@@ -9,7 +9,7 @@ JPEG_QUALITY = 75
 
 # --- 模型路径 ---
 SEG_MODEL = "models/seg/ppliteseg_320_320_int8.rknn"
-YOLO_MODEL = "models/det/ppyoloe_crn_m_80e_custom_raw_rk3588.rknn"
+YOLO_MODEL = "models/det/ppyoloe_crn_m_80e_custom_rk3588_fp16.rknn"
 REC_MODEL_PATH = "models/ocr/ppocrv4_rec_fp16.rknn"
 DICT_PATH = "models/ocr/keys.txt"
 

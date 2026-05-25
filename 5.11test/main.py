@@ -58,40 +58,45 @@ def draw_yolo_boxes(image, boxes):
     scale_y = img_h / float(src_h)
 
     for obj in boxes:
-        x, y, w, h = obj['rect']
-        cls_id = obj.get('class_id', -1)
-        cls_name = obj.get('class_name', str(cls_id))
-        score = obj.get('score', 0.0)
-        text = obj.get('text', '')
+        rect = obj.get("rect", [0, 0, 0, 0])
+        if len(rect) != 4:
+            continue
 
-        x = int(x * scale_x)
-        y = int(y * scale_y)
-        w = int(w * scale_x)
-        h = int(h * scale_y)
+        x, y, w, h = rect
+        cls_id = obj.get("class_id", -1)
+        cls_name = obj.get("class_name", str(cls_id))
+        score = obj.get("score", 0.0)
+        text = obj.get("text", "")
 
-        x2 = x + w
-        y2 = y + h
+        x1 = int(np.clip(round(x * scale_x), 0, img_w - 1))
+        y1 = int(np.clip(round(y * scale_y), 0, img_h - 1))
+        x2 = int(np.clip(round((x + w) * scale_x), 0, img_w - 1))
+        y2 = int(np.clip(round((y + h) * scale_y), 0, img_h - 1))
 
-        color = (0, 0, 255)  # 红框
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        color = (0, 0, 255)
         if cls_id == getattr(config, "SIGN_CLASS_ID", 9):
-            color = (0, 255, 255)  # 黄框
+            color = (0, 255, 255)
         elif cls_id == getattr(config, "LIMIT_SIGN_CLASS_ID", 10):
-            color = (255, 0, 0)  # 蓝框
+            color = (255, 0, 0)
 
-        cv2.rectangle(image, (x, y), (x2, y2), color, 2)
+        cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
 
         label = f"{cls_name}:{score:.2f}"
         if text:
             label += f" [{text}]"
 
+        text_y = y1 - 8 if y1 > 20 else y1 + 18
         cv2.putText(
             image,
             label,
-            (x, max(15, y - 5)),
+            (x1, text_y),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.45,
+            0.55,
             color,
-            1,
+            2,
             cv2.LINE_AA
         )
 
@@ -116,30 +121,40 @@ def yolo_and_ocr_worker():
             if frame_data is None:
                 break
 
-            # 1. 目标检测
             objs = det.run(frame_data)
 
-            # 2. 检测到 sign 时，裁图跑 OCR
             for obj in objs:
-                if obj.get('class_id') == getattr(config, 'SIGN_CLASS_ID', 9):
-                    bx, by, bw, bh = obj['rect']
-                    x1, y1 = max(0, bx), max(0, by)
-                    x2, y2 = min(frame_data.shape[1], bx + bw), min(frame_data.shape[0], by + bh)
+                if obj.get("class_id") != getattr(config, "SIGN_CLASS_ID", 9):
+                    continue
+
+                try:
+                    bx, by, bw, bh = obj["rect"]
+                    x1 = max(0, int(bx))
+                    y1 = max(0, int(by))
+                    x2 = min(frame_data.shape[1], int(bx + bw))
+                    y2 = min(frame_data.shape[0], int(by + bh))
+
+                    if x2 <= x1 or y2 <= y1:
+                        continue
+
                     roi = frame_data[y1:y2, x1:x2]
+                    if roi is None or roi.size == 0:
+                        continue
 
-                    if roi.size > 0:
-                        text, score = ocr.run_single_crop(roi)
-                        obj['text'] = text
-                        obj['ocr_score'] = score
+                    text, score = ocr.run_single_crop(roi)
+                    text = text.strip().upper()
+                    obj["text"] = text
+                    obj["ocr_score"] = float(score)
 
-                        if text == 'LEFT':
-                            with data_lock:
-                                global_control_data['turn_intent'] = -1
-                        elif text == 'RIGHT':
-                            with data_lock:
-                                global_control_data['turn_intent'] = 1
+                    if text == "LEFT":
+                        with data_lock:
+                            global_control_data["turn_intent"] = -1
+                    elif text == "RIGHT":
+                        with data_lock:
+                            global_control_data["turn_intent"] = 1
+                except Exception as e:
+                    print(f"OCR单框异常: {e}", flush=True)
 
-            # 更新全局框
             with data_lock:
                 global global_yolo_boxes
                 global_yolo_boxes = objs
@@ -147,7 +162,6 @@ def yolo_and_ocr_worker():
 
         except Exception as e:
             print(f"YOLO/OCR线程异常: {e}", flush=True)
-
 
 # ==============================================================================
 # 核心线程 2：分割与路径规划线程
@@ -169,13 +183,24 @@ def seg_worker(core_id):
             break
 
         with data_lock:
-            current_yolo_boxes = global_yolo_boxes.copy()
+            current_yolo_boxes = [obj.copy() for obj in global_yolo_boxes]
             turn_intent = global_control_data.get("turn_intent", -1)
 
-        err_x, l_k, rendered_img = seg.run(blob_rgb_320, current_yolo_boxes, turn_intent, fps_stats)
+        err_x, l_k, rendered_img = seg.run(
+            blob_rgb_320,
+            current_yolo_boxes,
+            turn_intent,
+            fps_stats
+        )
 
-        # 在最终显示图上叠加 YOLO 框
+        # 关键修正：先放大回 960x720，再叠加 YOLO 框
         if rendered_img is not None:
+            if rendered_img.shape[1] != config.TARGET_RES[0] or rendered_img.shape[0] != config.TARGET_RES[1]:
+                rendered_img = cv2.resize(
+                    rendered_img,
+                    config.TARGET_RES,
+                    interpolation=cv2.INTER_NEAREST
+                )
             rendered_img = draw_yolo_boxes(rendered_img, current_yolo_boxes)
 
         with data_lock:
@@ -197,7 +222,6 @@ def seg_worker(core_id):
             current_seg_fps = fps_stats["seg_fps"]
             current_yolo_fps = fps_stats["yolo_fps"]
 
-        # 状态栏叠加
         if rendered_img is not None:
             cv2.rectangle(rendered_img, (2, 102), (230, 154), (0, 0, 0), -1)
             cv2.rectangle(rendered_img, (2, 102), (230, 154), (0, 255, 255), 1)
@@ -235,7 +259,6 @@ def seg_worker(core_id):
 
         with frame_lock:
             global_preview_frame = rendered_img
-
 
 # ==============================================================================
 # 基础支撑线程：串口控制
