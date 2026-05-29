@@ -3,14 +3,10 @@
 
 这个模块负责:
 1. 调用分割模型得到二值赛道 mask
-2. 在 mask 空间中搜索一条可跟踪路径
+2. 在 mask 空间中搜索一条可跟踪路径（引入分支局部中心约束，抑制切内线）
 3. 将路径投影到鸟瞰图坐标系，计算横向误差和预瞄斜率
-4. 返回用于控制的 err_x / l_k，以及一张调试渲染图
-
-当前版本特点:
-- 输入固定为 320x320 RGB
-- 路径搜索直接在分割 mask 上进行
-- 使用 turn_intent 对分叉场景做简单偏向控制
+4. 引入多项式时域低通滤波 (EMA)，提升路径稳定性
+5. 返回用于控制的 err_x / l_k，以及一张调试渲染图
 """
 
 import cv2
@@ -44,6 +40,12 @@ class RoadSegmentor:
             getattr(config, "PLANNING_CIRCLE_CLASS_NAMES", ())
         )
 
+        # -------------------------------------------------------------------
+        # 【新增】时域滤波历史记忆
+        # -------------------------------------------------------------------
+        self.last_poly_coeffs = None
+        self.ema_alpha = 0.6  # 历史权重：越接近 1.0 越稳定，越接近 0.0 响应越快
+
     def _path_x_at_y(self, candidate, target_y):
         """在候选路径上找到最接近 target_y 的横坐标，统一在分割平面里比较."""
         path = candidate.get("path")
@@ -57,17 +59,7 @@ class RoadSegmentor:
         return float(xs[idx])
 
     def _estimate_stone_branch_side(self, planning_items, candidate_paths):
-        """估计石头更接近哪一侧候选分支.
-
-        注意:
-        - 这里必须在同一个坐标系里比较
-        - 当前统一使用“分割平面”的坐标，不再拿 bird_center 去和原始路径点混比
-
-        返回:
-            -1: 石头更偏左侧分支，应优先走右侧
-             1: 石头更偏右侧分支，应优先走左侧
-             0: 无法判断，不干预
-        """
+        """估计石头更接近哪一侧候选分支."""
         stone_items = [
             item for item in planning_items
             if item.get("class_name") == "stone" and item.get("seg_box") is not None
@@ -212,14 +204,7 @@ class RoadSegmentor:
             )
 
     def run(self, blob_rgb_320, current_yolo_boxes, turn_intent, fps_stats):
-        """执行一次完整的分割和路径规划.
-
-        参数:
-            blob_rgb_320: 来自主线程的 320x320 RGB 图像
-            current_yolo_boxes: 当前最新检测框，基于原图框映射规划相关元素
-            turn_intent: OCR 识别出的转向意图，-1 倾向左，1 倾向右
-            fps_stats: 用于渲染调试信息
-        """
+        """执行一次完整的分割和路径规划."""
         w_out, h_out = config.TARGET_RES # 960, 720
         w_seg, h_seg = config.SEG_SIZE   # 320, 320
         
@@ -227,7 +212,7 @@ class RoadSegmentor:
         blob = blob_rgb_320
         ai_view = cv2.cvtColor(blob, cv2.COLOR_RGB2BGR)
 
-        # 分割模型直接输出赛道类别概率或二值图，这里统一整理成 0/1 mask。
+        # 分割模型推理
         outputs = self.rknn.inference(inputs=[np.expand_dims(blob, axis=0)])
         out = outputs[0]
         
@@ -236,28 +221,28 @@ class RoadSegmentor:
         else:
             mask = out.squeeze().astype(np.uint8)
 
-        # 检测结果始终来自原图，只有真正需要参与路径规划的元素才投影到俯视图。
+        # 投影 YOLO 框到分割面
         planning_items = self._project_planning_objects(current_yolo_boxes, w_seg, h_seg)
 
         # -------------------------------------------------------------------
-        # 3. 在 mask 空间中做自底向上的路径搜索
+        # 3. 在 mask 空间中做自底向上的路径搜索（重构：局部中线记录版）
         # -------------------------------------------------------------------
         err_x, l_k = 0.0, 0.0
         pts_final_orig = None
         pts_final_bird = None
         
-        STEP_Y = 12        
+        STEP_Y = 10        # 加密采样点，提供更好的局部边界感知
         GAP_THRESH = 15    
         active_paths = []  
         
-        # 从靠近车辆的底部区域选取起点，优先保证路径对当前控制有效。
         bottom_y = h_seg - 5
         bottom_slice = mask[h_seg-15:h_seg, :]
         white_xs = np.where(bottom_slice == 1)[1]
         
         if len(white_xs) > 8:
             start_x = int(np.median(white_xs))
-            active_paths.append([(start_x, bottom_y)])
+            # 路径节点存储结构：包含像素点坐标 pt 和当前分支的局部几何中心 local_center
+            active_paths.append([{"pt": (start_x, bottom_y), "local_center": start_x}])
             
             curr_y = bottom_y
             while curr_y >= int(h_seg * 0.1): 
@@ -268,25 +253,30 @@ class RoadSegmentor:
                     curr_y -= STEP_Y
                     continue 
                     
+                # 区分不同的局部赛道分支
                 splits = np.split(xs, np.where(np.diff(xs) > GAP_THRESH)[0] + 1)
-                branch_centers = [int(np.mean(s)) for s in splits if len(s) > 2]
+                valid_branches = []
+                for s in splits:
+                    if len(s) > 2:
+                        branch_center = int(np.mean(s))
+                        valid_branches.append(branch_center)
                 
-                if not branch_centers:
+                if not valid_branches:
                     curr_y -= STEP_Y
                     continue
                     
                 if not active_paths:
-                    for bx in branch_centers:
-                        active_paths.append([(bx, curr_y)])
+                    for bx in valid_branches:
+                        active_paths.append([{"pt": (bx, curr_y), "local_center": bx}])
                 else:
                     new_paths = []
                     for path in active_paths:
-                        last_x = path[-1][0]
+                        last_x = path[-1]["pt"][0]
                         connected = False
-                        for bx in branch_centers:
-                            # 如果当前层中心点和上一层足够接近，认为它们属于同一条路。
+                        for bx in valid_branches:
+                            # 关联层级：若空间距离足够近，归入同一条分支路径
                             if abs(bx - last_x) < 50:
-                                new_paths.append(path + [(bx, curr_y)])
+                                new_paths.append(path + [{"pt": (bx, curr_y), "local_center": bx}])
                                 connected = True
                         if not connected:
                             new_paths.append(path)
@@ -299,25 +289,32 @@ class RoadSegmentor:
                 curr_y -= STEP_Y
                 
         # -------------------------------------------------------------------
-        # 4. 对候选路径打分，并根据 turn_intent 选择最终路径
+        # 4. 对候选路径打分，引入局部中心偏差惩罚 + EMA 滤波选择最终路径
         # -------------------------------------------------------------------
         if active_paths:
             valid_candidates = []
             for path in active_paths:
-                if len(path) < 3: continue
-                path_arr = np.array(path)
+                if len(path) < 3: 
+                    continue
+                
+                path_arr = np.array([node["pt"] for node in path])
                 px = path_arr[:, 0]
                 
-                # 评分思路:
-                # - 越长越好
-                # - 越平滑越好
-                # - 横向漂移越小越好
+                # 1. 长度分
                 length_score = len(path) * 50.0
-                dx = np.diff(px)
-                smooth_score = -np.std(dx) * 10.0
-                yaw_score = -abs(px[-1] - px[0]) * 0.5
                 
-                base_score = length_score + smooth_score + yaw_score
+                # 2. 平滑度分
+                dx = np.diff(px)
+                smooth_score = -np.std(dx) * 20.0
+                
+                # 3. 分支局部中心偏离惩罚（精准抑制弯道强行切直线走捷径的行为）
+                center_penalty = 0.0
+                for node in path:
+                    x_curr = node["pt"][0]
+                    x_local_center = node["local_center"]
+                    center_penalty += abs(x_curr - x_local_center) * 3.5
+                
+                base_score = length_score + smooth_score - center_penalty
                 avg_x = np.mean(px)
                 
                 valid_candidates.append({'path': path_arr, 'score': base_score, 'avg_x': avg_x})
@@ -328,8 +325,6 @@ class RoadSegmentor:
                 max_score = max(c['score'] for c in valid_candidates)
                 top_tier_paths = [c for c in valid_candidates if c['score'] >= max_score - 150]
 
-                # 默认岔路优先走左边；如果检测到 stone，则优先选择没有 stone 的那一支。
-                preferred_turn = -1
                 stone_branch_side = self._estimate_stone_branch_side(planning_items, top_tier_paths)
                 if stone_branch_side == -1:
                     preferred_turn = 1
@@ -349,42 +344,45 @@ class RoadSegmentor:
                 node_x = best_path[:, 0]
                 node_y = best_path[:, 1]
                 
-                # 用多项式拟合把离散路径点变成连续曲线，便于控制和可视化。
                 if len(np.unique(node_y)) > 2:
-                    poly_coeffs = np.polyfit(node_y, node_x, 2)
+                    current_coeffs = np.polyfit(node_y, node_x, 2)
                 else:
-                    poly_coeffs = np.polyfit(node_y, node_x, 1)
-                    poly_coeffs = np.insert(poly_coeffs, 0, 0)
+                    current_coeffs = np.polyfit(node_y, node_x, 1)
+                    current_coeffs = np.insert(current_coeffs, 0, 0)
+                
+                # 4. 时域一阶低通滤波 (EMA)，赋予路径物理连贯惯性，消除分叉口反复横跳
+                if self.last_poly_coeffs is not None and len(self.last_poly_coeffs) == len(current_coeffs):
+                    poly_coeffs = self.ema_alpha * self.last_poly_coeffs + (1.0 - self.ema_alpha) * current_coeffs
+                else:
+                    poly_coeffs = current_coeffs
+                
+                self.last_poly_coeffs = poly_coeffs
                     
                 dense_y = np.linspace(node_y[0], node_y[-1], num=30)
                 dense_x = np.polyval(poly_coeffs, dense_y)
                 
-                # OpenCV polyline / perspectiveTransform 都要求这种点集结构。
                 pts_final_orig = np.vstack((dense_x, dense_y)).astype(np.float32).T.reshape((-1, 1, 2))
-                
-                # 把前视图路径整体投影到鸟瞰图，便于计算更稳定的控制量。
                 pts_final_bird = cv2.perspectiveTransform(pts_final_orig, self.M_seg)
                 
-                # 真正用于控制的是鸟瞰图里的横向偏差和预瞄斜率。
                 bird_nodes = pts_final_bird.squeeze()
                 if bird_nodes.ndim == 2:
                     bx = bird_nodes[:, 0]
                     by = bird_nodes[:, 1]
                     
                     car_center_x_bird = w_seg / 2.0
-                    # 最近端节点代表“车辆当前应跟踪的位置”，换算成厘米级误差。
                     err_x = (bx[0] - car_center_x_bird) * getattr(config, 'CM_PER_PIXEL_X', 0.109649) * (w_out / w_seg)
                     
-                    # 预瞄斜率用于抑制大角度转向时的过冲。
                     lookahead_idx = min(12, len(by) - 1)
                     dy_l = by[0] - by[lookahead_idx]
                     dx_l = bx[0] - bx[lookahead_idx]
                     l_k = dx_l / dy_l if dy_l != 0 else 0.0
+            else:
+                # 极端丢线情况：平滑清空历史系数，防止干扰后续帧恢复
+                self.last_poly_coeffs = None
 
         # -------------------------------------------------------------------
         # 5. 调试渲染
         # -------------------------------------------------------------------
-        # 主画面叠加绿色分割区域和粉色规划线。
         colored_roi = np.zeros_like(ai_view)
         colored_roi[mask == 1] = [0, 255, 0] 
         ai_view = cv2.addWeighted(ai_view, 0.6, colored_roi, 0.4, 0)
@@ -392,7 +390,6 @@ class RoadSegmentor:
         if pts_final_orig is not None:
             cv2.polylines(ai_view, [pts_final_orig.astype(np.int32)], False, (255, 0, 255), 2)
 
-        # 右上角小窗显示 BEV。这里只做控制和后续改写路径的调试，不给模型回灌。
         bird_eye_mask = cv2.warpPerspective(mask, self.M_seg, (w_seg, h_seg), flags=cv2.INTER_NEAREST)
         pip_img = cv2.cvtColor(np.where(bird_eye_mask == 1, 255, 0).astype(np.uint8), cv2.COLOR_GRAY2BGR)
         
@@ -405,8 +402,6 @@ class RoadSegmentor:
         ai_view[0:pip_h, w_seg-pip_w:w_seg] = cv2.resize(pip_img, (pip_w, pip_h))
         cv2.rectangle(ai_view, (w_seg-pip_w, 0), (w_seg, pip_h), (255, 255, 255), 1)
 
-        # 这里单独计算一个“理论舵机值”用于页面调试显示，
-        # 真正下发给下位机的值在 serial_control_thread 中统一生成。
         servo_pwm = int(getattr(config, 'SERVO_CENTER', 750) + (err_x * getattr(config, 'KP', 0.16)) - (l_k * getattr(config, 'KD', 160.0)))
         cv2.putText(ai_view, f"Seg FPS:{fps_stats.get('seg_fps', 0):.1f} YOLO:{fps_stats.get('yolo_fps', 0):.1f}", (5, 18), 1, 0.8, (0, 255, 0), 1)
         cv2.putText(ai_view, f"Err:{err_x:.1f}cm PWM:{servo_pwm}", (5, 36), 1, 0.8, (0, 255, 255), 1)
