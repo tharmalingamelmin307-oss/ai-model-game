@@ -19,6 +19,7 @@ import cv2
 import threading
 import serial
 from queue import Queue
+from collections import deque
 from multiprocessing import shared_memory, resource_tracker
 from flask import Flask, Response, render_template_string
 
@@ -52,14 +53,20 @@ data_lock = threading.Lock()
 
 # 三条工作队列:
 # - seg_queue: 最新一帧分割输入
-# - yolo_queue: 最新一帧检测输入
-# - ocr_queue: 检测线程生成的 sign OCR 任务
+# - yolo_queue: 最新一帧检测输入 (fid, det_img)
+# - ocr_queue: 检测线程生成的 (fid, sign 原图 ROI 任务)
 seg_queue = Queue(maxsize=1)
 yolo_queue = Queue(maxsize=1)
 ocr_queue = Queue(maxsize=2)
 
 # 当前最新一帧的检测结果。
 global_yolo_boxes = []
+global_yolo_frame_id = -1
+
+raw_frame_lock = threading.Lock()
+raw_frame_cache = {}
+raw_frame_order = deque()
+RAW_FRAME_CACHE_SIZE = 4
 
 
 def remove_shm_from_resource_tracker():
@@ -151,6 +158,59 @@ def summarize_yolo_boxes(boxes):
     return " | ".join(parts)
 
 
+def cache_raw_frame(fid, raw_frame):
+    """缓存少量原始分辨率帧，供 sign 命中后按 fid 回取 ROI。"""
+    if raw_frame is None:
+        return
+
+    with raw_frame_lock:
+        if fid in raw_frame_cache:
+            try:
+                raw_frame_order.remove(fid)
+            except ValueError:
+                pass
+        raw_frame_cache[fid] = raw_frame
+        raw_frame_order.append(fid)
+
+        while len(raw_frame_order) > RAW_FRAME_CACHE_SIZE:
+            old_fid = raw_frame_order.popleft()
+            raw_frame_cache.pop(old_fid, None)
+
+
+def get_cached_raw_frame(fid):
+    """按 fid 取回原始分辨率帧；返回的是同一块内存引用，不做整帧复制。"""
+    with raw_frame_lock:
+        return raw_frame_cache.get(fid)
+
+
+def crop_target_rect_from_raw_frame(raw_frame, rect):
+    """将 TARGET_RES 坐标系下的检测框映射回原图并裁出 ROI。"""
+    if raw_frame is None or len(rect) != 4:
+        return None
+
+    raw_h, raw_w = raw_frame.shape[:2]
+    target_w, target_h = config.TARGET_RES
+    if raw_w <= 0 or raw_h <= 0 or target_w <= 0 or target_h <= 0:
+        return None
+
+    bx, by, bw, bh = rect
+    scale_x = raw_w / float(target_w)
+    scale_y = raw_h / float(target_h)
+
+    x1 = max(0, int(np.floor(bx * scale_x)))
+    y1 = max(0, int(np.floor(by * scale_y)))
+    x2 = min(raw_w, int(np.ceil((bx + bw) * scale_x)))
+    y2 = min(raw_h, int(np.ceil((by + bh) * scale_y)))
+
+    if x2 <= x1 or y2 <= y1:
+        return None
+
+    roi = raw_frame[y1:y2, x1:x2]
+    if roi is None or roi.size == 0:
+        return None
+    return roi.copy()
+
+
 # ==============================================================================
 # 核心线程 1：YOLO 检测线程
 # ==============================================================================
@@ -176,7 +236,7 @@ def yolo_worker():
             if frame_data is None:
                 break
 
-            det_frame, vis_frame = frame_data
+            frame_fid, det_frame = frame_data
             objs = det.run(det_frame, output_size=config.TARGET_RES)
 
             # 新一帧检测结果先清掉旧的 OCR 文本，避免沿用上一帧残留内容。
@@ -189,24 +249,30 @@ def yolo_worker():
 
             with data_lock:
                 global global_yolo_boxes
+                global global_yolo_frame_id
                 global_yolo_boxes = objs
+                global_yolo_frame_id = frame_fid
                 fps_stats["yolo_frames"] += 1
 
             # 只把需要 OCR 的 sign 框送到 OCR 队列，减少额外开销。
-            sign_jobs = []
+            raw_frame = get_cached_raw_frame(frame_fid)
+            sign_crops = []
             for idx, obj in enumerate(objs):
                 if obj.get("class_id") != getattr(config, "SIGN_CLASS_ID", 9):
                     continue
-                sign_jobs.append((idx, obj.get("rect", [0, 0, 0, 0])))
+                roi = crop_target_rect_from_raw_frame(raw_frame, obj.get("rect", [0, 0, 0, 0]))
+                if roi is None:
+                    continue
+                sign_crops.append((idx, roi))
 
-            if sign_jobs:
+            if sign_crops:
                 # OCR 只保留较新的任务，过旧的任务直接丢掉。
                 if ocr_queue.full():
                     try:
                         ocr_queue.get_nowait()
                     except:
                         pass
-                ocr_queue.put((vis_frame.copy(), sign_jobs))
+                ocr_queue.put((frame_fid, sign_crops))
 
         except Exception as e:
             print(f"YOLO线程异常: {e}", flush=True)
@@ -219,7 +285,7 @@ def ocr_worker():
     """纯 OCR 线程.
 
     输入:
-        yolo_worker 投递的 (frame_data, sign_jobs)
+        yolo_worker 投递的 (fid, sign 原图 ROI 列表)
 
     输出:
         将识别出的 text / ocr_score 回写到 global_yolo_boxes，
@@ -238,29 +304,21 @@ def ocr_worker():
             if job is None:
                 break
 
-            frame_data, sign_jobs = job
+            frame_fid, sign_crops = job
             updates = []
 
-            for idx, rect in sign_jobs:
+            for idx, roi in sign_crops:
                 try:
-                    if len(rect) != 4:
-                        continue
-
-                    bx, by, bw, bh = rect
-                    x1 = max(0, int(bx))
-                    y1 = max(0, int(by))
-                    x2 = min(frame_data.shape[1], int(bx + bw))
-                    y2 = min(frame_data.shape[0], int(by + bh))
-
-                    if x2 <= x1 or y2 <= y1:
-                        continue
-
-                    roi = frame_data[y1:y2, x1:x2]
                     if roi is None or roi.size == 0:
                         continue
 
-                    text, score = ocr.run_single_crop(roi)
-                    text = text.strip().upper()
+                    raw_text, score = ocr.run_single_crop(roi)
+                    text = raw_text.strip().upper()
+                    print(
+                        f"OCR fid={frame_fid} idx={idx} roi={roi.shape[1]}x{roi.shape[0]} "
+                        f"raw={raw_text!r} norm={text!r} score={float(score):.3f}",
+                        flush=True
+                    )
                     updates.append((idx, text, float(score)))
                 except Exception as e:
                     print(f"OCR单框异常: {e}", flush=True)
@@ -270,6 +328,8 @@ def ocr_worker():
 
             # 回写时再做一次 class_id 检查，避免队列延迟导致“框已经换帧”的情况。
             with data_lock:
+                if global_yolo_frame_id != frame_fid:
+                    continue
                 for idx, text, score in updates:
                     if idx >= len(global_yolo_boxes):
                         continue
@@ -499,17 +559,17 @@ def ai_producer_thread():
                 seg_queue.put(seg_blob)
 
                 # 检测分支直接生成 YOLO 输入尺寸的小图，避免大图先放大再缩小。
-                # 同时保留一份 TARGET_RES 大图，继续用于框绘制和 OCR 裁图。
+                # 原始分辨率 BGR 图只放进一个很小的缓存里，等 sign 命中后再按 fid 取回。
                 frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
                 det_img = cv2.resize(frame_bgr, config.YOLO_SIZE, interpolation=cv2.INTER_LINEAR)
-                vis_img_large = cv2.resize(frame_bgr, config.TARGET_RES, interpolation=cv2.INTER_LINEAR)
+                cache_raw_frame(fid, frame_bgr)
 
                 if yolo_queue.full():
                     try:
                         yolo_queue.get_nowait()
                     except:
                         pass
-                yolo_queue.put((det_img, vis_img_large))
+                yolo_queue.put((fid, det_img))
 
         except Exception:
             time.sleep(1.0)

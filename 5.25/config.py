@@ -112,6 +112,7 @@ SEG_SIZE = (320, 320)
 REC_HEIGHT = 48
 REC_WIDTH = 320
 
+
 # 当前版本没有直接在代码里裁顶部 ROI，但这个参数保留下来，
 # 方便后面继续做轻量化处理时直接使用。
 ROI_TOP_CUT_RATIO = 0.3
