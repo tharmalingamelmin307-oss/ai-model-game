@@ -1,9 +1,21 @@
 # utils/image_proc.py
+"""图像几何处理工具.
+
+当前这里只保留 OCR 会直接使用的一项能力：
+- 把 OCR det 输出的四点文字框透视拉正成规则矩形
+"""
+
 import cv2
 import numpy as np
 
 def get_rotate_crop_image(img, points):
-    """ 官方标准：透视变换矫正文字区域 """
+    """把四点文字框透视拉正成规则文本图。
+
+    这是 OCR det + rec 链路里的标准中间步骤：
+    1. 根据四点框估计目标宽高
+    2. 用透视变换把倾斜文本拉正
+    3. 如果结果明显是“竖着的长条”，再旋转成更适合 rec 的横向文本
+    """
     points = np.array(points, dtype=np.float32)
     # 计算目标矩形的宽高
     width = int(max(np.linalg.norm(points[0] - points[1]), 

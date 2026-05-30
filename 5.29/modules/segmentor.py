@@ -7,6 +7,12 @@
 3. 将路径投影到鸟瞰图坐标系，计算横向误差和预瞄斜率
 4. 引入多项式时域低通滤波 (EMA)，提升路径稳定性
 5. 返回用于控制的 err_x / l_k，以及一张调试渲染图
+
+当前路径选择策略的核心优先级是:
+1. 先从 mask 里搜索可连接的候选路径
+2. 如果检测到 `stone`，优先绕开石头所在分支
+3. 否则默认偏向左支
+4. 如果 OCR 已经给出 `turn_intent`，再用 LEFT / RIGHT 意图覆盖默认偏向
 """
 
 import cv2
@@ -59,7 +65,13 @@ class RoadSegmentor:
         return float(xs[idx])
 
     def _estimate_stone_branch_side(self, planning_items, candidate_paths):
-        """估计石头更接近哪一侧候选分支."""
+        """估计石头更接近哪一侧候选分支.
+
+        返回:
+        -1: 更接近左支
+         1: 更接近右支
+         0: 无法稳定判断
+        """
         stone_items = [
             item for item in planning_items
             if item.get("class_name") == "stone" and item.get("seg_box") is not None
@@ -123,7 +135,13 @@ class RoadSegmentor:
         return corners
 
     def _project_planning_objects(self, current_yolo_boxes, w_seg, h_seg):
-        """将原图中的规划相关检测框映射到分割平面和俯视图平面."""
+        """将原图中的规划相关检测框映射到分割平面和俯视图平面.
+
+        这些目标当前主要用于:
+        - 调试显示
+        - `stone` 与分支左右关系判断
+        暂时不会像 cost map 那样直接侵蚀主路径。
+        """
         planning_items = []
         seg_boxes = []
 
@@ -204,7 +222,18 @@ class RoadSegmentor:
             )
 
     def run(self, blob_rgb_320, current_yolo_boxes, turn_intent, fps_stats):
-        """执行一次完整的分割和路径规划."""
+        """执行一次完整的分割和路径规划.
+
+        输入:
+        - blob_rgb_320: 分割线程当前拿到的最新 320x320 RGB 图
+        - current_yolo_boxes: 当前最新一帧检测框，坐标在 TARGET_RES
+        - turn_intent: OCR 给出的 LEFT / RIGHT 分叉意图
+
+        输出:
+        - err_x: 鸟瞰图横向偏差，已经换算到近似厘米
+        - l_k: 预瞄斜率，供控制线程做提前修正
+        - ai_view: 320 空间调试图，主线程会再放大回 TARGET_RES
+        """
         w_out, h_out = config.TARGET_RES # 960, 720
         w_seg, h_seg = config.SEG_SIZE   # 320, 320
         

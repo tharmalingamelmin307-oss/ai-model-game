@@ -13,6 +13,13 @@
        "class_name": str,
        "score": float,
    }
+
+实现约定:
+1. 所有输出框最终都统一映射到 `config.TARGET_RES` 坐标系。
+2. 当前检测后处理只保留“框尺寸合法 + 类别置信度阈值”两层过滤，
+   不再使用面积或贴边几何规则。
+3. 类别级阈值由 `config.CLASS_MIN_SCORES` 控制，PP-YOLOE 多分支输出和
+   单 tensor 回退路径都会走同一套阈值逻辑。
 """
 
 import cv2
@@ -31,8 +38,8 @@ class YOLODetector:
         if self.rknn.init_runtime(core_mask=core_id) != 0:
             raise RuntimeError("YOLO 初始化失败")
 
-        self.conf_thres = 0.25
-        self.nms_thres = 0.45
+        self.conf_thres = float(getattr(config, "YOLO_CONF_THRES", 0.25))
+        self.nms_thres = float(getattr(config, "YOLO_NMS_THRES", 0.45))
         
         # [已修改] 关闭单次调试打印，保持终端整洁。如需排错可改为 True。
         self.debug_once = False 
@@ -42,40 +49,37 @@ class YOLODetector:
         # 允许程序自动判断 PP-YOLOE 的多分支输出格式
         self.expect_raw_single_output = False
 
+    def _class_name_from_id(self, cls_id):
+        cls_id = int(cls_id)
+        if 0 <= cls_id < len(config.CLASS_NAMES):
+            return config.CLASS_NAMES[cls_id]
+        return str(cls_id)
+
+    def _get_class_conf_thres(self, cls_id=None, cls_name=None):
+        """返回某个类别当前应使用的置信度阈值。"""
+        if cls_name is None and cls_id is not None:
+            cls_name = self._class_name_from_id(cls_id)
+
+        min_scores = getattr(config, "CLASS_MIN_SCORES", {})
+        return float(min_scores.get(cls_name, self.conf_thres))
+
+    def _build_score_keep_mask(self, class_ids, scores):
+        """为一批候选框生成“按类别阈值保留”的布尔掩码。"""
+        if len(class_ids) == 0 or len(scores) == 0:
+            return np.array([], dtype=bool)
+
+        score_thres = np.array(
+            [self._get_class_conf_thres(cls_id=int(cls_id)) for cls_id in class_ids],
+            dtype=np.float32,
+        )
+        return scores >= score_thres
+
     def _is_valid_detection(self, x, y, w, h, cls_name, score, orig_w, orig_h):
-        """过滤明显异常的大框误检，优先兜底贴边超大框。"""
+        """只按基础框尺寸和类别置信度过滤检测结果。"""
         if w < 2 or h < 2:
             return False
 
-        min_scores = getattr(config, "CLASS_MIN_SCORES", {})
-        if score < float(min_scores.get(cls_name, self.conf_thres)):
-            return False
-
-        frame_area = float(max(orig_w * orig_h, 1))
-        area_ratio = (w * h) / frame_area
-
-        max_area_ratio_map = getattr(config, "CLASS_MAX_AREA_RATIO", {})
-        max_area_ratio = max_area_ratio_map.get(cls_name)
-        if max_area_ratio is not None and area_ratio > float(max_area_ratio):
-            return False
-
-        edge_margin_ratio = float(getattr(config, "DETECTION_EDGE_MARGIN_RATIO", 0.02))
-        edge_margin_x = orig_w * edge_margin_ratio
-        edge_margin_y = orig_h * edge_margin_ratio
-
-        edge_touch_count = 0
-        if x <= edge_margin_x:
-            edge_touch_count += 1
-        if y <= edge_margin_y:
-            edge_touch_count += 1
-        if (x + w) >= (orig_w - edge_margin_x):
-            edge_touch_count += 1
-        if (y + h) >= (orig_h - edge_margin_y):
-            edge_touch_count += 1
-
-        edge_touch_area_ratio_map = getattr(config, "CLASS_MAX_EDGE_TOUCH_AREA_RATIO", {})
-        edge_touch_area_ratio = edge_touch_area_ratio_map.get(cls_name)
-        if edge_touch_area_ratio is not None and edge_touch_count >= 2 and area_ratio > float(edge_touch_area_ratio):
+        if score < self._get_class_conf_thres(cls_name=cls_name):
             return False
 
         return True
@@ -118,6 +122,7 @@ class YOLODetector:
         return np.sum(y * acc, axis=2)
 
     def _box_process(self, position, input_w, input_h):
+        """按 PP-YOLOE 的 DFL 方式把位置分支解码成 xyxy 像素框。"""
         grid_h, grid_w = position.shape[2:4]
         col, row = np.meshgrid(
             np.arange(grid_w, dtype=np.float32),
@@ -174,6 +179,7 @@ class YOLODetector:
         return np.array(keep, dtype=np.int32)
 
     def _classwise_nms_xyxy(self, boxes, class_ids, scores):
+        """按类别分别做 NMS，避免不同类别之间互相压框。"""
         if len(boxes) == 0:
             return boxes, class_ids, scores
 
@@ -202,6 +208,7 @@ class YOLODetector:
         )
 
     def _build_results(self, boxes_xyxy, class_ids, scores, output_w, output_h, input_w, input_h):
+        """把内部 xyxy 结果转换成统一的 [x, y, w, h] 输出结构。"""
         results = []
         scale_x = output_w / float(input_w)
         scale_y = output_h / float(input_h)
@@ -224,11 +231,7 @@ class YOLODetector:
             h = h * scale_y
 
             cls_id = int(class_ids[i])
-            cls_name = (
-                config.CLASS_NAMES[cls_id]
-                if 0 <= cls_id < len(config.CLASS_NAMES)
-                else str(cls_id)
-            )
+            cls_name = self._class_name_from_id(cls_id)
             score = float(scores[i])
 
             if not self._is_valid_detection(x, y, w, h, cls_name, score, output_w, output_h):
@@ -271,6 +274,7 @@ class YOLODetector:
         return True
 
     def _decode_ppyoloe_outputs(self, outputs, output_w, output_h, input_w, input_h):
+        """解析 PP-YOLOE 官方 demo 风格的多分支输出。"""
         pair_per_branch = len(outputs) // 3
         boxes = []
         class_confs = []
@@ -284,15 +288,16 @@ class YOLODetector:
         boxes = np.concatenate([self._sp_flatten(v) for v in boxes], axis=0)
         class_confs = np.concatenate([self._sp_flatten(v) for v in class_confs], axis=0)
 
-        class_ids = np.argmax(class_confs, axis=1)
-        scores = class_confs[np.arange(class_confs.shape[0]), class_ids]
-        keep = scores >= self.conf_thres
+        # 这里先选每个位置得分最高的类别，再按“该类别自己的阈值”过滤。
+        class_ids = np.argmax(class_confs, axis=1).astype(np.int32)
+        scores = class_confs[np.arange(class_confs.shape[0]), class_ids].astype(np.float32)
+        keep = self._build_score_keep_mask(class_ids, scores)
         if not np.any(keep):
             return []
 
         boxes = boxes[keep]
-        class_ids = class_ids[keep].astype(np.int32)
-        scores = scores[keep].astype(np.float32)
+        class_ids = class_ids[keep]
+        scores = scores[keep]
 
         boxes, class_ids, scores = self._classwise_nms_xyxy(boxes, class_ids, scores)
         if boxes is None:
@@ -304,6 +309,7 @@ class YOLODetector:
         return self._build_results(boxes, class_ids, scores, output_w, output_h, input_w, input_h)
 
     def _normalize_single_tensor_preds(self, outputs):
+        """把单 tensor 输出整理成 [N, 4 + num_classes] 的统一形状。"""
         if outputs is None or len(outputs) == 0:
             return None
 
@@ -324,6 +330,7 @@ class YOLODetector:
         )
 
     def _decode_single_tensor_outputs(self, outputs, output_w, output_h, input_w, input_h):
+        """解析单 tensor 风格输出，兼容 logits / sigmoid 两种分数形态。"""
         preds = self._normalize_single_tensor_preds(outputs)
         if preds is None or len(preds) == 0:
             return []
@@ -351,11 +358,15 @@ class YOLODetector:
         class_ids = np.argmax(scores, axis=1).astype(np.int32)
         max_scores = scores[np.arange(scores.shape[0]), class_ids].astype(np.float32)
         
-        keep = max_scores >= self.conf_thres
+        keep = self._build_score_keep_mask(class_ids, max_scores)
 
         if not np.any(keep):
             if self.debug_once:
-                print(f"--> [YOLO 拦截] 无框保留！当前全图最高分数为: {np.max(max_scores):.4f} (阈值 {self.conf_thres})", flush=True)
+                print(
+                    f"--> [YOLO 拦截] 无框保留！当前全图最高分数为: {np.max(max_scores):.4f} "
+                    f"(默认阈值 {self.conf_thres})",
+                    flush=True,
+                )
                 self.debug_once = False # 查错完毕，关闭打印
             return []
 

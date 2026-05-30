@@ -9,6 +9,11 @@
 
 YOLO 的 `sign / limit_sign` 现在只负责触发 OCR 和做结果关联，
 不再直接把 YOLO 框拿来当最终识别 ROI。
+
+当前模块本身不关心“这是普通语义牌还是限速牌”。
+类别语义差异由 main.py 在回匹配后决定：
+- `sign` 关注 LEFT / RIGHT
+- `limit_sign` 只提取其中的数字字符参与限速确认
 """
 
 import cv2
@@ -50,7 +55,7 @@ class OCRRecognizer:
         self.last_det_box_count = 0
 
     def _decode(self, preds):
-        """把识别模型输出按 CTC 规则解码成字符串和平均置信度."""
+        """把识别模型输出按 CTC 规则解码成字符串和平均置信度。"""
         preds_idx = preds.argmax(axis=1)
         text = ""
         conf = 0.0
@@ -68,7 +73,14 @@ class OCRRecognizer:
         return text, (conf / count if count > 0 else 0.0)
 
     def run_text_detection(self, image_bgr):
-        """在整张图上执行 OCR 检测，返回文本框四点列表."""
+        """在整张图上执行 OCR 检测，返回文本框四点列表.
+
+        这里采用轻量化的后处理：
+        - 二值化概率图
+        - 适度膨胀
+        - 直接找轮廓并拟合旋转矩形
+        目标是优先满足板端实时性，而不是追求最复杂的 DB 后处理。
+        """
         if image_bgr is None or image_bgr.size == 0:
             return []
 
@@ -114,7 +126,11 @@ class OCRRecognizer:
         return boxes
 
     def run_single_crop(self, crop):
-        """对单个裁图执行识别."""
+        """对单个裁图执行识别.
+
+        裁图会先按固定高度缩放，再在右侧补零到 REC_WIDTH，
+        以适配 PaddleOCR 风格的 rec 输入。
+        """
         if crop is None or crop.size == 0:
             return "", 0.0
 
@@ -137,7 +153,11 @@ class OCRRecognizer:
         return text, score
 
     def run_full_frame(self, image_bgr):
-        """对整张图执行 det + rec，返回识别结果列表."""
+        """对整张图执行 det + rec，返回识别结果列表.
+
+        返回结果里的 `points` 会保留原图坐标四点框，
+        供上层按中心点回匹配到 sign / limit_sign 检测框。
+        """
         boxes = self.run_text_detection(image_bgr)
         self.last_det_box_count = len(boxes)
         results = []

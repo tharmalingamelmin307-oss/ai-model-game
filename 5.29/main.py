@@ -5,8 +5,9 @@
 2. 图像被拆成两条支路:
    - seg_queue: 送给分割 / 路径规划线程
    - yolo_queue: 送给目标检测线程
-3. yolo_worker 只负责检测；如果检测到 sign，再把 OCR 任务异步送入 ocr_queue。
-4. ocr_worker 单独占用一个 NPU 核，只负责识别 sign 里的文字。
+3. yolo_worker 只负责检测；如果检测到 sign / limit_sign，再把 OCR 任务异步送入 ocr_queue。
+4. ocr_worker 单独占用一个 NPU 核，对整张 TARGET_RES 图执行 OCR det + rec，
+   再把识别结果按中心点回匹配到 sign / limit_sign 检测框。
 5. seg_worker 读取当前最新的检测结果与 turn_intent，生成控制量和预览图。
 6. serial_control_thread 将控制量打包后发给下位机。
 7. Flask 将 global_preview_frame 编码成 MJPEG 提供网页预览。
@@ -36,6 +37,10 @@ app = Flask(__name__)
 global_preview_frame = None
 
 # 供分割线程、串口线程、OCR 线程共享的控制状态。
+# 这份状态是系统里最核心的一块“跨线程控制面板”：
+# - seg_worker 写入 err_x / l_k / 红绿灯 / 停止线
+# - ocr_worker 写入 turn_intent / speed_limit
+# - serial_control_thread 读取这些状态并生成最终底层控制命令
 global_control_data = {
     "error_x": 0,
     "line_k": 0,
@@ -43,8 +48,8 @@ global_control_data = {
     "turn_intent_fid": -1,
     "speed_limit": None,
     "speed_limit_fid": -1,
-    "pending_speed_limit_text": "",
-    "pending_speed_limit_count": 0,
+    "limit_sign_history": {},
+    "limit_sign_last_detect_fid": -1,
     "zebra_stopline_y": None,
     "traffic_light_state": "",
     "traffic_stop_active": False,
@@ -62,7 +67,7 @@ log_lock = threading.Lock()
 # 三条工作队列:
 # - seg_queue: 最新一帧分割输入
 # - yolo_queue: 最新一帧检测输入
-# - ocr_queue: 检测线程生成的 sign OCR 任务
+# - ocr_queue: 检测线程生成的 sign / limit_sign OCR 任务
 seg_queue = Queue(maxsize=1)
 yolo_queue = Queue(maxsize=1)
 ocr_queue = Queue(maxsize=2)
@@ -252,22 +257,57 @@ def draw_zebra_stopline(image, zebra_stopline):
 
 
 def should_enqueue_ocr_job(cls_id, rect):
-    """按类别过滤过小 ROI，减少远距离小牌子的 OCR 误判。"""
+    """判断某个 sign / limit_sign 是否值得触发一次整图 OCR.
+
+    当前不是“直接裁检测框做 OCR”，而是:
+    1. YOLO 先给出路牌框
+    2. 只有框足够大、且没有明显贴边截断风险时，才触发一次整图 OCR
+    3. OCR det + rec 的结果再回匹配到这个框
+
+    额外约束:
+    - 对 limit_sign 来说，如果框面积已经达到 LIMIT_SIGN_APPLY_MIN_AREA，
+      就不再继续 OCR，而是转去使用历史聚合结果做正式生效判定。
+
+    返回:
+        (should_enqueue, reason)
+        - should_enqueue: 是否允许进入 OCR
+        - reason: 便于日志打印的跳过原因
+    """
     if len(rect) != 4:
-        return False
+        return False, "invalid_rect"
 
-    _, _, w, h = rect
+    x, y, w, h = rect
+    if w < 2 or h < 2:
+        return False, "invalid_rect"
+
+    area = float(w * h)
     if cls_id == getattr(config, "SIGN_CLASS_ID", 9):
-        min_w = int(getattr(config, "OCR_MIN_SIGN_BOX_W", 26))
-        min_h = int(getattr(config, "OCR_MIN_SIGN_BOX_H", 26))
-        return w >= min_w and h >= min_h
+        min_area = float(getattr(config, "OCR_MIN_SIGN_BOX_AREA", 26 * 26))
+    elif cls_id == getattr(config, "LIMIT_SIGN_CLASS_ID", 10):
+        min_area = float(getattr(config, "OCR_MIN_LIMIT_SIGN_BOX_AREA", 24 * 24))
+        apply_min_area = float(getattr(config, "LIMIT_SIGN_APPLY_MIN_AREA", 80 * 80))
+        if area >= apply_min_area:
+            return False, f"ready_to_apply_history({int(area)}>={int(apply_min_area)})"
+    else:
+        return False, "non_ocr_class"
 
-    if cls_id == getattr(config, "LIMIT_SIGN_CLASS_ID", 10):
-        min_w = int(getattr(config, "OCR_MIN_LIMIT_SIGN_BOX_W", 24))
-        min_h = int(getattr(config, "OCR_MIN_LIMIT_SIGN_BOX_H", 24))
-        return w >= min_w and h >= min_h
+    if area < min_area:
+        return False, f"area_too_small({int(area)}<{int(min_area)})"
 
-    return False
+    frame_w, frame_h = config.TARGET_RES
+    edge_margin_ratio = float(getattr(config, "OCR_SIGN_EDGE_MARGIN_RATIO", 0.03))
+    edge_margin_x = frame_w * edge_margin_ratio
+    edge_margin_y = frame_h * edge_margin_ratio
+
+    if (
+        x <= edge_margin_x or
+        y <= edge_margin_y or
+        (x + w) >= (frame_w - edge_margin_x) or
+        (y + h) >= (frame_h - edge_margin_y)
+    ):
+        return False, "too_close_to_edge"
+
+    return True, "ok"
 
 
 def class_name_from_id(cls_id):
@@ -294,6 +334,65 @@ def points_center(points):
     return (float(center[0]), float(center[1]))
 
 
+def rect_area(rect):
+    """返回 [x, y, w, h] 框面积."""
+    if len(rect) != 4:
+        return 0.0
+    return float(max(0, rect[2]) * max(0, rect[3]))
+
+
+def reset_limit_sign_history(state):
+    """清空当前限速牌历史聚合统计."""
+    state["limit_sign_history"] = {}
+
+
+def update_limit_sign_history(state, digit_text, score):
+    """按数字聚合累计限速牌 OCR 结果，只保留次数和分数和."""
+    history = state.setdefault("limit_sign_history", {})
+    item = history.setdefault(str(digit_text), {"count": 0, "score_sum": 0.0})
+    item["count"] = int(item.get("count", 0)) + 1
+    item["score_sum"] = float(item.get("score_sum", 0.0)) + float(score)
+
+    count = int(item["count"])
+    avg_score = float(item["score_sum"]) / float(max(count, 1))
+    return count, avg_score
+
+
+def select_best_limit_sign_candidate(state):
+    """从限速牌历史聚合统计里选当前最优候选。
+
+    规则:
+    1. 优先从出现次数达到 LIMIT_SIGN_CONFIRM_FRAMES 的候选里挑
+    2. 若都没达到，再从全部候选里挑
+    3. 同一池子里先比 count，再比平均置信度，再比分数和
+    """
+    history = dict(state.get("limit_sign_history", {}))
+    if not history:
+        return None
+
+    confirm_needed = max(1, int(getattr(config, "LIMIT_SIGN_CONFIRM_FRAMES", 2)))
+    candidates = []
+    for digit_text, item in history.items():
+        count = int(item.get("count", 0))
+        score_sum = float(item.get("score_sum", 0.0))
+        if count <= 0:
+            continue
+        avg_score = score_sum / float(count)
+        candidates.append({
+            "digit_text": str(digit_text),
+            "count": count,
+            "score_sum": score_sum,
+            "avg_score": avg_score,
+        })
+
+    if not candidates:
+        return None
+
+    stable_candidates = [c for c in candidates if c["count"] >= confirm_needed]
+    pool = stable_candidates if stable_candidates else candidates
+    return max(pool, key=lambda c: (c["count"], c["avg_score"], c["score_sum"]))
+
+
 # ==============================================================================
 # 核心线程 1：YOLO 检测线程
 # ==============================================================================
@@ -302,7 +401,7 @@ def yolo_worker():
 
     这个线程只做两件事:
     1. 执行 YOLO 推理并更新 global_yolo_boxes
-    2. 将 sign / limit_sign 类别的 ROI 任务投递给 OCR 线程
+    2. 将 sign / limit_sign 类别的候选任务连同同帧 TARGET_RES 图一起投递给 OCR 线程
 
     这样 OCR 不会反过来阻塞 YOLO，能显著降低检测延迟。
     """
@@ -336,9 +435,13 @@ def yolo_worker():
                 global_yolo_frame_id = int(frame_id)
                 fps_stats["yolo_frames"] += 1
 
-            # 只把需要 OCR 的 sign / limit_sign 框送到 OCR 队列，减少额外开销。
+            # 只把通过门槛的 sign / limit_sign 送去 OCR，减少不必要的整图文字检测开销。
+            # 其中 limit_sign 一旦面积达到“生效阈值”，就不再继续 OCR，
+            # 而是直接从历史聚合统计里挑选最优数字。
             sign_jobs = []
+            apply_limit_jobs = []
             skipped_jobs = []
+            limit_sign_seen = False
             for idx, obj in enumerate(objs):
                 cls_id = obj.get("class_id")
                 if cls_id not in (
@@ -347,17 +450,94 @@ def yolo_worker():
                 ):
                     continue
                 rect = obj.get("rect", [0, 0, 0, 0])
-                if not should_enqueue_ocr_job(cls_id, rect):
+                if cls_id == getattr(config, "LIMIT_SIGN_CLASS_ID", 10):
+                    limit_sign_seen = True
+                should_enqueue, skip_reason = should_enqueue_ocr_job(cls_id, rect)
+                if not should_enqueue:
+                    if (
+                        cls_id == getattr(config, "LIMIT_SIGN_CLASS_ID", 10) and
+                        skip_reason.startswith("ready_to_apply_history")
+                    ):
+                        apply_limit_jobs.append((idx, rect))
+                        continue
                     skipped_jobs.append(
-                        f"{class_name_from_id(cls_id)} rect={rect} reason=roi_too_small"
+                        f"{class_name_from_id(cls_id)} rect={rect} reason={skip_reason}"
                     )
                     continue
                 sign_jobs.append((idx, cls_id, rect))
 
+            limit_history_cleared = False
+            limit_applied_from_history = None
+            with data_lock:
+                if limit_sign_seen:
+                    global_control_data["limit_sign_last_detect_fid"] = int(frame_id)
+                else:
+                    last_limit_detect_fid = int(global_control_data.get("limit_sign_last_detect_fid", -1))
+                    max_miss = max(1, int(getattr(config, "LIMIT_SIGN_HISTORY_MAX_MISS_FRAMES", 15)))
+                    if last_limit_detect_fid >= 0 and int(frame_id) - last_limit_detect_fid > max_miss:
+                        if global_control_data.get("limit_sign_history"):
+                            reset_limit_sign_history(global_control_data)
+                            limit_history_cleared = True
+                        global_control_data["limit_sign_last_detect_fid"] = -1
+
+                if apply_limit_jobs:
+                    best_apply_idx, best_apply_rect = max(
+                        apply_limit_jobs,
+                        key=lambda item: rect_area(item[1]),
+                    )
+                    best_candidate = select_best_limit_sign_candidate(global_control_data)
+                    if best_candidate is not None:
+                        prev_effective_limit = global_control_data.get("speed_limit")
+                        last_speed_fid = int(global_control_data.get("speed_limit_fid", -1))
+                        if int(frame_id) >= last_speed_fid:
+                            speed_limit = int(best_candidate["digit_text"])
+                            effective_limit = max(0, speed_limit - 1)
+                            global_control_data["speed_limit"] = effective_limit
+                            global_control_data["speed_limit_fid"] = int(frame_id)
+                            reset_limit_sign_history(global_control_data)
+                            limit_applied_from_history = {
+                                "digit_text": best_candidate["digit_text"],
+                                "count": int(best_candidate["count"]),
+                                "avg_score": float(best_candidate["avg_score"]),
+                                "effective_limit": effective_limit,
+                                "area": int(rect_area(best_apply_rect)),
+                                "changed": effective_limit != prev_effective_limit,
+                            }
+
+                            if best_apply_idx < len(global_yolo_boxes):
+                                if global_yolo_boxes[best_apply_idx].get("class_id") == getattr(config, "LIMIT_SIGN_CLASS_ID", 10):
+                                    global_yolo_boxes[best_apply_idx]["text"] = best_candidate["digit_text"]
+                                    global_yolo_boxes[best_apply_idx]["ocr_score"] = float(best_candidate["avg_score"])
+
+            if limit_history_cleared:
+                throttled_log(
+                    "speed_limit_history_reset",
+                    "限速历史已清空: limit_sign 消失过久，避免旧牌子结果串到新牌子",
+                    min_interval=1.5
+                )
+
+            if limit_applied_from_history is not None:
+                throttled_log(
+                    "speed_limit_effective",
+                    "限速生效: "
+                    f"历史最优={limit_applied_from_history['digit_text']} "
+                    f"次数={limit_applied_from_history['count']} "
+                    f"平均置信度={limit_applied_from_history['avg_score']:.3f} "
+                    f"牌面面积={limit_applied_from_history['area']} "
+                    f"实际上限={limit_applied_from_history['effective_limit']}",
+                    state=(
+                        limit_applied_from_history["digit_text"],
+                        limit_applied_from_history["count"],
+                        round(limit_applied_from_history["avg_score"], 3),
+                        limit_applied_from_history["effective_limit"],
+                    ),
+                    min_interval=0.8
+                )
+
             if skipped_jobs:
                 throttled_log(
                     "ocr_skip",
-                    "OCR跳过: 检到路牌但框太小，未进入识别 | "
+                    "OCR跳过: 检到路牌但未满足识别门槛 | "
                     + " | ".join(skipped_jobs),
                     state=tuple(skipped_jobs),
                     min_interval=2.0
@@ -395,11 +575,16 @@ def ocr_worker():
     """纯 OCR 线程.
 
     输入:
-        yolo_worker 投递的 (frame_data, sign_jobs)
+        yolo_worker 投递的 (frame_data, sign_jobs, frame_id)
 
     输出:
         将识别出的 text / ocr_score 回写到 global_yolo_boxes，
-        同时根据 LEFT / RIGHT 更新 turn_intent。
+        同时根据 LEFT / RIGHT 更新 turn_intent，根据限速牌更新 speed_limit。
+
+    关键约束:
+    - OCR 在整张 TARGET_RES 图上执行 det + rec，不是直接拿检测框裁图识别
+    - 同一帧里的多个 OCR 结果，会按“中心点最近”去匹配各个路牌框
+    - 匹配结果回写时还会再核对 frame_id，避免旧帧 OCR 迟到污染新状态
     """
     try:
         ocr = OCRRecognizer(core_id=config.REC_CORE)
@@ -416,6 +601,7 @@ def ocr_worker():
 
             frame_data, sign_jobs, frame_id = job
             updates = []
+            # 这里跑的是整图 OCR，再把结果按中心点回匹配给 sign_jobs。
             ocr_results = ocr.run_full_frame(frame_data)
             if not ocr_results:
                 throttled_log(
@@ -520,39 +706,21 @@ def ocr_worker():
                                 )
                                 continue
 
+                            count, avg_score = update_limit_sign_history(
+                                global_control_data,
+                                digit_text,
+                                score,
+                            )
                             confirm_needed = max(1, int(getattr(config, "LIMIT_SIGN_CONFIRM_FRAMES", 2)))
-                            pending_text = str(global_control_data.get("pending_speed_limit_text", ""))
-                            pending_count = int(global_control_data.get("pending_speed_limit_count", 0))
-                            prev_effective_limit = global_control_data.get("speed_limit")
-
-                            if digit_text == pending_text:
-                                pending_count += 1
-                            else:
-                                pending_text = digit_text
-                                pending_count = 1
-
-                            global_control_data["pending_speed_limit_text"] = pending_text
-                            global_control_data["pending_speed_limit_count"] = pending_count
 
                             throttled_log(
                                 "speed_limit_pending",
-                                f"限速待确认: 识别值={digit_text} 连续次数={pending_count}/{confirm_needed}",
-                                state=(digit_text, pending_count, confirm_needed),
+                                "限速累计: "
+                                f"候选={digit_text} 次数={count}/{confirm_needed} "
+                                f"平均置信度={avg_score:.3f}",
+                                state=(digit_text, count, round(avg_score, 3), confirm_needed),
                                 min_interval=1.0
                             )
-
-                            speed_limit = int(digit_text)
-                            last_speed_fid = int(global_control_data.get("speed_limit_fid", -1))
-                            if pending_count >= confirm_needed and int(frame_id) >= last_speed_fid:
-                                global_control_data["speed_limit"] = max(0, speed_limit - 1)
-                                global_control_data["speed_limit_fid"] = int(frame_id)
-                                if global_control_data["speed_limit"] != prev_effective_limit:
-                                    throttled_log(
-                                        "speed_limit_effective",
-                                        f"限速生效: 牌面={speed_limit} 实际上限={global_control_data['speed_limit']}",
-                                        state=global_control_data["speed_limit"],
-                                        min_interval=0.8
-                                    )
                         except Exception:
                             pass
 
@@ -567,7 +735,7 @@ def seg_worker(core_id):
 
     它是控制闭环的核心：
     - 从 seg_queue 取最新 320x320 RGB 图
-    - 结合当前检测结果和转向意图生成 err_x / l_k
+    - 结合“当前最新一帧”的检测结果和转向意图生成 err_x / l_k
     - 渲染最终预览画面
     """
     global global_preview_frame
@@ -596,8 +764,8 @@ def seg_worker(core_id):
             fps_stats
         )
 
-        # segmentor 输出是 320 空间画面，这里统一放大回 TARGET_RES，
-        # 让检测框和页面显示都处于同一坐标系。
+            # segmentor 输出是 320 空间画面，这里统一放大回 TARGET_RES，
+            # 让检测框、OCR 文本和页面显示都处于同一坐标系。
         zebra_stopline, traffic_light_state = extract_scene_control_signals(current_yolo_boxes)
         if rendered_img is not None:
             if rendered_img.shape[1] != config.TARGET_RES[0] or rendered_img.shape[0] != config.TARGET_RES[1]:
@@ -719,7 +887,13 @@ def seg_worker(core_id):
 # 基础支撑线程：串口控制
 # ==============================================================================
 def serial_control_thread():
-    """根据 err_x / l_k 持续输出底层控制命令."""
+    """根据视觉状态持续输出底层控制命令.
+
+    当前速度控制是三层叠加关系:
+    1. 先根据弯道程度得到 dynamic_target_speed
+    2. 如果 speed_limit 已生效，再把它作为速度上限
+    3. 如果红/黄灯且停止线已接近，则强制把速度打到 0
+    """
     last_control_debug = None
     try:
         ser = serial.Serial(config.SERIAL_PORT, config.BAUD_RATE, timeout=0.1)
@@ -741,7 +915,6 @@ def serial_control_thread():
             if np.isnan(l_k) or np.isinf(l_k):
                 l_k = 0
 
-            max_speed = getattr(config, 'MOTOR_MAX_SPEED', 30)
             min_speed = 10
 
             # 弯越大，目标速度越低，避免高速出弯失控。
@@ -874,8 +1047,11 @@ def ai_producer_thread():
                 seg_queue.put(seg_blob)
 
                 # 检测分支直接生成 YOLO 输入尺寸的小图，避免大图先放大再缩小。
-                # 同时保留一份 TARGET_RES 大图，继续用于框绘制和 OCR 裁图。
-                # 注意: OCR 当前直接按 TARGET_RES 坐标系裁图，所以这里必须和检测框坐标系一致。
+                # 同时保留一份 TARGET_RES 大图，供:
+                # - 检测框绘制
+                # - OCR 整图 det + rec
+                # - OCR 结果回写后的页面可视化
+                # 注意: 检测框最终也会映射到 TARGET_RES 坐标系，所以这里要保持一致。
                 frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
                 det_img = cv2.resize(frame_bgr, config.YOLO_SIZE, interpolation=cv2.INTER_LINEAR)
                 vis_img_large = cv2.resize(frame_bgr, config.TARGET_RES, interpolation=cv2.INTER_LINEAR)
