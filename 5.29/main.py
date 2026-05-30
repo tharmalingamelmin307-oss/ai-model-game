@@ -38,12 +38,11 @@ global_preview_frame = None
 
 # 供分割线程、串口线程、OCR 线程共享的控制状态。
 # 这份状态是系统里最核心的一块“跨线程控制面板”：
-# - seg_worker 写入 err_x / l_k / 红绿灯 / 停止线
+# - seg_worker 写入 steer_signal / 红绿灯 / 停止线
 # - ocr_worker 写入 turn_intent / speed_limit
 # - serial_control_thread 读取这些状态并生成最终底层控制命令
 global_control_data = {
-    "error_x": 0,
-    "line_k": 0,
+    "steer_signal": 0.0,
     "turn_intent": -1,
     "turn_intent_fid": -1,
     "speed_limit": None,
@@ -735,7 +734,7 @@ def seg_worker(core_id):
 
     它是控制闭环的核心：
     - 从 seg_queue 取最新 320x320 RGB 图
-    - 结合“当前最新一帧”的检测结果和转向意图生成 err_x / l_k
+    - 结合“当前最新一帧”的检测结果和转向意图生成 steer_signal
     - 渲染最终预览画面
     """
     global global_preview_frame
@@ -757,7 +756,7 @@ def seg_worker(core_id):
             current_yolo_boxes = [obj.copy() for obj in global_yolo_boxes]
             turn_intent = global_control_data.get("turn_intent", -1)
 
-        err_x, l_k, rendered_img = seg.run(
+        steer_signal, rendered_img = seg.run(
             blob_rgb_320,
             current_yolo_boxes,
             turn_intent,
@@ -778,8 +777,7 @@ def seg_worker(core_id):
             rendered_img = draw_zebra_stopline(rendered_img, zebra_stopline)
 
         with data_lock:
-            global_control_data["error_x"] = err_x
-            global_control_data["line_k"] = l_k
+            global_control_data["steer_signal"] = steer_signal
             global_control_data["traffic_light_state"] = traffic_light_state
             global_control_data["zebra_stopline_y"] = None if zebra_stopline is None else int(zebra_stopline[1])
 
@@ -816,7 +814,7 @@ def seg_worker(core_id):
             )
             cv2.putText(
                 rendered_img,
-                f"Err:{err_x:.1f}cm Srv:{actual_servo}",
+                f"Ctrl:{steer_signal:.1f} Srv:{actual_servo}",
                 (6, 132),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.42,
@@ -890,7 +888,7 @@ def serial_control_thread():
     """根据视觉状态持续输出底层控制命令.
 
     当前速度控制是三层叠加关系:
-    1. 先根据弯道程度得到 dynamic_target_speed
+    1. 先根据 steer_signal 幅度得到 dynamic_target_speed
     2. 如果 speed_limit 已生效，再把它作为速度上限
     3. 如果红/黄灯且停止线已接近，则强制把速度打到 0
     """
@@ -902,23 +900,22 @@ def serial_control_thread():
 
     while True:
         with data_lock:
-            err_x = global_control_data.get("error_x", 0)
-            l_k = global_control_data.get("line_k", 0)
+            steer_signal = global_control_data.get("steer_signal", 0.0)
             speed_limit = global_control_data.get("speed_limit")
             zebra_stopline_y = global_control_data.get("zebra_stopline_y")
             traffic_light_state = str(global_control_data.get("traffic_light_state", ""))
             traffic_stop_active = bool(global_control_data.get("traffic_stop_active", False))
 
         try:
-            if np.isnan(err_x) or np.isinf(err_x):
-                err_x = 0
-            if np.isnan(l_k) or np.isinf(l_k):
-                l_k = 0
+            if np.isnan(steer_signal) or np.isinf(steer_signal):
+                steer_signal = 0.0
 
             min_speed = 10
 
-            # 弯越大，目标速度越低，避免高速出弯失控。
-            dynamic_target_speed = 30 - int(abs(l_k) * 10)
+            # 转向量幅度越大，目标速度越低，避免高速出弯失控。
+            dynamic_target_speed = 30 - int(
+                abs(steer_signal) * getattr(config, "STEER_SIGNAL_SPEED_GAIN", 0.02)
+            )
             dynamic_target_speed = int(max(min_speed, min(30, dynamic_target_speed)))
             target_speed = dynamic_target_speed
             if speed_limit is not None:
@@ -940,15 +937,10 @@ def serial_control_thread():
 
             limit_applied = speed_limit is not None and dynamic_target_speed > int(speed_limit)
 
-            # 一个简单但够用的串级控制：
-            # 横向误差负责“拉回中心”，斜率负责“提前预瞄修正”。
-            base_p = err_x * getattr(config, 'KP', 0.16)
-            extra_p = 0
-            if abs(err_x) > 80:
-                extra_p = (abs(err_x) - 80) * 0.4 * np.sign(err_x)
-            d_term = l_k * getattr(config, 'KD', 160.0)
-
-            raw_pwm = getattr(config, 'SERVO_CENTER', 750) - base_p - extra_p + d_term
+            raw_pwm = (
+                getattr(config, 'SERVO_CENTER', 750)
+                - steer_signal * getattr(config, 'STEER_SIGNAL_PWM_GAIN', 0.03)
+            )
             servo_pwm = int(max(getattr(config, 'SERVO_MIN', 590), min(getattr(config, 'SERVO_MAX', 910), raw_pwm)))
         except:
             target_speed = 10
@@ -956,6 +948,7 @@ def serial_control_thread():
             dynamic_target_speed = target_speed
             stop_ready = False
             limit_applied = False
+            steer_signal = 0.0
 
         with data_lock:
             global_control_data["traffic_stop_active"] = traffic_stop_active
@@ -968,6 +961,8 @@ def serial_control_thread():
             bool(traffic_stop_active),
             bool(stop_ready),
             bool(limit_applied),
+            round(float(steer_signal), 1),
+            int(servo_pwm),
             int(target_speed),
             int(dynamic_target_speed),
         )
@@ -981,6 +976,7 @@ def serial_control_thread():
                 "control_state",
                 "控速状态: "
                 f"基础速度={dynamic_target_speed} 最终速度={target_speed} "
+                f"控制量={steer_signal:.1f} 舵机={servo_pwm} "
                 f"限速上限={speed_limit_text} 限速生效={limit_text} "
                 f"灯色={light_text} 停车线已接近={stop_ready_text} 红黄灯停车={stop_active_text}",
                 state=control_debug,

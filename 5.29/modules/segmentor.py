@@ -4,9 +4,9 @@
 这个模块负责:
 1. 调用分割模型得到二值赛道 mask
 2. 在 mask 空间中搜索一条可跟踪路径（引入分支局部中心约束，抑制切内线）
-3. 将路径投影到鸟瞰图坐标系，计算横向误差和预瞄斜率
+3. 基于路径点到图像底部中点的加权斜率和，生成单一转向控制量
 4. 引入多项式时域低通滤波 (EMA)，提升路径稳定性
-5. 返回用于控制的 err_x / l_k，以及一张调试渲染图
+5. 返回用于控制的 steer_signal，以及一张调试渲染图
 
 当前路径选择策略的核心优先级是:
 1. 先从 mask 里搜索可连接的候选路径
@@ -181,6 +181,22 @@ class RoadSegmentor:
 
         return planning_items
 
+    def _compute_weighted_steer_signal(self, path_points, img_w, img_h):
+        """按“路径点到底部中点连线斜率 * 行号”的方式聚合单一控制量."""
+        if path_points is None or len(path_points) == 0:
+            return 0.0
+
+        pts = np.array(path_points, dtype=np.float32).reshape((-1, 2))
+        # 以图像几何中线为 0，保证垂直中线上的路径控制量严格为 0。
+        bottom_mid_x = float(img_w) / 2.0
+        bottom_y = float(img_h) - 1.0
+        min_dy = float(getattr(config, "STEER_SIGNAL_MIN_DY", 8.0))
+
+        dy = np.maximum(bottom_y - pts[:, 1], min_dy)
+        slopes = (pts[:, 0] - bottom_mid_x) / dy
+        row_weights = np.clip(pts[:, 1], 0.0, bottom_y)
+        return float(np.sum(slopes * row_weights))
+
     def _draw_planning_points(self, canvas, planning_items):
         """在俯视图上绘制规划相关目标的质心点，必要时附加半径圈."""
         for item in planning_items:
@@ -230,11 +246,9 @@ class RoadSegmentor:
         - turn_intent: OCR 给出的 LEFT / RIGHT 分叉意图
 
         输出:
-        - err_x: 鸟瞰图横向偏差，已经换算到近似厘米
-        - l_k: 预瞄斜率，供控制线程做提前修正
+        - steer_signal: 单一转向控制量，来自路径点加权斜率和
         - ai_view: 320 空间调试图，主线程会再放大回 TARGET_RES
         """
-        w_out, h_out = config.TARGET_RES # 960, 720
         w_seg, h_seg = config.SEG_SIZE   # 320, 320
         
         # ai_view 是最终调试图的底板，保持在 320 空间，后续再由主线程放大。
@@ -256,7 +270,7 @@ class RoadSegmentor:
         # -------------------------------------------------------------------
         # 3. 在 mask 空间中做自底向上的路径搜索（重构：局部中线记录版）
         # -------------------------------------------------------------------
-        err_x, l_k = 0.0, 0.0
+        steer_signal = 0.0
         pts_final_orig = None
         pts_final_bird = None
         
@@ -389,22 +403,14 @@ class RoadSegmentor:
                     
                 dense_y = np.linspace(node_y[0], node_y[-1], num=30)
                 dense_x = np.polyval(poly_coeffs, dense_y)
-                
-                pts_final_orig = np.vstack((dense_x, dense_y)).astype(np.float32).T.reshape((-1, 1, 2))
+                dense_x = np.clip(dense_x, 0, w_seg - 1)
+                dense_y = np.clip(dense_y, 0, h_seg - 1)
+
+                path_points_orig = np.vstack((dense_x, dense_y)).astype(np.float32).T
+                steer_signal = self._compute_weighted_steer_signal(path_points_orig, w_seg, h_seg)
+
+                pts_final_orig = path_points_orig.reshape((-1, 1, 2))
                 pts_final_bird = cv2.perspectiveTransform(pts_final_orig, self.M_seg)
-                
-                bird_nodes = pts_final_bird.squeeze()
-                if bird_nodes.ndim == 2:
-                    bx = bird_nodes[:, 0]
-                    by = bird_nodes[:, 1]
-                    
-                    car_center_x_bird = w_seg / 2.0
-                    err_x = (bx[0] - car_center_x_bird) * getattr(config, 'CM_PER_PIXEL_X', 0.109649) * (w_out / w_seg)
-                    
-                    lookahead_idx = min(12, len(by) - 1)
-                    dy_l = by[0] - by[lookahead_idx]
-                    dx_l = bx[0] - bx[lookahead_idx]
-                    l_k = dx_l / dy_l if dy_l != 0 else 0.0
             else:
                 # 极端丢线情况：平滑清空历史系数，防止干扰后续帧恢复
                 self.last_poly_coeffs = None
@@ -418,6 +424,8 @@ class RoadSegmentor:
         
         if pts_final_orig is not None:
             cv2.polylines(ai_view, [pts_final_orig.astype(np.int32)], False, (255, 0, 255), 2)
+        bottom_mid_pt = (int(round(w_seg / 2.0)), h_seg - 1)
+        cv2.circle(ai_view, bottom_mid_pt, 4, (255, 255, 0), -1)
 
         bird_eye_mask = cv2.warpPerspective(mask, self.M_seg, (w_seg, h_seg), flags=cv2.INTER_NEAREST)
         pip_img = cv2.cvtColor(np.where(bird_eye_mask == 1, 255, 0).astype(np.uint8), cv2.COLOR_GRAY2BGR)
@@ -431,9 +439,13 @@ class RoadSegmentor:
         ai_view[0:pip_h, w_seg-pip_w:w_seg] = cv2.resize(pip_img, (pip_w, pip_h))
         cv2.rectangle(ai_view, (w_seg-pip_w, 0), (w_seg, pip_h), (255, 255, 255), 1)
 
-        servo_pwm = int(getattr(config, 'SERVO_CENTER', 750) + (err_x * getattr(config, 'KP', 0.16)) - (l_k * getattr(config, 'KD', 160.0)))
+        servo_pwm = int(
+            getattr(config, 'SERVO_CENTER', 750)
+            - steer_signal * getattr(config, 'STEER_SIGNAL_PWM_GAIN', 0.03)
+        )
+        servo_pwm = int(max(getattr(config, 'SERVO_MIN', 590), min(getattr(config, 'SERVO_MAX', 910), servo_pwm)))
         cv2.putText(ai_view, f"Seg FPS:{fps_stats.get('seg_fps', 0):.1f} YOLO:{fps_stats.get('yolo_fps', 0):.1f}", (5, 18), 1, 0.8, (0, 255, 0), 1)
-        cv2.putText(ai_view, f"Err:{err_x:.1f}cm PWM:{servo_pwm}", (5, 36), 1, 0.8, (0, 255, 255), 1)
+        cv2.putText(ai_view, f"Ctrl:{steer_signal:.1f} PWM:{servo_pwm}", (5, 36), 1, 0.8, (0, 255, 255), 1)
         stone_side_text = "UNK"
         if 'stone_branch_side' in locals():
             if stone_branch_side == -1:
@@ -444,4 +456,4 @@ class RoadSegmentor:
                 stone_side_text = "NONE"
         cv2.putText(ai_view, f"Stone:{stone_side_text}", (5, 54), 1, 0.8, (0, 200, 255), 1)
 
-        return err_x, l_k, ai_view
+        return steer_signal, ai_view
