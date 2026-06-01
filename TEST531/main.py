@@ -925,7 +925,6 @@ def seg_worker(core_id):
                 config.PREVIEW_TEXT_THICKNESS,
                 cv2.LINE_AA
             )
-
         with frame_lock:
             global_preview_frame = rendered_img
 

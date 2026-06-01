@@ -55,6 +55,19 @@ class RoadSegmentor:
         self.last_branch_stats = {
             "branch_pair_count_max": 0,
             "branch_support_rows": 0,
+            "fork_active": False,
+            "y_fork_active": False,
+            "y_fork_bottom_width": 0.0,
+        }
+        self.last_main_overlay = {
+            "path": None,
+            "left": None,
+            "right": None,
+            "candidate_left": None,
+            "candidate_right": None,
+            "fork_point": None,
+            "bottom_mid": (0.0, 0.0),
+            "base_size": tuple(config.SEG_SIZE),
         }
         self.seg_profile_enabled = bool(getattr(config, "SEG_PROFILE_ENABLED", False))
         self.seg_profile_print_interval = float(getattr(config, "SEG_PROFILE_PRINT_INTERVAL", 1.0))
@@ -68,6 +81,132 @@ class RoadSegmentor:
             "render": 0.0,
             "total": 0.0,
         }
+
+    def _store_main_overlay(
+        self,
+        path_pts,
+        left_pts,
+        right_pts,
+        img_w,
+        img_h,
+        candidate_left_pts=None,
+        candidate_right_pts=None,
+        fork_point=None,
+    ):
+        """缓存主图路径叠加层，供主线程在其它元素之上重绘."""
+        self.last_main_overlay = {
+            "path": None if path_pts is None else np.array(path_pts, dtype=np.float32).copy(),
+            "left": None if left_pts is None else np.array(left_pts, dtype=np.float32).copy(),
+            "right": None if right_pts is None else np.array(right_pts, dtype=np.float32).copy(),
+            "candidate_left": None if candidate_left_pts is None else np.array(candidate_left_pts, dtype=np.float32).copy(),
+            "candidate_right": None if candidate_right_pts is None else np.array(candidate_right_pts, dtype=np.float32).copy(),
+            "fork_point": None if fork_point is None else (float(fork_point[0]), float(fork_point[1])),
+            "bottom_mid": (float(img_w) / 2.0, float(img_h) - 1.0),
+            "base_size": (int(img_w), int(img_h)),
+        }
+
+    def draw_path_overlay(self, image):
+        """把最近一次搜索得到的主图路径/边界叠加到任意尺寸的画面最上层."""
+        if image is None:
+            return image
+
+        overlay = self.last_main_overlay
+        base_w, base_h = overlay.get("base_size", tuple(config.SEG_SIZE))
+        if base_w <= 0 or base_h <= 0:
+            return image
+
+        img_h, img_w = image.shape[:2]
+        scale_x = img_w / float(base_w)
+        scale_y = img_h / float(base_h)
+        scale = max(scale_x, scale_y)
+
+        def _scaled_polyline(polyline):
+            if polyline is None:
+                return None
+            pts = np.array(polyline, dtype=np.float32).copy().reshape((-1, 1, 2))
+            pts[:, 0, 0] *= scale_x
+            pts[:, 0, 1] *= scale_y
+            return pts.astype(np.int32)
+
+        path_poly = _scaled_polyline(overlay.get("path"))
+        left_poly = _scaled_polyline(overlay.get("left"))
+        right_poly = _scaled_polyline(overlay.get("right"))
+        candidate_left_poly = _scaled_polyline(overlay.get("candidate_left"))
+        candidate_right_poly = _scaled_polyline(overlay.get("candidate_right"))
+
+        path_thickness = max(1, int(round(config.SEG_DEBUG_PATH_THICKNESS * scale)))
+        boundary_thickness = max(1, int(round(config.SEG_DEBUG_BOUNDARY_THICKNESS * scale)))
+        candidate_path_thickness = max(1, int(round(config.SEG_DEBUG_CANDIDATE_PATH_THICKNESS * scale)))
+        bottom_mid_radius = max(1, int(round(config.SEG_DEBUG_BOTTOM_MID_RADIUS * scale)))
+
+        if candidate_left_poly is not None:
+            cv2.polylines(
+                image,
+                [candidate_left_poly],
+                False,
+                config.SEG_DEBUG_LEFT_PATH_COLOR,
+                candidate_path_thickness,
+            )
+        if candidate_right_poly is not None:
+            cv2.polylines(
+                image,
+                [candidate_right_poly],
+                False,
+                config.SEG_DEBUG_RIGHT_PATH_COLOR,
+                candidate_path_thickness,
+            )
+        if path_poly is not None:
+            cv2.polylines(
+                image,
+                [path_poly],
+                False,
+                config.SEG_DEBUG_PATH_COLOR,
+                path_thickness,
+            )
+        if left_poly is not None:
+            cv2.polylines(
+                image,
+                [left_poly],
+                False,
+                config.SEG_DEBUG_LEFT_BOUNDARY_COLOR,
+                boundary_thickness,
+            )
+        if right_poly is not None:
+            cv2.polylines(
+                image,
+                [right_poly],
+                False,
+                config.SEG_DEBUG_RIGHT_BOUNDARY_COLOR,
+                boundary_thickness,
+            )
+
+        bottom_mid = overlay.get("bottom_mid", (float(base_w) / 2.0, float(base_h) - 1.0))
+        bottom_mid_pt = (
+            int(round(float(bottom_mid[0]) * scale_x)),
+            int(round(float(bottom_mid[1]) * scale_y)),
+        )
+        fork_point = overlay.get("fork_point")
+        if fork_point is not None:
+            fork_pt = (
+                int(round(float(fork_point[0]) * scale_x)),
+                int(round(float(fork_point[1]) * scale_y)),
+            )
+            cv2.line(
+                image,
+                fork_pt,
+                bottom_mid_pt,
+                config.SEG_DEBUG_FORK_DIVIDER_COLOR,
+                max(1, int(round(config.SEG_DEBUG_FORK_DIVIDER_THICKNESS * scale))),
+                cv2.LINE_AA,
+            )
+        cv2.circle(
+            image,
+            bottom_mid_pt,
+            bottom_mid_radius,
+            config.SEG_DEBUG_BOTTOM_MID_COLOR,
+            -1,
+        )
+        return image
 
     def _profile_add(self, infer_s, preprocess_s, search_s, fit_s, render_s, total_s):
         """累计分割链路阶段耗时，并按时间窗口打印平均值."""
@@ -149,6 +288,188 @@ class RoadSegmentor:
         )
         return cv2.subtract(mask_u8, interior)
 
+    def _find_mask_runs(self, mask_row, gap_thresh, min_pixels):
+        """在单行 mask 上寻找若干横向白区段，供分叉几何判定使用."""
+        xs = np.where(mask_row > 0)[0]
+        if len(xs) == 0:
+            return []
+
+        splits = np.split(xs, np.where(np.diff(xs) > int(gap_thresh))[0] + 1)
+        runs = []
+        for split in splits:
+            pixel_count = int(len(split))
+            if pixel_count < int(min_pixels):
+                continue
+
+            left_x = int(split[0])
+            right_x = int(split[-1])
+            runs.append({
+                "left_x": float(left_x),
+                "right_x": float(right_x),
+                "center_x": 0.5 * float(left_x + right_x),
+                "width": float(right_x - left_x),
+                "pixel_count": pixel_count,
+            })
+        return runs
+
+    def _pick_dual_branch_runs(self, runs):
+        """从一组横向白区段里挑出最像左右两支的组合."""
+        if len(runs) < 2:
+            return None
+
+        best_pair = None
+        for left_idx in range(len(runs) - 1):
+            for right_idx in range(left_idx + 1, len(runs)):
+                left_run = runs[left_idx]
+                right_run = runs[right_idx]
+                separation = float(right_run["center_x"]) - float(left_run["center_x"])
+                if separation < float(config.FORK_MIN_BRANCH_SEP):
+                    continue
+
+                score = (
+                    min(int(left_run["pixel_count"]), int(right_run["pixel_count"])),
+                    int(left_run["pixel_count"]) + int(right_run["pixel_count"]),
+                    separation,
+                )
+                if best_pair is None or score > best_pair["score"]:
+                    best_pair = {
+                        "left_run": left_run,
+                        "right_run": right_run,
+                        "separation": separation,
+                        "score": score,
+                    }
+        return best_pair
+
+    def _detect_y_fork(self, search_mask):
+        """识别 Y 型路口，并估计用于切分左右区域的分叉点."""
+        if search_mask is None or search_mask.size == 0:
+            return {"active": False, "bottom_width": 0.0, "fork_point": None, "split_rows": 0}
+
+        h, w = search_mask.shape[:2]
+        bottom_margin = max(0, int(config.SEG_PATH_BOTTOM_MARGIN))
+        bottom_band_height = max(1, int(config.FORK_BOTTOM_BAND_HEIGHT))
+        bottom_y_end = max(1, h - bottom_margin)
+        bottom_y_start = max(0, bottom_y_end - bottom_band_height)
+
+        bottom_width = 0.0
+        for sample_y in range(bottom_y_end - 1, bottom_y_start - 1, -1):
+            runs = self._find_mask_runs(
+                search_mask[sample_y],
+                config.FORK_MASK_GAP_THRESH,
+                config.FORK_MASK_MIN_BRANCH_PIXELS,
+            )
+            if not runs:
+                continue
+            widest_run = max(runs, key=lambda run: float(run["width"]))
+            bottom_width = max(bottom_width, float(widest_run["width"]))
+
+        if bottom_width < float(config.FORK_MIN_BOTTOM_WIDTH):
+            return {
+                "active": False,
+                "bottom_width": bottom_width,
+                "fork_point": None,
+                "split_rows": 0,
+            }
+
+        upper_center_y = int(round((h - 1) * float(config.FORK_UPPER_ROW_RATIO)))
+        upper_band_height = max(1, int(config.FORK_UPPER_BAND_HEIGHT))
+        upper_half = upper_band_height // 2
+        upper_y_start = max(0, upper_center_y - upper_half)
+        upper_y_end = min(h - 1, upper_center_y + upper_half)
+
+        upper_best = None
+        for sample_y in range(upper_y_start, upper_y_end + 1):
+            runs = self._find_mask_runs(
+                search_mask[sample_y],
+                config.FORK_MASK_GAP_THRESH,
+                config.FORK_MASK_MIN_BRANCH_PIXELS,
+            )
+            dual_branch = self._pick_dual_branch_runs(runs)
+            if dual_branch is None:
+                continue
+
+            pick_key = (
+                dual_branch["score"],
+                -abs(sample_y - upper_center_y),
+            )
+            if upper_best is None or pick_key > upper_best["pick_key"]:
+                fork_x = 0.5 * (
+                    float(dual_branch["left_run"]["right_x"]) +
+                    float(dual_branch["right_run"]["left_x"])
+                )
+                upper_best = {
+                    "left_run": dual_branch["left_run"],
+                    "right_run": dual_branch["right_run"],
+                    "separation": dual_branch["separation"],
+                    "y": int(sample_y),
+                    "fork_x": float(fork_x),
+                    "pick_key": pick_key,
+                }
+
+        if upper_best is None:
+            return {
+                "active": False,
+                "bottom_width": bottom_width,
+                "fork_point": None,
+                "split_rows": 0,
+            }
+
+        lowest_split = dict(upper_best)
+        split_rows = 0
+        for sample_y in range(int(upper_best["y"]), bottom_y_start + 1):
+            runs = self._find_mask_runs(
+                search_mask[sample_y],
+                config.FORK_MASK_GAP_THRESH,
+                config.FORK_MASK_MIN_BRANCH_PIXELS,
+            )
+            dual_branch = self._pick_dual_branch_runs(runs)
+            if dual_branch is None:
+                continue
+
+            split_rows += 1
+            lowest_split = {
+                "left_run": dual_branch["left_run"],
+                "right_run": dual_branch["right_run"],
+                "separation": dual_branch["separation"],
+                "y": int(sample_y),
+                "fork_x": 0.5 * (
+                    float(dual_branch["left_run"]["right_x"]) +
+                    float(dual_branch["right_run"]["left_x"])
+                ),
+            }
+
+        return {
+            "active": True,
+            "bottom_width": bottom_width,
+            "fork_point": (float(lowest_split["fork_x"]), float(lowest_split["y"])),
+            "split_rows": max(1, int(split_rows)),
+        }
+
+    def _split_mask_by_fork(self, search_mask, fork_point):
+        """按“分叉点到底部中点”的分界线，把 mask 切成左右两大区域."""
+        h, w = search_mask.shape[:2]
+        bottom_mid_x = float(w) / 2.0
+        bottom_y = float(h) - 1.0
+        fork_x = float(fork_point[0])
+        fork_y = float(fork_point[1])
+
+        left_mask = np.zeros_like(search_mask, dtype=np.uint8)
+        right_mask = np.zeros_like(search_mask, dtype=np.uint8)
+
+        divider_dy = max(1.0, bottom_y - fork_y)
+        for y in range(h):
+            if float(y) <= fork_y:
+                split_x = fork_x
+            else:
+                t = np.clip((float(y) - fork_y) / divider_dy, 0.0, 1.0)
+                split_x = fork_x + (bottom_mid_x - fork_x) * t
+
+            split_col = int(np.clip(round(split_x), 0, w - 1))
+            left_mask[y, :split_col + 1] = search_mask[y, :split_col + 1]
+            right_mask[y, split_col:] = search_mask[y, split_col:]
+
+        return left_mask, right_mask
+
     def _build_row_segments(self, mask_row, edge_row):
         """把单行白区解析成若干个左右边界配对后的通道片段."""
         xs = np.where(mask_row > 0)[0]
@@ -190,6 +511,169 @@ class RoadSegmentor:
 
         return segments
 
+    def _search_active_paths(self, search_mask, edge_mask):
+        """在给定 mask 区域内做一次自底向上的多候选路径搜索."""
+        h_seg, _ = search_mask.shape[:2]
+        step_y = int(config.SEG_PATH_SEARCH_STEP_Y)
+        active_paths = []
+        branch_pair_count_max = 0
+        branch_support_rows = 0
+
+        fallback_top_y = int(h_seg * float(config.SEG_PATH_SCAN_TOP_RATIO))
+        fallback_top_y = int(np.clip(fallback_top_y, 0, h_seg - 1))
+        mask_rows = np.where(np.any(search_mask > 0, axis=1))[0]
+        if len(mask_rows) > 0:
+            top_y = int(mask_rows[0])
+        else:
+            top_y = fallback_top_y
+
+        work_mask = search_mask.copy()
+        work_edge = edge_mask.copy()
+        if top_y > 0:
+            work_mask[:top_y, :] = 0
+            work_edge[:top_y, :] = 0
+
+        bottom_y = h_seg - int(config.SEG_PATH_BOTTOM_MARGIN)
+        bottom_slice_height = int(config.SEG_PATH_BOTTOM_SLICE_HEIGHT)
+        start_segments = []
+        start_row_y = None
+        for sample_y in range(bottom_y, max(-1, bottom_y - bottom_slice_height), -1):
+            row_segments = self._build_row_segments(work_mask[sample_y], work_edge[sample_y])
+            if not row_segments:
+                continue
+            start_segments = row_segments
+            start_row_y = sample_y
+            break
+
+        if not start_segments:
+            return active_paths, branch_pair_count_max, branch_support_rows
+
+        branch_pair_count_max = max(branch_pair_count_max, len(start_segments))
+        if len(start_segments) >= 2:
+            branch_support_rows += 1
+
+        for segment in start_segments:
+            active_paths.append([{
+                "pt": (segment["center_x"], float(start_row_y)),
+                "left_x": segment["left_x"],
+                "right_x": segment["right_x"],
+                "width": segment["width"],
+                "local_center": segment["center_x"],
+                "pair_count": len(start_segments),
+            }])
+
+        curr_y = start_row_y - step_y
+        while curr_y >= top_y:
+            row_start = max(0, curr_y - step_y // 2)
+            row_end = min(h_seg, curr_y + step_y // 2 + 1)
+
+            best_row_y = None
+            best_segments = []
+            best_score = (-1, -1.0)
+            for sample_y in range(row_start, row_end):
+                row_segments = self._build_row_segments(work_mask[sample_y], work_edge[sample_y])
+                score = (len(row_segments), float(sum(seg["width"] for seg in row_segments)))
+                if score > best_score:
+                    best_score = score
+                    best_segments = row_segments
+                    best_row_y = sample_y
+
+            if not best_segments:
+                curr_y -= step_y
+                continue
+
+            branch_pair_count_max = max(branch_pair_count_max, len(best_segments))
+            if len(best_segments) >= 2:
+                branch_support_rows += 1
+
+            if not active_paths:
+                for segment in best_segments:
+                    active_paths.append([{
+                        "pt": (segment["center_x"], float(best_row_y)),
+                        "left_x": segment["left_x"],
+                        "right_x": segment["right_x"],
+                        "width": segment["width"],
+                        "local_center": segment["center_x"],
+                        "pair_count": len(best_segments),
+                    }])
+            else:
+                new_paths = []
+                used_segments = set()
+
+                for path in active_paths:
+                    last_node = path[-1]
+                    matched = False
+                    for seg_idx, segment in enumerate(best_segments):
+                        if not self._segments_can_connect(last_node, segment):
+                            continue
+
+                        node = {
+                            "pt": (segment["center_x"], float(best_row_y)),
+                            "left_x": segment["left_x"],
+                            "right_x": segment["right_x"],
+                            "width": segment["width"],
+                            "local_center": segment["center_x"],
+                            "pair_count": len(best_segments),
+                        }
+                        new_paths.append(path + [node])
+                        used_segments.add(seg_idx)
+                        matched = True
+
+                    if not matched:
+                        new_paths.append(path)
+
+                for seg_idx, segment in enumerate(best_segments):
+                    if seg_idx in used_segments:
+                        continue
+                    new_paths.append([{
+                        "pt": (segment["center_x"], float(best_row_y)),
+                        "left_x": segment["left_x"],
+                        "right_x": segment["right_x"],
+                        "width": segment["width"],
+                        "local_center": segment["center_x"],
+                        "pair_count": len(best_segments),
+                    }])
+
+                active_paths = new_paths
+                if len(active_paths) > int(config.SEG_PATH_MAX_ACTIVE_PATHS):
+                    active_paths = self._prune_active_paths(active_paths)
+
+            curr_y -= step_y
+
+        return active_paths, branch_pair_count_max, branch_support_rows
+
+    def _score_candidate_paths(self, active_paths):
+        """对候选路径列表打分，返回可参与最终决策的候选池."""
+        valid_candidates = []
+        for path in active_paths:
+            if len(path) < int(config.SEG_PATH_MIN_LENGTH):
+                continue
+
+            path_arr = np.array([node["pt"] for node in path], dtype=np.float32)
+            px = path_arr[:, 0]
+            widths = np.array([node["width"] for node in path], dtype=np.float32)
+
+            length_score = len(path) * float(config.SEG_PATH_LENGTH_SCORE_GAIN)
+            dx = np.diff(px)
+            smooth_score = -np.std(dx) * float(config.SEG_PATH_SMOOTH_SCORE_GAIN)
+
+            center_penalty = 0.0
+            for node in path:
+                center_penalty += abs(node["pt"][0] - node["local_center"]) * float(config.SEG_PATH_CENTER_PENALTY_GAIN)
+
+            width_score = 0.05 * float(np.mean(widths)) if len(widths) > 0 else 0.0
+            base_score = length_score + smooth_score + width_score - center_penalty
+            avg_x = float(np.mean(px))
+
+            valid_candidates.append({
+                "path": path_arr,
+                "nodes": path,
+                "score": base_score,
+                "avg_x": avg_x,
+            })
+
+        return valid_candidates
+
     def _segments_can_connect(self, prev_node, curr_segment):
         """判断上下两层的通道片段是否属于同一条候选路径."""
         prev_center = float(prev_node["pt"][0])
@@ -220,6 +704,65 @@ class RoadSegmentor:
         xs = path[:, 0]
         idx = int(np.argmin(np.abs(ys - float(target_y))))
         return float(xs[idx])
+
+    def _prune_active_paths(self, active_paths):
+        """裁剪候选路径数量，同时尽量保住左右代表分支."""
+        max_paths = int(config.SEG_PATH_MAX_ACTIVE_PATHS)
+        if len(active_paths) <= max_paths:
+            return active_paths
+
+        ranked_paths = sorted(active_paths, key=lambda p: len(p), reverse=True)
+        kept_paths = []
+        kept_ids = set()
+
+        def _keep(path):
+            path_id = id(path)
+            if path_id in kept_ids:
+                return
+            kept_ids.add(path_id)
+            kept_paths.append(path)
+
+        if len(ranked_paths) >= 2:
+            left_path = min(ranked_paths, key=lambda p: float(p[-1]["pt"][0]))
+            right_path = max(ranked_paths, key=lambda p: float(p[-1]["pt"][0]))
+            if abs(float(right_path[-1]["pt"][0]) - float(left_path[-1]["pt"][0])) >= float(config.PATH_LOCK_FORK_MIN_SEP):
+                _keep(left_path)
+                _keep(right_path)
+
+        for path in ranked_paths:
+            if len(kept_paths) >= max_paths:
+                break
+            _keep(path)
+
+        return kept_paths[:max_paths]
+
+    def _select_fork_representatives(self, candidate_paths, branch_support_rows):
+        """在明显岔路里提取左右代表候选，避免某一支在筛选前被丢掉."""
+        if branch_support_rows <= 0 or len(candidate_paths) < 2:
+            return None, None, False
+
+        sorted_by_x = sorted(candidate_paths, key=lambda c: float(c["avg_x"]))
+        leftmost = sorted_by_x[0]
+        rightmost = sorted_by_x[-1]
+
+        fork_sep = float(rightmost["avg_x"]) - float(leftmost["avg_x"])
+        if leftmost is rightmost or fork_sep < float(config.PATH_LOCK_FORK_MIN_SEP):
+            return None, None, False
+
+        split_x = 0.5 * (float(leftmost["avg_x"]) + float(rightmost["avg_x"]))
+        left_group = [c for c in candidate_paths if float(c["avg_x"]) <= split_x]
+        right_group = [c for c in candidate_paths if float(c["avg_x"]) >= split_x]
+
+        if not left_group or not right_group:
+            return None, None, False
+
+        left_repr = max(left_group, key=lambda c: (float(c["score"]), -float(c["avg_x"])))
+        right_repr = max(right_group, key=lambda c: (float(c["score"]), float(c["avg_x"])))
+
+        if left_repr is right_repr:
+            return None, None, False
+
+        return left_repr, right_repr, True
 
     def _estimate_stone_branch_side(self, planning_items, candidate_paths):
         """估计石头更接近哪一侧候选分支.
@@ -265,6 +808,14 @@ class RoadSegmentor:
         if vote > 0:
             return 1
         return 0
+
+    def _resolve_preferred_turn(self, stone_branch_side, turn_intent):
+        """融合石头避让和 OCR 意图，得到最终偏左/偏右选择."""
+        if stone_branch_side == -1:
+            return 1
+        if stone_branch_side == 1:
+            return -1
+        return turn_intent if turn_intent in (-1, 1) else -1
 
     def _get_planning_box_points(self, obj, w_seg, h_seg):
         """把原图检测框转换成分割平面中的整框四角点."""
@@ -448,195 +999,111 @@ class RoadSegmentor:
         steer_signal = 0.0
         pts_final_orig = None
         pts_final_bird = None
-        
-        step_y = int(config.SEG_PATH_SEARCH_STEP_Y)
-        active_paths = []
         search_mask = self._prepare_search_mask(mask)
-        edge_mask = self._extract_edge_mask(search_mask)
+        y_fork_info = self._detect_y_fork(search_mask)
         branch_pair_count_max = 0
         branch_support_rows = 0
-
-        bottom_y = h_seg - int(config.SEG_PATH_BOTTOM_MARGIN)
-        bottom_slice_height = int(config.SEG_PATH_BOTTOM_SLICE_HEIGHT)
-        start_segments = []
-        start_row_y = None
-        for sample_y in range(bottom_y, max(-1, bottom_y - bottom_slice_height), -1):
-            row_segments = self._build_row_segments(search_mask[sample_y], edge_mask[sample_y])
-            if not row_segments:
-                continue
-            start_segments = row_segments
-            start_row_y = sample_y
-            break
-
-        if start_segments:
-            branch_pair_count_max = max(branch_pair_count_max, len(start_segments))
-            if len(start_segments) >= 2:
-                branch_support_rows += 1
-
-            for segment in start_segments:
-                active_paths.append([{
-                    "pt": (segment["center_x"], float(start_row_y)),
-                    "left_x": segment["left_x"],
-                    "right_x": segment["right_x"],
-                    "width": segment["width"],
-                    "local_center": segment["center_x"],
-                    "pair_count": len(start_segments),
-                }])
-
-            curr_y = start_row_y - step_y
-            top_y = int(h_seg * float(config.SEG_PATH_SCAN_TOP_RATIO))
-            while curr_y >= top_y:
-                row_start = max(0, curr_y - step_y // 2)
-                row_end = min(h_seg, curr_y + step_y // 2 + 1)
-
-                best_row_y = None
-                best_segments = []
-                best_score = (-1, -1.0)
-                for sample_y in range(row_start, row_end):
-                    row_segments = self._build_row_segments(search_mask[sample_y], edge_mask[sample_y])
-                    score = (len(row_segments), float(sum(seg["width"] for seg in row_segments)))
-                    if score > best_score:
-                        best_score = score
-                        best_segments = row_segments
-                        best_row_y = sample_y
-
-                if not best_segments:
-                    curr_y -= step_y
-                    continue
-
-                branch_pair_count_max = max(branch_pair_count_max, len(best_segments))
-                if len(best_segments) >= 2:
-                    branch_support_rows += 1
-
-                if not active_paths:
-                    for segment in best_segments:
-                        active_paths.append([{
-                            "pt": (segment["center_x"], float(best_row_y)),
-                            "left_x": segment["left_x"],
-                            "right_x": segment["right_x"],
-                            "width": segment["width"],
-                            "local_center": segment["center_x"],
-                            "pair_count": len(best_segments),
-                        }])
-                else:
-                    new_paths = []
-                    used_segments = set()
-
-                    for path in active_paths:
-                        last_node = path[-1]
-                        matched = False
-                        for seg_idx, segment in enumerate(best_segments):
-                            if not self._segments_can_connect(last_node, segment):
-                                continue
-
-                            node = {
-                                "pt": (segment["center_x"], float(best_row_y)),
-                                "left_x": segment["left_x"],
-                                "right_x": segment["right_x"],
-                                "width": segment["width"],
-                                "local_center": segment["center_x"],
-                                "pair_count": len(best_segments),
-                            }
-                            new_paths.append(path + [node])
-                            used_segments.add(seg_idx)
-                            matched = True
-
-                        if not matched:
-                            new_paths.append(path)
-
-                    for seg_idx, segment in enumerate(best_segments):
-                        if seg_idx in used_segments:
-                            continue
-                        new_paths.append([{
-                            "pt": (segment["center_x"], float(best_row_y)),
-                            "left_x": segment["left_x"],
-                            "right_x": segment["right_x"],
-                            "width": segment["width"],
-                            "local_center": segment["center_x"],
-                            "pair_count": len(best_segments),
-                        }])
-
-                    active_paths = new_paths
-                    if len(active_paths) > int(config.SEG_PATH_MAX_ACTIVE_PATHS):
-                        active_paths.sort(key=lambda p: len(p), reverse=True)
-                        active_paths = active_paths[:int(config.SEG_PATH_MAX_ACTIVE_PATHS)]
-
-                curr_y -= step_y
         t_search_end = time.perf_counter()
                 
         # -------------------------------------------------------------------
         # 4. 对候选路径打分，引入局部中心偏差惩罚 + EMA 滤波选择最终路径
         # -------------------------------------------------------------------
         t_fit_start = time.perf_counter()
-        self.last_branch_stats = {
-            "branch_pair_count_max": int(branch_pair_count_max),
-            "branch_support_rows": int(branch_support_rows),
-        }
         boundary_left_orig = None
         boundary_right_orig = None
         boundary_left_bird = None
         boundary_right_bird = None
-        if active_paths:
-            valid_candidates = []
-            for path in active_paths:
-                if len(path) < int(config.SEG_PATH_MIN_LENGTH):
-                    continue
-                
-                path_arr = np.array([node["pt"] for node in path])
-                px = path_arr[:, 0]
-                widths = np.array([node["width"] for node in path], dtype=np.float32)
-                
-                # 1. 长度分
-                length_score = len(path) * float(config.SEG_PATH_LENGTH_SCORE_GAIN)
-                
-                # 2. 平滑度分
-                dx = np.diff(px)
-                smooth_score = -np.std(dx) * float(config.SEG_PATH_SMOOTH_SCORE_GAIN)
-                
-                # 3. 分支局部中心偏离惩罚（精准抑制弯道强行切直线走捷径的行为）
-                center_penalty = 0.0
-                for node in path:
-                    x_curr = node["pt"][0]
-                    x_local_center = node["local_center"]
-                    center_penalty += abs(x_curr - x_local_center) * float(config.SEG_PATH_CENTER_PENALTY_GAIN)
+        candidate_left_orig = None
+        candidate_right_orig = None
+        y_fork_active = False
+        fork_active = False
+        best_path = None
+        best_nodes = None
+        stone_branch_side = 0
 
-                width_score = 0.05 * float(np.mean(widths)) if len(widths) > 0 else 0.0
-                base_score = length_score + smooth_score + width_score - center_penalty
-                avg_x = np.mean(px)
-                
-                valid_candidates.append({
-                    'path': path_arr,
-                    'nodes': path,
-                    'score': base_score,
-                    'avg_x': avg_x,
-                })
-                
-            best_path = None
-            best_nodes = None
-            stone_branch_side = 0
+        if y_fork_info.get("active"):
+            left_mask, right_mask = self._split_mask_by_fork(search_mask, y_fork_info["fork_point"])
+            left_paths, left_pair_max, left_support_rows = self._search_active_paths(
+                left_mask,
+                self._extract_edge_mask(left_mask),
+            )
+            right_paths, right_pair_max, right_support_rows = self._search_active_paths(
+                right_mask,
+                self._extract_edge_mask(right_mask),
+            )
+
+            left_candidates = self._score_candidate_paths(left_paths)
+            right_candidates = self._score_candidate_paths(right_paths)
+            left_best = max(left_candidates, key=lambda c: float(c["score"])) if left_candidates else None
+            right_best = max(right_candidates, key=lambda c: float(c["score"])) if right_candidates else None
+
+            branch_pair_count_max = max(2, left_pair_max, right_pair_max)
+            branch_support_rows = max(
+                int(y_fork_info.get("split_rows", 0)),
+                left_support_rows,
+                right_support_rows,
+            )
+
+            if left_best is not None and right_best is not None:
+                y_fork_active = True
+                fork_active = True
+                candidate_left_orig = np.array(left_best["path"], dtype=np.float32).reshape((-1, 1, 2))
+                candidate_right_orig = np.array(right_best["path"], dtype=np.float32).reshape((-1, 1, 2))
+
+                candidate_pool = [left_best, right_best]
+                stone_branch_side = self._estimate_stone_branch_side(planning_items, candidate_pool)
+                preferred_turn = self._resolve_preferred_turn(stone_branch_side, turn_intent)
+                best_candidate = right_best if preferred_turn == 1 else left_best
+                best_path = best_candidate["path"]
+                best_nodes = best_candidate["nodes"]
+
+        if not y_fork_active:
+            active_paths, branch_pair_count_max, branch_support_rows = self._search_active_paths(
+                search_mask,
+                self._extract_edge_mask(search_mask),
+            )
+            valid_candidates = self._score_candidate_paths(active_paths)
+            fork_left = None
+            fork_right = None
+
             if valid_candidates:
-                stone_branch_side = self._estimate_stone_branch_side(planning_items, valid_candidates)
-                max_score = max(c['score'] for c in valid_candidates)
-                top_tier_paths = [
-                    c for c in valid_candidates
-                    if c['score'] >= max_score - float(config.SEG_PATH_TOP_TIER_SCORE_GAP)
-                ]
-                if stone_branch_side == -1:
-                    preferred_turn = 1
-                elif stone_branch_side == 1:
-                    preferred_turn = -1
-                else:
-                    preferred_turn = turn_intent if turn_intent in (-1, 1) else -1
+                if len(valid_candidates) == 1:
+                    candidate_left_orig = np.array(
+                        valid_candidates[0]["path"],
+                        dtype=np.float32,
+                    ).reshape((-1, 1, 2))
+                elif len(valid_candidates) >= 2:
+                    display_left = min(valid_candidates, key=lambda c: c["avg_x"])
+                    display_right = max(valid_candidates, key=lambda c: c["avg_x"])
+                    if display_left is not display_right:
+                        candidate_left_orig = np.array(display_left["path"], dtype=np.float32).reshape((-1, 1, 2))
+                        candidate_right_orig = np.array(display_right["path"], dtype=np.float32).reshape((-1, 1, 2))
 
-                if preferred_turn == 1:
-                    best_candidate = max(top_tier_paths, key=lambda c: c['avg_x'])
+                fork_left, fork_right, fork_active = self._select_fork_representatives(
+                    valid_candidates,
+                    branch_support_rows,
+                )
+                if fork_active:
+                    candidate_pool = [fork_left, fork_right]
+                    stone_branch_side = self._estimate_stone_branch_side(planning_items, candidate_pool)
                 else:
-                    best_candidate = min(top_tier_paths, key=lambda c: c['avg_x'])
-                    
-                best_path = best_candidate['path']
-                best_nodes = best_candidate['nodes']
-                    
-            if best_path is not None:
+                    stone_branch_side = self._estimate_stone_branch_side(planning_items, valid_candidates)
+                    max_score = max(c["score"] for c in valid_candidates)
+                    candidate_pool = [
+                        c for c in valid_candidates
+                        if c["score"] >= max_score - float(config.SEG_PATH_TOP_TIER_SCORE_GAP)
+                    ]
+
+                preferred_turn = self._resolve_preferred_turn(stone_branch_side, turn_intent)
+                if preferred_turn == 1:
+                    best_candidate = max(candidate_pool, key=lambda c: c["avg_x"])
+                else:
+                    best_candidate = min(candidate_pool, key=lambda c: c["avg_x"])
+
+                best_path = best_candidate["path"]
+                best_nodes = best_candidate["nodes"]
+
+        if best_path is not None:
                 node_x = best_path[:, 0]
                 node_y = best_path[:, 1]
                 left_boundary_pts = np.array(
@@ -649,21 +1116,21 @@ class RoadSegmentor:
                 )
                 boundary_left_orig = left_boundary_pts.reshape((-1, 1, 2))
                 boundary_right_orig = right_boundary_pts.reshape((-1, 1, 2))
-                
+
                 if len(np.unique(node_y)) > 2:
                     current_coeffs = np.polyfit(node_y, node_x, 2)
                 else:
                     current_coeffs = np.polyfit(node_y, node_x, 1)
                     current_coeffs = np.insert(current_coeffs, 0, 0)
-                
+
                 # 4. 时域一阶低通滤波 (EMA)，赋予路径物理连贯惯性，消除分叉口反复横跳
                 if self.last_poly_coeffs is not None and len(self.last_poly_coeffs) == len(current_coeffs):
                     poly_coeffs = self.ema_alpha * self.last_poly_coeffs + (1.0 - self.ema_alpha) * current_coeffs
                 else:
                     poly_coeffs = current_coeffs
-                
+
                 self.last_poly_coeffs = poly_coeffs
-                    
+
                 dense_y = np.linspace(node_y[0], node_y[-1], num=int(config.SEG_PATH_DENSE_SAMPLES))
                 dense_x = np.polyval(poly_coeffs, dense_y)
                 dense_x = np.clip(dense_x, 0, w_seg - 1)
@@ -676,8 +1143,25 @@ class RoadSegmentor:
                 pts_final_bird = cv2.perspectiveTransform(pts_final_orig, self.M_seg)
                 boundary_left_bird = cv2.perspectiveTransform(boundary_left_orig, self.M_seg)
                 boundary_right_bird = cv2.perspectiveTransform(boundary_right_orig, self.M_seg)
-            else:
-                self.last_poly_coeffs = None
+        else:
+            self.last_poly_coeffs = None
+        self.last_branch_stats = {
+            "branch_pair_count_max": int(branch_pair_count_max),
+            "branch_support_rows": int(branch_support_rows),
+            "fork_active": bool(fork_active),
+            "y_fork_active": bool(y_fork_active),
+            "y_fork_bottom_width": float(y_fork_info.get("bottom_width", 0.0)),
+        }
+        self._store_main_overlay(
+            pts_final_orig,
+            boundary_left_orig,
+            boundary_right_orig,
+            w_seg,
+            h_seg,
+            candidate_left_pts=candidate_left_orig,
+            candidate_right_pts=candidate_right_orig,
+            fork_point=y_fork_info.get("fork_point") if y_fork_active else None,
+        )
         t_fit_end = time.perf_counter()
 
         # -------------------------------------------------------------------
@@ -687,39 +1171,8 @@ class RoadSegmentor:
         colored_roi = np.zeros_like(ai_view)
         colored_roi[mask == 1] = [0, 255, 0]
         ai_view = cv2.addWeighted(ai_view, 1.0 - config.MASK_ALPHA, colored_roi, config.MASK_ALPHA, 0)
-        
-        if pts_final_orig is not None:
-            cv2.polylines(
-                ai_view,
-                [pts_final_orig.astype(np.int32)],
-                False,
-                config.SEG_DEBUG_PATH_COLOR,
-                config.SEG_DEBUG_PATH_THICKNESS,
-            )
-        if boundary_left_orig is not None:
-            cv2.polylines(
-                ai_view,
-                [boundary_left_orig.astype(np.int32)],
-                False,
-                config.SEG_DEBUG_LEFT_BOUNDARY_COLOR,
-                config.SEG_DEBUG_BOUNDARY_THICKNESS,
-            )
-        if boundary_right_orig is not None:
-            cv2.polylines(
-                ai_view,
-                [boundary_right_orig.astype(np.int32)],
-                False,
-                config.SEG_DEBUG_RIGHT_BOUNDARY_COLOR,
-                config.SEG_DEBUG_BOUNDARY_THICKNESS,
-            )
-        bottom_mid_pt = (int(round(w_seg / 2.0)), h_seg - 1)
-        cv2.circle(
-            ai_view,
-            bottom_mid_pt,
-            config.SEG_DEBUG_BOTTOM_MID_RADIUS,
-            config.SEG_DEBUG_BOTTOM_MID_COLOR,
-            -1,
-        )
+        # 路径直接画在分割调试平面里，主线程只负责整体缩放和其它信息叠加。
+        ai_view = self.draw_path_overlay(ai_view)
 
         bird_eye_mask = cv2.warpPerspective(mask, self.M_seg, (w_seg, h_seg), flags=cv2.INTER_NEAREST)
         pip_img = cv2.cvtColor(np.where(bird_eye_mask == 1, 255, 0).astype(np.uint8), cv2.COLOR_GRAY2BGR)
@@ -805,7 +1258,8 @@ class RoadSegmentor:
             ai_view,
             (
                 f"PairsMax:{self.last_branch_stats.get('branch_pair_count_max', 0)} "
-                f"Rows2+:{self.last_branch_stats.get('branch_support_rows', 0)}"
+                f"Rows2+:{self.last_branch_stats.get('branch_support_rows', 0)} "
+                f"Y:{int(self.last_branch_stats.get('y_fork_active', False))}"
             ),
             config.SEG_DEBUG_TEXT_POS_BRANCH,
             1,

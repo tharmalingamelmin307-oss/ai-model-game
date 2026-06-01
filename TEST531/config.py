@@ -9,7 +9,12 @@
 3. README 里描述的系统行为，可以直接映射到这里的配置项
 """
 
+from pathlib import Path
+
 import numpy as np
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent
 
 
 # ---------------------------------------------------------------------------
@@ -48,7 +53,7 @@ JPEG_QUALITY = 75
 # 分割模型路径。
 # 当前主控链路依赖这个模型输出赛道 mask，所以它直接影响路径规划和转向控制。
 # 这里的模型默认输入尺寸是 SEG_SIZE，对应下面的 320x320。
-SEG_MODEL = "models/seg/ppliteseg_320_320_int8.rknn"
+SEG_MODEL = str(PROJECT_ROOT / "models/seg/ppliteseg_320_320_int8.rknn")
 
 # 目标检测模型路径。
 # 当前使用的是 PP-YOLOE 的 RKNN 版本，输出后处理由 modules/detector.py 负责。
@@ -56,21 +61,21 @@ SEG_MODEL = "models/seg/ppliteseg_320_320_int8.rknn"
 # - YOLO_SIZE
 # - CLASS_NAMES
 # - detector.py 的输出解析逻辑
-YOLO_MODEL = "models/det/detv2/ppyoloe_crn_m_80e_custom_raw_rk3588_fp16.rknn"
+YOLO_MODEL = str(PROJECT_ROOT / "models/det/detv2/ppyoloe_crn_m_80e_custom_raw_rk3588_fp16.rknn")
 
 # OCR 检测模型路径。
 # 当前改回 det + rec 全流程时使用。
 # 这个模型会在整张 OCR 输入图上先找文字区域，再把文字区域交给 rec 识别。
-OCR_DET_MODEL_PATH = "models/ocr/ppocrv4_det_int8.rknn"
+OCR_DET_MODEL_PATH = str(PROJECT_ROOT / "models/ocr/ppocrv4_det_int8.rknn")
 
 # OCR 识别模型路径。
 # det 找到文字框后，再由这个 rec 模型读出具体文本。
-REC_MODEL_PATH = "models/ocr/ppocrv4_rec_fp16.rknn"
+REC_MODEL_PATH = str(PROJECT_ROOT / "models/ocr/ppocrv4_rec_fp16.rknn")
 
 # OCR 字典路径。
 # 识别模型输出的是字符索引序列，最终要靠这份字典把索引翻译成字符。
 # 如果更换 OCR 模型，这份字典往往也要一起换。
-DICT_PATH = "models/ocr/keys.txt"
+DICT_PATH = str(PROJECT_ROOT / "models/ocr/keys.txt")
 
 
 # ---------------------------------------------------------------------------
@@ -772,7 +777,7 @@ STONE_BRANCH_MIN_SEP = 12
 SEG_PATH_SEARCH_STEP_Y = 5
 
 # 同一层里，相邻白色像素之间如果断开超过这个阈值，就认为属于不同分支。
-SEG_PATH_GAP_THRESH = 15
+SEG_PATH_GAP_THRESH = 5
 
 # 路径搜索前，对二值 mask 底部局部做轻微膨胀，优先修补起步区域的小断裂。
 # 膨胀只作用于“搜索用 mask”，不会改动原始分割模型输出。
@@ -788,8 +793,9 @@ SEG_PATH_BOTTOM_MARGIN = 5
 SEG_PATH_BOTTOM_SLICE_HEIGHT = 15
 SEG_PATH_MIN_START_PIXELS = 8
 
-# 向上搜索的最高比例位置。
-# 例如 0.1 表示最多搜到图像高度 10% 的地方就停止。
+# 向上搜索的最高比例位置（兜底值）。
+# 正常情况下会优先按当前帧 mask 的最高有效行动态截断；
+# 这里只有在当前帧几乎没有有效 mask 时才会回退到这个比例上界。
 SEG_PATH_SCAN_TOP_RATIO = 0.1
 
 # 某一层最少要有多少白像素，才认为这一层值得参与路径连接。
@@ -843,6 +849,9 @@ SEG_DEBUG_PLANNING_TEXT_THICKNESS = 1
 # 主分割调试图与鸟瞰图小窗的绘制风格。
 SEG_DEBUG_PATH_COLOR = (255, 0, 255)
 SEG_DEBUG_PATH_THICKNESS = 2
+SEG_DEBUG_LEFT_PATH_COLOR = (255, 255, 0)
+SEG_DEBUG_RIGHT_PATH_COLOR = (0, 200, 255)
+SEG_DEBUG_CANDIDATE_PATH_THICKNESS = 1
 SEG_DEBUG_LEFT_BOUNDARY_COLOR = (255, 255, 0)
 SEG_DEBUG_RIGHT_BOUNDARY_COLOR = (0, 165, 255)
 SEG_DEBUG_BOUNDARY_THICKNESS = 2
@@ -853,6 +862,8 @@ SEG_DEBUG_BIRD_RIGHT_BOUNDARY_COLOR = (0, 165, 255)
 SEG_DEBUG_BIRD_BOUNDARY_THICKNESS = 2
 SEG_DEBUG_BOTTOM_MID_COLOR = (255, 255, 0)
 SEG_DEBUG_BOTTOM_MID_RADIUS = 4
+SEG_DEBUG_FORK_DIVIDER_COLOR = (0, 255, 0)
+SEG_DEBUG_FORK_DIVIDER_THICKNESS = 1
 SEG_DEBUG_PIP_DIVISOR = 3
 SEG_DEBUG_PIP_BORDER_COLOR = (255, 255, 255)
 SEG_DEBUG_PIP_BORDER_THICKNESS = 1
