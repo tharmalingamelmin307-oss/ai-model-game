@@ -65,6 +65,7 @@ class RoadSegmentor:
             "candidate_left": None,
             "candidate_right": None,
             "fork_point": None,
+            "merge_guide": None,
             "bottom_mid": (0.0, 0.0),
             "base_size": tuple(config.SEG_SIZE),
         }
@@ -79,6 +80,7 @@ class RoadSegmentor:
         candidate_left_pts=None,
         candidate_right_pts=None,
         fork_point=None,
+        merge_guide_pts=None,
     ):
         """缓存主图路径叠加层，供主线程在其它元素之上重绘."""
         self.last_main_overlay = {
@@ -88,6 +90,7 @@ class RoadSegmentor:
             "candidate_left": None if candidate_left_pts is None else np.array(candidate_left_pts, dtype=np.float32).copy(),
             "candidate_right": None if candidate_right_pts is None else np.array(candidate_right_pts, dtype=np.float32).copy(),
             "fork_point": None if fork_point is None else (float(fork_point[0]), float(fork_point[1])),
+            "merge_guide": None if merge_guide_pts is None else np.array(merge_guide_pts, dtype=np.float32).copy(),
             "bottom_mid": (float(img_w) / 2.0, float(img_h) - 1.0),
             "base_size": (int(img_w), int(img_h)),
         }
@@ -120,6 +123,7 @@ class RoadSegmentor:
         right_poly = _scaled_polyline(overlay.get("right"))
         candidate_left_poly = _scaled_polyline(overlay.get("candidate_left"))
         candidate_right_poly = _scaled_polyline(overlay.get("candidate_right"))
+        merge_guide_poly = _scaled_polyline(overlay.get("merge_guide"))
 
         path_thickness = max(1, int(round(config.SEG_DEBUG_PATH_THICKNESS * scale)))
         boundary_thickness = max(1, int(round(config.SEG_DEBUG_BOUNDARY_THICKNESS * scale)))
@@ -149,6 +153,14 @@ class RoadSegmentor:
                 False,
                 config.SEG_DEBUG_PATH_COLOR,
                 path_thickness,
+            )
+        if merge_guide_poly is not None:
+            cv2.polylines(
+                image,
+                [merge_guide_poly],
+                False,
+                config.SEG_DEBUG_MERGE_GUIDE_COLOR,
+                max(1, int(round(config.SEG_DEBUG_MERGE_GUIDE_THICKNESS * scale))),
             )
         if left_poly is not None:
             cv2.polylines(
@@ -458,6 +470,160 @@ class RoadSegmentor:
             "split_rows": max(1, int(len(opening_run))),
         }
 
+    def _collect_branch_rows(self, search_mask, edge_mask, top_y, bottom_y):
+        """收集全图双白区行，并统计是否存在足够长的宽带区域."""
+        branch_rows = []
+        wide_row_thresh = float(config.MERGE_GUIDE_MIN_ROW_WIDTH)
+        wide_rows_need = max(1, int(config.MERGE_GUIDE_MIN_WIDE_ROWS))
+        curr_wide_streak = 0
+        max_wide_streak = 0
+
+        for sample_y in range(top_y, bottom_y + 1):
+            xs = np.where(search_mask[sample_y] > 0)[0]
+            if len(xs) > 0 and float(xs[-1] - xs[0]) >= wide_row_thresh:
+                curr_wide_streak += 1
+                max_wide_streak = max(max_wide_streak, curr_wide_streak)
+            else:
+                curr_wide_streak = 0
+
+            row_segments = self._build_row_segments(search_mask[sample_y], edge_mask[sample_y])
+            if len(row_segments) < 2:
+                continue
+
+            left_seg = min(row_segments, key=lambda seg: float(seg["center_x"]))
+            right_seg = max(row_segments, key=lambda seg: float(seg["center_x"]))
+            if left_seg is right_seg:
+                continue
+
+            separation = float(right_seg["center_x"]) - float(left_seg["center_x"])
+            if separation < float(config.FORK_MIN_BRANCH_SEP):
+                continue
+
+            branch_rows.append({
+                "left_run": left_seg,
+                "right_run": right_seg,
+                "separation": separation,
+                "y": int(sample_y),
+                "fork_x": 0.5 * (float(left_seg["right_x"]) + float(right_seg["left_x"])),
+                "left_inner_x": float(left_seg["right_x"]),
+                "right_inner_x": float(right_seg["left_x"]),
+                "gap_width": float(right_seg["left_x"] - left_seg["right_x"]),
+            })
+
+        return branch_rows, max_wide_streak >= wide_rows_need
+
+    def _select_merge_run(self, branch_rows, side_name):
+        """在全图双白区行里寻找单侧向下扩张的汇合尖角."""
+        if len(branch_rows) < 2:
+            return None
+
+        max_miss_rows = max(0, int(config.MERGE_GUIDE_MAX_MISS_ROWS))
+        min_side_delta = float(config.MERGE_GUIDE_MIN_SIDE_DELTA)
+        opposite_max_drift = float(config.MERGE_GUIDE_OPPOSITE_MAX_DRIFT)
+        rows = sorted(branch_rows, key=lambda row: int(row["y"]), reverse=True)
+
+        def _run_metrics(run_rows):
+            if len(run_rows) < 2:
+                return None
+
+            bottom_row = run_rows[0]
+            top_row = run_rows[-1]
+            gap_shrink = float(bottom_row["gap_width"]) - float(top_row["gap_width"])
+
+            if side_name == "left":
+                primary_collapse = float(top_row["left_inner_x"]) - float(bottom_row["left_inner_x"])
+                opposite_drift = abs(float(top_row["right_inner_x"]) - float(bottom_row["right_inner_x"]))
+            else:
+                primary_collapse = float(bottom_row["right_inner_x"]) - float(top_row["right_inner_x"])
+                opposite_drift = abs(float(top_row["left_inner_x"]) - float(bottom_row["left_inner_x"]))
+
+            if (
+                primary_collapse < min_side_delta or
+                gap_shrink < min_side_delta or
+                opposite_drift > opposite_max_drift
+            ):
+                return None
+
+            return {
+                "run_rows": run_rows,
+                "score": (
+                    len(run_rows),
+                    primary_collapse + gap_shrink,
+                    -opposite_drift,
+                ),
+            }
+
+        best_run = None
+        curr_run = [rows[0]]
+
+        for row in rows[1:]:
+            prev_row = curr_run[-1]
+            row_gap = int(prev_row["y"]) - int(row["y"]) - 1
+            if row_gap > max_miss_rows:
+                candidate = _run_metrics(curr_run)
+                if candidate is not None and (
+                    best_run is None or candidate["score"] > best_run["score"]
+                ):
+                    best_run = candidate
+                curr_run = [row]
+                continue
+
+            curr_run.append(row)
+
+        candidate = _run_metrics(curr_run)
+        if candidate is not None and (
+            best_run is None or candidate["score"] > best_run["score"]
+        ):
+            best_run = candidate
+
+        if best_run is None:
+            return None
+        return best_run["run_rows"]
+
+    def _detect_merge_guide(self, search_mask, edge_mask):
+        """在全图宽带区域中搜索单侧汇合尖角，命中后返回引导线."""
+        if search_mask is None or search_mask.size == 0:
+            return None
+
+        h, _ = search_mask.shape[:2]
+        mask_rows = np.where(np.any(search_mask > 0, axis=1))[0]
+        if len(mask_rows) > 0:
+            top_y = int(mask_rows[0])
+        else:
+            top_y = 0
+
+        bottom_margin = max(0, int(config.SEG_PATH_BOTTOM_MARGIN))
+        bottom_band_height = max(1, int(config.FORK_BOTTOM_BAND_HEIGHT))
+        bottom_y_end = max(1, h - bottom_margin)
+        bottom_y_start = max(0, bottom_y_end - bottom_band_height)
+
+        branch_rows, wide_band_ok = self._collect_branch_rows(
+            search_mask,
+            edge_mask,
+            top_y,
+            bottom_y_start,
+        )
+        if not wide_band_ok:
+            return None
+
+        left_run = self._select_merge_run(branch_rows, "left")
+        right_run = self._select_merge_run(branch_rows, "right")
+
+        best_side = None
+        best_run = None
+        if left_run is not None:
+            best_side = "left"
+            best_run = left_run
+        if right_run is not None:
+            if best_run is None or len(right_run) > len(best_run):
+                best_side = "right"
+                best_run = right_run
+
+        if best_run is None:
+            return None
+
+        return self._build_merge_guide_line(best_run, best_side)
+
     def _split_mask_by_fork(self, search_mask, fork_point):
         """按“分叉点到底部中点”的分界线，把 mask 切成左右两大区域."""
         h, w = search_mask.shape[:2]
@@ -678,20 +844,79 @@ class RoadSegmentor:
 
         return valid_candidates
 
-    def _is_valid_fork_side_candidate(self, candidate):
-        """判断分区后单侧候选是否真的像一条可走分支，而不是底部短开口."""
-        if candidate is None:
-            return False
+    def _build_merge_guide_line(self, merge_run, side_name):
+        """从单侧汇合尖角那一侧边界最底部的局部斜率构造一条向上的引导线."""
+        if merge_run is None:
+            return None
 
-        path = np.array(candidate.get("path", []), dtype=np.float32).reshape((-1, 2))
-        if len(path) < int(config.FORK_SIDE_MIN_VALID_NODES):
-            return False
+        rows = list(merge_run)
+        if len(rows) < 2:
+            return None
 
-        y_span = float(np.max(path[:, 1]) - np.min(path[:, 1])) if len(path) > 0 else 0.0
-        if y_span < float(config.FORK_SIDE_MIN_VALID_Y_SPAN):
-            return False
+        fit_rows = max(2, int(config.MERGE_GUIDE_FIT_ROWS))
+        fit_rows_data = rows[:min(len(rows), fit_rows)]
+        if len(fit_rows_data) < 2:
+            return None
 
-        return True
+        if side_name == "left":
+            anchor_x = float(rows[-1]["left_inner_x"])
+        else:
+            anchor_x = float(rows[-1]["right_inner_x"])
+
+        # 只取“最底部相邻两点”的局部斜率。
+        slope_dx_dy = None
+        for lower_row, upper_row in zip(fit_rows_data[:-1], fit_rows_data[1:]):
+            y0 = float(lower_row["y"])
+            y1 = float(upper_row["y"])
+            dy = y1 - y0
+            if abs(dy) < 1e-6:
+                continue
+
+            if side_name == "left":
+                x0 = float(lower_row["left_inner_x"])
+                x1 = float(upper_row["left_inner_x"])
+            else:
+                x0 = float(lower_row["right_inner_x"])
+                x1 = float(upper_row["right_inner_x"])
+
+            slope_dx_dy = (x1 - x0) / dy
+            break
+
+        if slope_dx_dy is None:
+            return None
+
+        anchor_y = float(rows[-1]["y"])
+        top_y = max(0.0, anchor_y - float(config.MERGE_GUIDE_EXTEND_ROWS))
+        top_x = float(anchor_x + slope_dx_dy * (top_y - anchor_y))
+
+        guide_pts = np.array(
+            [
+                [anchor_x, anchor_y],
+                [top_x, top_y],
+            ],
+            dtype=np.float32,
+        ).reshape((-1, 1, 2))
+        return guide_pts
+
+    def _apply_merge_guide(self, search_mask, guide_polyline):
+        """把汇合引导线补到搜索用 mask 中，帮助按单路模式继续搜路."""
+        if guide_polyline is None:
+            return search_mask
+
+        guided_mask = search_mask.copy()
+        thickness = max(
+            int(config.MERGE_GUIDE_LINE_THICKNESS),
+            int(config.SEG_PATH_MIN_PAIR_WIDTH) + 1,
+        )
+        cv2.polylines(
+            guided_mask,
+            [guide_polyline.astype(np.int32)],
+            False,
+            1,
+            thickness,
+            cv2.LINE_AA,
+        )
+        return (guided_mask > 0).astype(np.uint8)
 
     def _segments_can_connect(self, prev_node, curr_segment):
         """判断上下两层的通道片段是否属于同一条候选路径."""
@@ -1019,7 +1244,14 @@ class RoadSegmentor:
         pts_final_orig = None
         pts_final_bird = None
         search_mask = self._prepare_search_mask(mask)
-        y_fork_info = self._detect_y_fork(search_mask)
+        search_edge_mask = self._extract_edge_mask(search_mask)
+        merge_guide_orig = self._detect_merge_guide(search_mask, search_edge_mask)
+        if merge_guide_orig is not None:
+            search_mask = self._apply_merge_guide(search_mask, merge_guide_orig)
+            search_edge_mask = self._extract_edge_mask(search_mask)
+            y_fork_info = {"active": False, "fork_point": None, "split_rows": 0}
+        else:
+            y_fork_info = self._detect_y_fork(search_mask)
         branch_pair_count_max = 0
         branch_support_rows = 0
         t_search_end = time.perf_counter()
@@ -1063,10 +1295,7 @@ class RoadSegmentor:
                 right_support_rows,
             )
 
-            left_branch_valid = self._is_valid_fork_side_candidate(left_best)
-            right_branch_valid = self._is_valid_fork_side_candidate(right_best)
-
-            if left_branch_valid and right_branch_valid:
+            if left_best is not None and right_best is not None:
                 y_fork_active = True
                 fork_active = True
                 candidate_left_orig = np.array(left_best["path"], dtype=np.float32).reshape((-1, 1, 2))
@@ -1082,7 +1311,7 @@ class RoadSegmentor:
         if not y_fork_active:
             active_paths, branch_pair_count_max, branch_support_rows = self._search_active_paths(
                 search_mask,
-                self._extract_edge_mask(search_mask),
+                search_edge_mask,
             )
             valid_candidates = self._score_candidate_paths(active_paths)
             fork_left = None
@@ -1182,6 +1411,7 @@ class RoadSegmentor:
             candidate_left_pts=candidate_left_orig,
             candidate_right_pts=candidate_right_orig,
             fork_point=y_fork_info.get("fork_point") if y_fork_active else None,
+            merge_guide_pts=merge_guide_orig,
         )
         t_fit_end = time.perf_counter()
 
