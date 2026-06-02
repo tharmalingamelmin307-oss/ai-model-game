@@ -159,12 +159,6 @@ OCR_SIGN_EDGE_MARGIN_RATIO = 0.03
 # sign / limit_sign 的匹配和后续状态更新。
 OCR_MIN_SCORE = 0.50
 
-# OCR 触发类别的语义说明表。
-# 当前主流程里真正决定“谁能进 OCR”的是 main.py 里的 class_id 判断，
-# 这里更像是一份配置侧的约定文档，方便 README 和后续改造时对齐语义。
-# OCR 实际运行的是“整图 det + rec”，YOLO 的 sign / limit_sign 只负责触发和回匹配。
-OCR_TRIGGER_CLASSES = ("sign", "limit_sign")
-
 # 限速牌历史候选的“稳定次数”门槛。
 # 当前逻辑会先累计同一块牌子的历史 OCR 结果；
 # 当牌子面积达到 LIMIT_SIGN_APPLY_MIN_AREA 后，
@@ -248,23 +242,6 @@ REC_HEIGHT = 48
 # 如果牌子很长，过小的宽度会让字符被横向压缩得太厉害。
 REC_WIDTH = 320
 
-# OCR 裁图外扩比例预留参数。
-# 早期版本里曾尝试直接按 YOLO 框裁牌子再识别，所以保留了这个入口。
-# 当前主流程已经改成“整图 OCR det + rec + 中心点回匹配”，这里暂时没有直接接入。
-# 如果后续重新启用“按牌子框裁图识别”的轻量路径，可以优先复用这个参数。
-OCR_CROP_EXPAND_RATIO = 0.18
-
-# OCR 小 ROI 的最小高度保护值预留参数。
-# 和上面的 OCR_CROP_EXPAND_RATIO 一样，它主要服务于“直接裁牌子 ROI 做识别”的旧方案。
-# 当前整图 OCR 路径里没有直接使用它，先保留作后续实验入口。
-
-OCR_MIN_CROP_HEIGHT = 28
-
-# 顶部 ROI 裁剪比例预留参数。
-# 当前主流程没有直接用它裁图，但它保留下来是为了后续做轻量化时方便接入。
-# 例如以后如果只想让某些模块看画面下半区，可以直接用这个比例。
-ROI_TOP_CUT_RATIO = 0.3
-
 # 分割蒙版显示时的叠加透明度。
 # 只影响调试画面观感，不影响控制量计算。
 MASK_ALPHA = 0.4
@@ -297,28 +274,6 @@ DST_PTS = np.float32([
 # ---------------------------------------------------------------------------
 # 路径规划与避障相关参数
 # ---------------------------------------------------------------------------
-# 分叉路口宽度比例预留参数。
-# 当前版本主路径选择还主要靠 mask 搜索 + turn_intent，下面这些参数更多是为后续
-# “检测结果主动参与改写路径”保留的，不是当前核心控制闭环的主开关。
-FORK_WIDTH_RATIO = 0.35
-
-# 分叉路口间隙比例预留参数。
-FORK_GAP_RATIO = 0.15
-
-# 分叉口 mask 判定时，底部连通白区至少要有多宽，单位是分割平面像素。
-# 原本宽度不够时会直接认为仍是普通单车道，不判成岔路口。
-# 当前这道硬门槛已在代码里暂时关闭，先观察全局分叉检测效果。
-FORK_MIN_BOTTOM_WIDTH = 110.0
-
-# 分叉口 mask 判定时，上方用于检查“左右是否断开”的带状区域中心高度比例。
-# 例如 0.60 表示在图像高度 60% 附近检查左右分支是否已经分开。
-# 当前分叉检测已改为全局扫描，这个参数暂时未使用。
-FORK_UPPER_ROW_RATIO = 0.60
-
-# 上方分支判定带的高度，单位是分割平面像素。
-# 当前分叉检测已改为全局扫描，这个参数暂时未使用。
-FORK_UPPER_BAND_HEIGHT = 12
-
 # 上方分支里，一段白色区域至少要有多少像素宽，才算一个有效分支。
 FORK_MASK_MIN_BRANCH_PIXELS = 6
 
@@ -337,29 +292,21 @@ FORK_BOTTOM_BAND_HEIGHT = 16
 # - 右支内边界向右张开
 # - 两者形成的中间缺口在一段连续区域里总体变大
 #   其中局部允许短暂持平，甚至允许少量小回退
+# - 但不能只靠极少数几步突然跳大，而是需要一段有效张开过程
 # 这样比单看边界断裂更贴近真正的 Y 型岔路几何。
 FORK_INNER_OPEN_MIN_ROWS = 5
 FORK_INNER_OPEN_MIN_GAP_GROWTH = 14.0
 FORK_INNER_OPEN_MIN_SIDE_GROWTH = 5.0
+FORK_INNER_OPEN_MIN_STEP_GAIN = 1.0
+FORK_INNER_OPEN_MIN_POSITIVE_GAP_ROWS = 3
+FORK_INNER_OPEN_MIN_POSITIVE_SIDE_ROWS = 2
 FORK_INNER_OPEN_MAX_STEP_REGRESSION = 3.0
 FORK_INNER_OPEN_MAX_MISS_ROWS = 2
 
-# 检测目标扰动路径时使用的高斯扩散 sigma 预留值。
-# 值越大，未来如果启用目标影响路径，障碍物对路径的“排斥范围”会越宽。
-GAUSSIAN_SIGMA = 35.0
-
-# 安全边界预留值。
-# 后续若把障碍物投影到鸟瞰图并对路径做侵蚀/扩张，这个值通常就是安全留边的像素尺度。
-SAFETY_MARGIN = 25
-
-# 路径平滑窗口预留值。
-# 后续如果对基础路径点做滑动平均或曲线平滑，这个窗口通常决定平滑强度。
-SMOOTH_WINDOW = 5
-
-# 分叉口路径锁定持续帧数。
-# 一旦系统在明显分叉里选定左/右某一支，会优先沿该分支继续保持这么多帧，
-# 用来抑制岔路口左右横跳。
-PATH_LOCK_HOLD_FRAMES = 6
+# 分叉口分区后，单侧路径至少要延伸到多长，才认为真的是一条可走分支。
+# 如果某一侧只在底部附近出现一小段就结束，更像开口/噪声，不按岔路处理。
+FORK_SIDE_MIN_VALID_NODES = 5
+FORK_SIDE_MIN_VALID_Y_SPAN = 70.0
 
 # 判定“当前确实出现了明显左右分叉”的最小横向间距，单位是分割平面像素。
 # 调大:
@@ -367,18 +314,6 @@ PATH_LOCK_HOLD_FRAMES = 6
 # 调小:
 # - 更容易把宽车道或轻微岔开也当成分叉
 PATH_LOCK_FORK_MIN_SEP = 28.0
-
-# 候选路径与上一帧路径之间的连续性惩罚权重。
-# 调大:
-# - 更强调与上一帧保持一致，分叉口更稳
-# - 但也更容易“恋旧”，切换到新分支会慢一点
-# 调小:
-# - 更容易跟着当前帧几何最优结果切换
-PATH_CONTINUITY_WEIGHT = 2.0
-
-# 计算“当前候选路径和上一帧路径有多接近”时的采样点数量。
-# 点越多，连续性判断越细，但计算也会稍重一点。
-PATH_CONTINUITY_SAMPLE_COUNT = 6
 
 # 会被投影到分割/鸟瞰图平面里的“规划相关类别”。
 # 当前这些目标暂时主要用于调试显示，不直接改写主路径。
@@ -430,16 +365,6 @@ SERVO_CENTER = 750
 # 舵机安全最小/最大 PWM。
 # 用于硬限制输出，避免控制算法在极端情况下打到危险位置。
 SERVO_MIN, SERVO_MAX = 590, 910
-
-# 电机停止 PWM 预留值。
-# 当前主线程真正下发的是 target_speed 这种速度级命令，不直接使用这个值，
-# 但它保留下来是为了后续如果改成更底层 PWM 控制时方便接。
-MOTOR_STOP = 2000
-
-# 电机最大速度预留值。
-# 目前 serial_control_thread() 里仍主要用内部的 10~30 速度档逻辑，
-# 这个值暂时更多是配置语义保留位。
-MOTOR_MAX_SPEED = 2350
 
 # 单一转向控制量换算到舵机 PWM 的增益。
 # 当前控制量定义为：
@@ -535,50 +460,20 @@ FPS_STATS_UPDATE_INTERVAL = 1.0
 
 # 默认日志节流间隔。
 # 当调用 throttled_log() 时没有显式传入 min_interval，就会回退到这里。
-LOG_INTERVAL_DEFAULT = 1.5
-
-# limit_sign 消失太久导致历史清空时的日志节流。
-LOG_INTERVAL_LIMIT_HISTORY_RESET = 1.5
+LOG_INTERVAL_DEFAULT = 2.0
 
 # 限速正式生效时的日志节流。
-# 这里适当短一点，便于近距离连续观察牌子生效过程。
-LOG_INTERVAL_SPEED_LIMIT_EFFECTIVE = 0.8
+# 只在正式达到限速生效条件时打印。
+LOG_INTERVAL_SPEED_LIMIT_EFFECTIVE = 2.0
 
-# “检测到了牌子，但因为面积/贴边等原因没进 OCR”的日志节流。
-LOG_INTERVAL_OCR_SKIP = 2.0
-
-# OCR 任务真正入队时的日志节流。
-LOG_INTERVAL_OCR_ENTER = 1.0
-
-# OCR 队列满了、主动丢旧任务时的日志节流。
-LOG_INTERVAL_OCR_QUEUE_DROP = 2.0
-
-# 整图 OCR 本帧完全没找到文字区域时的日志节流。
-LOG_INTERVAL_OCR_FULLFRAME_EMPTY = 2.0
-
-# OCR 找到了文本，但和某个检测框没匹配上时的日志节流。
-LOG_INTERVAL_OCR_MATCH_EMPTY = 2.0
-
-# OCR 成功识别出文本时的日志节流。
-LOG_INTERVAL_OCR_RESULT = 1.0
-
-# OCR 结果因为分数太低被过滤掉时的日志节流。
-LOG_INTERVAL_OCR_LOW_SCORE = 1.2
+# 路牌达到 OCR 识别条件、任务真正入队时的日志节流。
+LOG_INTERVAL_OCR_ENTER = 2.0
 
 # LEFT / RIGHT 语义路牌生效时的日志节流。
-LOG_INTERVAL_TURN_INTENT = 0.8
+LOG_INTERVAL_TURN_INTENT = 2.0
 
-# 限速牌 OCR 读出了非数字文本时的日志节流。
-LOG_INTERVAL_SPEED_LIMIT_PARSE_EMPTY = 1.2
-
-# 限速牌仍在累计历史、尚未正式生效时的日志节流。
-LOG_INTERVAL_SPEED_LIMIT_PENDING = 1.0
-
-# 串口线程整体控速状态摘要的日志节流。
-LOG_INTERVAL_CONTROL_STATE = 1.2
-
-# 红绿灯停车链路细节日志的节流。
-LOG_INTERVAL_TRAFFIC_STOP_DETAIL = 1.2
+# 红绿灯停车条件满足、强制停车链路触发时的日志节流。
+LOG_INTERVAL_TRAFFIC_STOP_DETAIL = 2.0
 
 
 # ---------------------------------------------------------------------------
@@ -803,12 +698,9 @@ SEG_PATH_DILATE_BOTTOM_HEIGHT = 40
 
 # 路径搜索底部起点相关参数。
 # - BOTTOM_MARGIN: 底部预留，避免正贴边采样
-# - BOTTOM_SLICE_HEIGHT: 底部起始白区统计高度
-# - MIN_START_PIXELS: 底部白像素至少达到多少才开始建路径
+# - BOTTOM_TOUCH_HEIGHT: 底部多少行以内触达才允许起路径
 SEG_PATH_BOTTOM_MARGIN = 5
-SEG_PATH_BOTTOM_SLICE_HEIGHT = 15
 SEG_PATH_BOTTOM_TOUCH_HEIGHT = 20
-SEG_PATH_MIN_START_PIXELS = 8
 
 # 向上搜索的最高比例位置（兜底值）。
 # 正常情况下会优先按当前帧 mask 的最高有效行动态截断；
@@ -900,8 +792,3 @@ SEG_DEBUG_TEXT_COLOR_FPS = (0, 255, 0)
 SEG_DEBUG_TEXT_COLOR_CTRL = (0, 255, 255)
 SEG_DEBUG_TEXT_COLOR_STONE = (0, 200, 255)
 SEG_DEBUG_TEXT_COLOR_BRANCH = (255, 200, 0)
-
-# 分割链路阶段耗时统计。
-# 开启后会按时间窗口打印 infer / preprocess / search / fit / render / total 的平均耗时。
-SEG_PROFILE_ENABLED = True
-SEG_PROFILE_PRINT_INTERVAL = 1.0

@@ -96,6 +96,15 @@ def throttled_log(key, message, state=None, min_interval=None):
             log_cache[key] = {"time": now, "state": state}
 
 
+def log_once(key, message):
+    """同一类错误只打印一次，避免异常反复刷屏。"""
+    with log_lock:
+        if key in log_cache:
+            return
+        print(message, flush=True)
+        log_cache[key] = {"time": time.time(), "state": "__once__"}
+
+
 # ==============================================================================
 # YOLO框绘制
 # ==============================================================================
@@ -422,9 +431,8 @@ def yolo_worker():
     """
     try:
         det = YOLODetector(core_id=config.YOLO_CORE)
-        print(f"✅ YOLO (Core {config.YOLO_CORE}) 已就绪", flush=True)
     except Exception as e:
-        print(f"❌ YOLO 启动失败: {e}", flush=True)
+        log_once("yolo_init_error", f"YOLO启动失败: {e}")
         return
 
     while True:
@@ -455,7 +463,6 @@ def yolo_worker():
             # 而是直接从历史聚合统计里挑选最优数字。
             sign_jobs = []
             apply_limit_jobs = []
-            skipped_jobs = []
             limit_sign_seen = False
             for idx, obj in enumerate(objs):
                 cls_id = obj.get("class_id")
@@ -475,13 +482,9 @@ def yolo_worker():
                     ):
                         apply_limit_jobs.append((idx, rect))
                         continue
-                    skipped_jobs.append(
-                        f"{class_name_from_id(cls_id)} rect={rect} reason={skip_reason}"
-                    )
                     continue
                 sign_jobs.append((idx, cls_id, rect))
 
-            limit_history_cleared = False
             limit_applied_from_history = None
             with data_lock:
                 if limit_sign_seen:
@@ -492,7 +495,6 @@ def yolo_worker():
                     if last_limit_detect_fid >= 0 and int(frame_id) - last_limit_detect_fid > max_miss:
                         if global_control_data.get("limit_sign_history"):
                             reset_limit_sign_history(global_control_data)
-                            limit_history_cleared = True
                         global_control_data["limit_sign_last_detect_fid"] = -1
 
                 if apply_limit_jobs:
@@ -524,13 +526,6 @@ def yolo_worker():
                                     global_yolo_boxes[best_apply_idx]["text"] = best_candidate["digit_text"]
                                     global_yolo_boxes[best_apply_idx]["ocr_score"] = float(best_candidate["avg_score"])
 
-            if limit_history_cleared:
-                throttled_log(
-                    "speed_limit_history_reset",
-                    "限速历史已清空: limit_sign 消失过久，避免旧牌子结果串到新牌子",
-                    min_interval=config.LOG_INTERVAL_LIMIT_HISTORY_RESET
-                )
-
             if limit_applied_from_history is not None:
                 throttled_log(
                     "speed_limit_effective",
@@ -549,38 +544,24 @@ def yolo_worker():
                     min_interval=config.LOG_INTERVAL_SPEED_LIMIT_EFFECTIVE
                 )
 
-            if skipped_jobs:
-                throttled_log(
-                    "ocr_skip",
-                    "OCR跳过: 检到路牌但未满足识别门槛 | "
-                    + " | ".join(skipped_jobs),
-                    state=tuple(skipped_jobs),
-                    min_interval=config.LOG_INTERVAL_OCR_SKIP
-                )
-
             if sign_jobs:
                 job_names = tuple(class_name_from_id(cls_id) for _, cls_id, _ in sign_jobs)
                 throttled_log(
                     "ocr_enter",
-                    f"OCR已触发: frame={frame_id} 数量={len(sign_jobs)} 类型={list(job_names)}",
-                    state=(len(sign_jobs), job_names),
+                    f"路牌达到识别条件: 数量={len(sign_jobs)} 类型={list(job_names)}",
+                    state=job_names,
                     min_interval=config.LOG_INTERVAL_OCR_ENTER
                 )
                 # OCR 只保留较新的任务，过旧的任务直接丢掉。
                 if ocr_queue.full():
                     try:
                         ocr_queue.get_nowait()
-                        throttled_log(
-                            "ocr_queue_drop",
-                            "OCR队列已满: 丢弃最旧任务，优先处理新画面",
-                            min_interval=config.LOG_INTERVAL_OCR_QUEUE_DROP
-                        )
                     except:
                         pass
                 ocr_queue.put((vis_frame.copy(), sign_jobs, int(frame_id)))
 
         except Exception as e:
-            print(f"YOLO线程异常: {e}", flush=True)
+            log_once("yolo_worker_error", f"YOLO线程异常: {e}")
 
 
 # ==============================================================================
@@ -603,9 +584,8 @@ def ocr_worker():
     """
     try:
         ocr = OCRRecognizer(core_id=config.REC_CORE)
-        print(f"✅ OCR (Core {config.REC_CORE}) 已就绪", flush=True)
     except Exception as e:
-        print(f"❌ OCR 启动失败: {e}", flush=True)
+        log_once("ocr_init_error", f"OCR启动失败: {e}")
         return
 
     while True:
@@ -619,11 +599,6 @@ def ocr_worker():
             # 这里跑的是整图 OCR，再把结果按中心点回匹配给 sign_jobs。
             ocr_results = ocr.run_full_frame(frame_data)
             if not ocr_results:
-                throttled_log(
-                    "ocr_fullframe_empty",
-                    "OCR整图检测无结果: 本帧没有找到可识别文字区域",
-                    min_interval=config.LOG_INTERVAL_OCR_FULLFRAME_EMPTY
-                )
                 continue
 
             used_result_ids = set()
@@ -643,12 +618,6 @@ def ocr_worker():
                             best_match = (result_id, result)
 
                     if best_match is None:
-                        throttled_log(
-                            f"ocr_match_empty_{class_name_from_id(cls_id)}",
-                            f"OCR无匹配结果: 类型={class_name_from_id(cls_id)} 检测框={rect}",
-                            state=(class_name_from_id(cls_id), tuple(rect)),
-                            min_interval=config.LOG_INTERVAL_OCR_MATCH_EMPTY
-                        )
                         continue
 
                     result_id, result = best_match
@@ -660,23 +629,11 @@ def ocr_worker():
                         continue
 
                     if score < float(config.OCR_MIN_SCORE):
-                        throttled_log(
-                            f"ocr_low_score_{class_name_from_id(cls_id)}",
-                            f"OCR低分过滤: 类型={class_name_from_id(cls_id)} 文本={text} 置信度={score:.3f}",
-                            state=(class_name_from_id(cls_id), text, round(score, 3)),
-                            min_interval=config.LOG_INTERVAL_OCR_LOW_SCORE,
-                        )
                         continue
 
-                    throttled_log(
-                        f"ocr_result_{class_name_from_id(cls_id)}",
-                        f"OCR结果: 类型={class_name_from_id(cls_id)} 文本={text} 置信度={score:.3f} 对应检测框={rect}",
-                        state=(class_name_from_id(cls_id), text, round(score, 3)),
-                        min_interval=config.LOG_INTERVAL_OCR_RESULT
-                    )
                     updates.append((idx, cls_id, text, score))
                 except Exception as e:
-                    print(f"OCR单框异常: {e}", flush=True)
+                    log_once("ocr_single_box_error", f"OCR单框处理异常: {e}")
 
             if not updates:
                 continue
@@ -700,6 +657,12 @@ def ocr_worker():
                     if job_cls_id == sign_class_id:
                         last_turn_fid = int(global_control_data.get("turn_intent_fid", -1))
                         if int(frame_id) >= last_turn_fid:
+                            throttled_log(
+                                f"ocr_sign_result_{text}",
+                                f"路牌识别结果: 文本={text} 置信度={score:.3f}",
+                                state=text,
+                                min_interval=config.LOG_INTERVAL_OCR_ENTER
+                            )
                             if text == "LEFT":
                                 global_control_data["turn_intent"] = -1
                                 global_control_data["turn_intent_fid"] = int(frame_id)
@@ -722,34 +685,25 @@ def ocr_worker():
                         try:
                             digit_text = "".join(ch for ch in text if ch.isdigit())
                             if not digit_text:
-                                throttled_log(
-                                    "speed_limit_parse_empty",
-                                    f"限速牌识别到非数字文本，未生效: 原始文本={text}",
-                                    state=text,
-                                    min_interval=config.LOG_INTERVAL_SPEED_LIMIT_PARSE_EMPTY
-                                )
                                 continue
 
-                            count, avg_score = update_limit_sign_history(
+                            throttled_log(
+                                f"ocr_limit_result_{digit_text}",
+                                f"限速牌识别结果: 文本={digit_text} 置信度={score:.3f}",
+                                state=digit_text,
+                                min_interval=config.LOG_INTERVAL_OCR_ENTER
+                            )
+
+                            update_limit_sign_history(
                                 global_control_data,
                                 digit_text,
                                 score,
-                            )
-                            confirm_needed = max(1, int(config.LIMIT_SIGN_CONFIRM_FRAMES))
-
-                            throttled_log(
-                                "speed_limit_pending",
-                                "限速累计: "
-                                f"候选={digit_text} 次数={count}/{confirm_needed} "
-                                f"平均置信度={avg_score:.3f}",
-                                state=(digit_text, count, round(avg_score, 3), confirm_needed),
-                                min_interval=config.LOG_INTERVAL_SPEED_LIMIT_PENDING
                             )
                         except Exception:
                             pass
 
         except Exception as e:
-            print(f"OCR线程异常: {e}", flush=True)
+            log_once("ocr_worker_error", f"OCR线程异常: {e}")
 
 # ==============================================================================
 # 核心线程 2：分割与路径规划线程
@@ -767,9 +721,8 @@ def seg_worker(core_id):
 
     try:
         seg = RoadSegmentor(core_id=core_id)
-        print(f"✅ Seg(Core {core_id}) 已就绪", flush=True)
     except Exception as e:
-        print(f"Seg 启动失败: {e}", flush=True)
+        log_once(f"seg_init_error_{core_id}", f"Seg启动失败(Core {core_id}): {e}")
         return
 
     while True:
@@ -939,7 +892,6 @@ def serial_control_thread():
     2. 如果 speed_limit 已生效，再把它作为速度上限
     3. 如果红/黄灯且停止线已接近，则强制把速度打到 0
     """
-    last_control_debug = None
     try:
         ser = serial.Serial(config.SERIAL_PORT, config.BAUD_RATE, timeout=config.SERIAL_TIMEOUT)
     except:
@@ -1009,44 +961,17 @@ def serial_control_thread():
             global_control_data["actual_servo_pwm"] = servo_pwm
             global_control_data["target_speed"] = target_speed
 
-        control_debug = (
-            speed_limit,
-            traffic_light_state,
-            bool(traffic_stop_active),
-            bool(stop_ready),
-            bool(limit_applied),
-            round(float(steer_signal), 1),
-            int(servo_pwm),
-            int(target_speed),
-            int(dynamic_target_speed),
-        )
-        if control_debug != last_control_debug:
+        if traffic_stop_active:
             light_text = traffic_light_state or "无"
-            speed_limit_text = "无" if speed_limit is None else str(speed_limit)
-            limit_text = "是" if limit_applied else "否"
-            stop_ready_text = "是" if stop_ready else "否"
-            stop_active_text = "是" if traffic_stop_active else "否"
+            zebra_dist_text = "无" if stopline_dist_to_bottom is None else str(stopline_dist_to_bottom)
             throttled_log(
-                "control_state",
-                "控速状态: "
-                f"基础速度={dynamic_target_speed} 最终速度={target_speed} "
-                f"控制量={steer_signal:.1f} 舵机={servo_pwm} "
-                f"限速上限={speed_limit_text} 限速生效={limit_text} "
-                f"灯色={light_text} 停车线已接近={stop_ready_text} 红黄灯停车={stop_active_text}",
-                state=control_debug,
-                min_interval=config.LOG_INTERVAL_CONTROL_STATE
+                "traffic_stop_detail",
+                "红绿灯停车条件触发: "
+                f"灯色={light_text} 停车线到底部距离={zebra_dist_text} "
+                f"阈值={stop_trigger_dist} 已停车=是",
+                state=(light_text, zebra_dist_text, int(stop_trigger_dist)),
+                min_interval=config.LOG_INTERVAL_TRAFFIC_STOP_DETAIL
             )
-            if traffic_light_state in ("red", "yellow", "green"):
-                zebra_dist_text = "无" if stopline_dist_to_bottom is None else str(stopline_dist_to_bottom)
-                throttled_log(
-                    "traffic_stop_detail",
-                    "红绿灯停车判定: "
-                    f"灯色={light_text} 停车线到底部距离={zebra_dist_text} "
-                    f"阈值={stop_trigger_dist} 已接近={stop_ready_text} 已停车={stop_active_text}",
-                    state=(light_text, zebra_dist_text, stop_ready_text, stop_active_text),
-                    min_interval=config.LOG_INTERVAL_TRAFFIC_STOP_DETAIL
-                )
-            last_control_debug = control_debug
 
         if ser:
             ser.write(
@@ -1074,7 +999,6 @@ def ai_producer_thread():
     - 这里的设计是“永远只保留最新帧”，所以两个队列都是小容量；
     - 如果下游处理不过来，会主动丢弃旧帧，优先保证实时性。
     """
-    print("--> 📡 启动拉流...", flush=True)
     while True:
         try:
             shm = shared_memory.SharedMemory(name=config.SHM_NAME)
@@ -1123,7 +1047,8 @@ def ai_producer_thread():
                         pass
                 yolo_queue.put((det_img, vis_img_large, (w, h), int(fid)))
 
-        except Exception:
+        except Exception as e:
+            log_once("shm_attach_error", f"共享内存拉流异常: {e}")
             time.sleep(config.SHM_RETRY_SLEEP)
 
 
@@ -1170,8 +1095,6 @@ def video_feed():
 
 if __name__ == "__main__":
     """按模块顺序启动所有线程和 Flask 服务."""
-    print("🚀 Aero-Twin [极限性能版] 启动", flush=True)
-
     threading.Thread(target=ai_producer_thread, daemon=True).start()
     threading.Thread(target=serial_control_thread, daemon=True).start()
     time.sleep(config.STARTUP_SHARED_THREAD_SLEEP)

@@ -30,11 +30,9 @@ class OCRRecognizer:
         self.rknn_det = RKNNLite()
         self.rknn_rec = RKNNLite()
 
-        print(f"--> 加载OCR检测模型: {config.OCR_DET_MODEL_PATH}")
         if self.rknn_det.load_rknn(config.OCR_DET_MODEL_PATH) != 0:
             raise RuntimeError("OCR det 模型加载失败")
 
-        print(f"--> 加载OCR识别模型: {config.REC_MODEL_PATH}")
         if self.rknn_rec.load_rknn(config.REC_MODEL_PATH) != 0:
             raise RuntimeError("OCR rec 模型加载失败")
 

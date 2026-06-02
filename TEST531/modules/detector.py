@@ -32,7 +32,6 @@ class YOLODetector:
     def __init__(self, core_id):
         """加载模型并绑定到指定 NPU 核."""
         self.rknn = RKNNLite()
-        print(f"--> [Detector] 加载模型: {config.YOLO_MODEL}", flush=True)
         if self.rknn.load_rknn(config.YOLO_MODEL) != 0:
             raise RuntimeError("YOLO 加载失败")
         if self.rknn.init_runtime(core_mask=core_id) != 0:
@@ -43,6 +42,7 @@ class YOLODetector:
         
         # [已修改] 关闭单次调试打印，保持终端整洁。如需排错可改为 True。
         self.debug_once = bool(config.YOLO_DEBUG_ONCE)
+        self.runtime_error_logged = False
         
         self.num_classes = len(config.CLASS_NAMES)
         
@@ -339,20 +339,8 @@ class YOLODetector:
         boxes = preds[:, :4].astype(np.float32)
         scores = preds[:, 4:].astype(np.float32)
 
-        # ====== 强制打印第一帧的数据统计 ======
-        if self.debug_once:
-            print("-" * 50, flush=True)
-            print(f"--> [暴力查错] 框的最大值/最小值: Max={np.max(boxes):.2f}, Min={np.min(boxes):.2f}", flush=True)
-            print(f"--> [暴力查错] 分数最大值/最小值: Max={np.max(scores):.4f}, Min={np.min(scores):.4f}", flush=True)
-            print(f"--> [暴力查错] 第1个Anchor的框数据: {boxes[0]}", flush=True)
-            print(f"--> [暴力查错] 第1个Anchor的分数数据: {scores[0]}", flush=True)
-            print("-" * 50, flush=True)
-        # ======================================
-
         # 自动判定是否需要 Sigmoid 激活
         if np.min(scores) < 0 or np.max(scores) > float(config.YOLO_SCORE_SIGMOID_TRIGGER_MAX):
-            if self.debug_once:
-                print("--> [自动修复] 检测到原始 Logits，应用 Sigmoid 激活...", flush=True)
             clip_value = float(config.YOLO_SINGLE_TENSOR_LOGIT_CLIP)
             scores = 1.0 / (1.0 + np.exp(-np.clip(scores, -clip_value, clip_value)))
 
@@ -362,13 +350,6 @@ class YOLODetector:
         keep = self._build_score_keep_mask(class_ids, max_scores)
 
         if not np.any(keep):
-            if self.debug_once:
-                print(
-                    f"--> [YOLO 拦截] 无框保留！当前全图最高分数为: {np.max(max_scores):.4f} "
-                    f"(默认阈值 {self.conf_thres})",
-                    flush=True,
-                )
-                self.debug_once = False # 查错完毕，关闭打印
             return []
 
         boxes = boxes[keep]
@@ -387,14 +368,8 @@ class YOLODetector:
 
         # 归一化坐标自动还原
         if np.max(boxes) <= float(config.YOLO_NORMALIZED_BOX_MAX):
-            if self.debug_once:
-                print("--> [自动修复] 检测到归一化坐标，还原到像素尺度...", flush=True)
             boxes[:, [0, 2]] *= input_w
             boxes[:, [1, 3]] *= input_h
-
-        if self.debug_once:
-            print(f"--> [YOLO 成功] 过滤后得到 {len(boxes)} 个候选框。准备执行 NMS...", flush=True)
-            self.debug_once = False # 查错完毕，关闭打印
 
         boxes, class_ids, max_scores = self._classwise_nms_xyxy(boxes, class_ids, max_scores)
         if boxes is None:
@@ -420,27 +395,16 @@ class YOLODetector:
             if outputs is None or len(outputs) == 0:
                 return []
 
-            if self.debug_once:
-                print(f"YOLO input shape: {blob.shape}, dtype: {blob.dtype}", flush=True)
-                print("YOLO output num:", len(outputs), flush=True)
-                for idx, out in enumerate(outputs):
-                    arr = np.array(out)
-                    print(f"output[{idx}] shape: {arr.shape}, dtype: {arr.dtype}", flush=True)
-
             if self.expect_raw_single_output:
-                if self.debug_once:
-                    print("YOLO decode path: raw_single_tensor_xyxy_scores", flush=True)
                 return self._decode_single_tensor_outputs(outputs, output_w, output_h, input_w, input_h)
 
             if self._looks_like_ppyoloe_outputs(outputs):
-                if self.debug_once:
-                    print("YOLO decode path: ppyoloe_demo_postprocess", flush=True)
                 return self._decode_ppyoloe_outputs(outputs, output_w, output_h, input_w, input_h)
 
-            if self.debug_once:
-                print("YOLO decode path: single_tensor_xyxy", flush=True)
             return self._decode_single_tensor_outputs(outputs, output_w, output_h, input_w, input_h)
 
         except Exception as e:
-            print(f"YOLO 解析异常: {e}", flush=True)
+            if not self.runtime_error_logged:
+                print(f"YOLO解析异常: {e}", flush=True)
+                self.runtime_error_logged = True
             return []

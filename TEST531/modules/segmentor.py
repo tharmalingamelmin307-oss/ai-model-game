@@ -9,10 +9,11 @@
 5. 返回用于控制的 steer_signal，以及一张调试渲染图
 
 当前路径选择策略的核心优先级是:
-1. 先从 mask 里搜索可连接的候选路径
-2. 如果检测到 `stone`，优先绕开石头所在分支
-3. 否则默认偏向左支
-4. 如果 OCR 已经给出 `turn_intent`，再用 LEFT / RIGHT 意图覆盖默认偏向
+1. 先在 mask 中寻找可行路径；若存在明显岔路，再先做分叉分区
+2. 路径必须从图像底部触达区域起步，悬空候选会被直接丢弃
+3. 如果检测到 `stone`，优先绕开石头所在分支
+4. 否则默认偏向左支
+5. 如果 OCR 已经给出 `turn_intent`，再用 LEFT / RIGHT 意图覆盖默认偏向
 """
 
 import cv2
@@ -25,8 +26,7 @@ class RoadSegmentor:
     def __init__(self, core_id):
         """初始化分割模型与 320 空间的逆透视矩阵."""
         self.rknn = RKNNLite()
-        print(f"--> [Segmentor] 正在初始化 NPU Core {core_id}...", flush=True)
-        
+
         if self.rknn.load_rknn(config.SEG_MODEL) != 0 or self.rknn.init_runtime(core_mask=core_id) != 0:
             raise RuntimeError("Seg 模型加载或初始化失败")
             
@@ -57,7 +57,6 @@ class RoadSegmentor:
             "branch_support_rows": 0,
             "fork_active": False,
             "y_fork_active": False,
-            "y_fork_bottom_width": 0.0,
         }
         self.last_main_overlay = {
             "path": None,
@@ -68,18 +67,6 @@ class RoadSegmentor:
             "fork_point": None,
             "bottom_mid": (0.0, 0.0),
             "base_size": tuple(config.SEG_SIZE),
-        }
-        self.seg_profile_enabled = bool(getattr(config, "SEG_PROFILE_ENABLED", False))
-        self.seg_profile_print_interval = float(getattr(config, "SEG_PROFILE_PRINT_INTERVAL", 1.0))
-        self.seg_profile_last_print = time.perf_counter()
-        self.seg_profile_acc = {
-            "frames": 0,
-            "infer": 0.0,
-            "preprocess": 0.0,
-            "search": 0.0,
-            "fit": 0.0,
-            "render": 0.0,
-            "total": 0.0,
         }
 
     def _store_main_overlay(
@@ -209,48 +196,8 @@ class RoadSegmentor:
         return image
 
     def _profile_add(self, infer_s, preprocess_s, search_s, fit_s, render_s, total_s):
-        """累计分割链路阶段耗时，并按时间窗口打印平均值."""
-        if not self.seg_profile_enabled:
-            return
-
-        acc = self.seg_profile_acc
-        acc["frames"] += 1
-        acc["infer"] += infer_s
-        acc["preprocess"] += preprocess_s
-        acc["search"] += search_s
-        acc["fit"] += fit_s
-        acc["render"] += render_s
-        acc["total"] += total_s
-
-        now = time.perf_counter()
-        interval = now - self.seg_profile_last_print
-        if interval < self.seg_profile_print_interval or acc["frames"] <= 0:
-            return
-
-        frames = float(acc["frames"])
-        print(
-            (
-                "[SegmentorProfile] "
-                f"frames={int(frames)} "
-                f"infer={acc['infer'] * 1000.0 / frames:.2f}ms "
-                f"pre={acc['preprocess'] * 1000.0 / frames:.2f}ms "
-                f"search={acc['search'] * 1000.0 / frames:.2f}ms "
-                f"fit={acc['fit'] * 1000.0 / frames:.2f}ms "
-                f"render={acc['render'] * 1000.0 / frames:.2f}ms "
-                f"total={acc['total'] * 1000.0 / frames:.2f}ms"
-            ),
-            flush=True,
-        )
-        self.seg_profile_last_print = now
-        self.seg_profile_acc = {
-            "frames": 0,
-            "infer": 0.0,
-            "preprocess": 0.0,
-            "search": 0.0,
-            "fit": 0.0,
-            "render": 0.0,
-            "total": 0.0,
-        }
+        """保留接口占位，当前版本不再输出分割链路阶段耗时。"""
+        return
 
     def _prepare_search_mask(self, mask):
         """为路径搜索准备更连贯的 mask，只修补底部附近的小断裂."""
@@ -354,6 +301,9 @@ class RoadSegmentor:
         min_rows = max(2, int(config.FORK_INNER_OPEN_MIN_ROWS))
         min_gap_growth = float(config.FORK_INNER_OPEN_MIN_GAP_GROWTH)
         min_side_growth = float(config.FORK_INNER_OPEN_MIN_SIDE_GROWTH)
+        min_step_gain = float(config.FORK_INNER_OPEN_MIN_STEP_GAIN)
+        min_positive_gap_rows = max(1, int(config.FORK_INNER_OPEN_MIN_POSITIVE_GAP_ROWS))
+        min_positive_side_rows = max(1, int(config.FORK_INNER_OPEN_MIN_POSITIVE_SIDE_ROWS))
         max_step_regression = float(config.FORK_INNER_OPEN_MAX_STEP_REGRESSION)
         max_miss_rows = max(0, int(config.FORK_INNER_OPEN_MAX_MISS_ROWS))
 
@@ -369,11 +319,28 @@ class RoadSegmentor:
             left_growth = float(bottom_row["left_inner_x"]) - float(top_row["left_inner_x"])
             right_growth = float(top_row["right_inner_x"]) - float(bottom_row["right_inner_x"])
             gap_growth = float(top_row["gap_width"]) - float(bottom_row["gap_width"])
+            positive_gap_rows = 0
+            positive_left_rows = 0
+            positive_right_rows = 0
+
+            for prev_row, curr_row in zip(run_rows[:-1], run_rows[1:]):
+                left_step = float(prev_row["left_inner_x"]) - float(curr_row["left_inner_x"])
+                right_step = float(curr_row["right_inner_x"]) - float(prev_row["right_inner_x"])
+                gap_step = float(curr_row["gap_width"]) - float(prev_row["gap_width"])
+
+                if gap_step >= min_step_gain:
+                    positive_gap_rows += 1
+                if left_step >= min_step_gain:
+                    positive_left_rows += 1
+                if right_step >= min_step_gain:
+                    positive_right_rows += 1
 
             if (
                 left_growth < min_side_growth or
                 right_growth < min_side_growth or
-                gap_growth < min_gap_growth
+                gap_growth < min_gap_growth or
+                positive_gap_rows < min_positive_gap_rows or
+                min(positive_left_rows, positive_right_rows) < min_positive_side_rows
             ):
                 return None
 
@@ -381,6 +348,7 @@ class RoadSegmentor:
                 "run_rows": run_rows,
                 "score": (
                     len(run_rows),
+                    positive_gap_rows,
                     gap_growth,
                     min(left_growth, right_growth),
                 ),
@@ -425,7 +393,7 @@ class RoadSegmentor:
     def _detect_y_fork(self, search_mask):
         """识别 Y 型路口，并估计用于切分左右区域的分叉点."""
         if search_mask is None or search_mask.size == 0:
-            return {"active": False, "bottom_width": 0.0, "fork_point": None, "split_rows": 0}
+            return {"active": False, "fork_point": None, "split_rows": 0}
 
         h, w = search_mask.shape[:2]
         mask_rows = np.where(np.any(search_mask > 0, axis=1))[0]
@@ -438,27 +406,6 @@ class RoadSegmentor:
         bottom_band_height = max(1, int(config.FORK_BOTTOM_BAND_HEIGHT))
         bottom_y_end = max(1, h - bottom_margin)
         bottom_y_start = max(0, bottom_y_end - bottom_band_height)
-
-        bottom_width = 0.0
-        for sample_y in range(bottom_y_end - 1, bottom_y_start - 1, -1):
-            runs = self._find_mask_runs(
-                search_mask[sample_y],
-                config.FORK_MASK_GAP_THRESH,
-                config.FORK_MASK_MIN_BRANCH_PIXELS,
-            )
-            if not runs:
-                continue
-            widest_run = max(runs, key=lambda run: float(run["width"]))
-            bottom_width = max(bottom_width, float(widest_run["width"]))
-
-        # 暂时关闭“底部宽度必须足够大”的硬门槛，先观察全局分叉检测效果。
-        # if bottom_width < float(config.FORK_MIN_BOTTOM_WIDTH):
-        #     return {
-        #         "active": False,
-        #         "bottom_width": bottom_width,
-        #         "fork_point": None,
-        #         "split_rows": 0,
-        #     }
 
         # 分叉改为在整个有效高度范围里全局检查，而不是只盯住某个固定高度带。
         branch_rows = []
@@ -491,7 +438,6 @@ class RoadSegmentor:
         if not branch_rows:
             return {
                 "active": False,
-                "bottom_width": bottom_width,
                 "fork_point": None,
                 "split_rows": 0,
             }
@@ -500,7 +446,6 @@ class RoadSegmentor:
         if opening_run is None:
             return {
                 "active": False,
-                "bottom_width": bottom_width,
                 "fork_point": None,
                 "split_rows": 0,
             }
@@ -509,7 +454,6 @@ class RoadSegmentor:
 
         return {
             "active": True,
-            "bottom_width": bottom_width,
             "fork_point": (float(lowest_split["fork_x"]), float(lowest_split["y"])),
             "split_rows": max(1, int(len(opening_run))),
         }
@@ -733,6 +677,21 @@ class RoadSegmentor:
             })
 
         return valid_candidates
+
+    def _is_valid_fork_side_candidate(self, candidate):
+        """判断分区后单侧候选是否真的像一条可走分支，而不是底部短开口."""
+        if candidate is None:
+            return False
+
+        path = np.array(candidate.get("path", []), dtype=np.float32).reshape((-1, 2))
+        if len(path) < int(config.FORK_SIDE_MIN_VALID_NODES):
+            return False
+
+        y_span = float(np.max(path[:, 1]) - np.min(path[:, 1])) if len(path) > 0 else 0.0
+        if y_span < float(config.FORK_SIDE_MIN_VALID_Y_SPAN):
+            return False
+
+        return True
 
     def _segments_can_connect(self, prev_node, curr_segment):
         """判断上下两层的通道片段是否属于同一条候选路径."""
@@ -1104,7 +1063,10 @@ class RoadSegmentor:
                 right_support_rows,
             )
 
-            if left_best is not None and right_best is not None:
+            left_branch_valid = self._is_valid_fork_side_candidate(left_best)
+            right_branch_valid = self._is_valid_fork_side_candidate(right_best)
+
+            if left_branch_valid and right_branch_valid:
                 y_fork_active = True
                 fork_active = True
                 candidate_left_orig = np.array(left_best["path"], dtype=np.float32).reshape((-1, 1, 2))
@@ -1210,7 +1172,6 @@ class RoadSegmentor:
             "branch_support_rows": int(branch_support_rows),
             "fork_active": bool(fork_active),
             "y_fork_active": bool(y_fork_active),
-            "y_fork_bottom_width": float(y_fork_info.get("bottom_width", 0.0)),
         }
         self._store_main_overlay(
             pts_final_orig,
