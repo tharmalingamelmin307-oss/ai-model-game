@@ -340,39 +340,87 @@ class RoadSegmentor:
                     }
         return best_pair
 
-    def _check_outer_edge_continuity(self, branch_rows):
-        """检查左右最外侧边界是否沿行方向保持连续，避免把突变轮廓误判成稳定岔路."""
+    def _select_inner_gap_opening_run(self, branch_rows):
+        """挑出一段“中间缺口双边张开”的有效连续区域，用来确认真实 Y 型岔路.
+
+        这里要求的是“总体张开”而不是“逐行严格单调张开”：
+        - 局部几行持平是允许的
+        - 小幅回退也允许
+        - 但整段累计张开量要达标
+        """
         if len(branch_rows) < 2:
-            return False
+            return None
 
-        max_jump = float(config.FORK_OUTER_EDGE_MAX_JUMP)
-        max_miss_rows = max(0, int(config.FORK_OUTER_EDGE_MAX_MISS_ROWS))
-        prev_left_x = None
-        prev_right_x = None
-        prev_y = None
-        valid_pairs = 0
+        min_rows = max(2, int(config.FORK_INNER_OPEN_MIN_ROWS))
+        min_gap_growth = float(config.FORK_INNER_OPEN_MIN_GAP_GROWTH)
+        min_side_growth = float(config.FORK_INNER_OPEN_MIN_SIDE_GROWTH)
+        max_step_regression = float(config.FORK_INNER_OPEN_MAX_STEP_REGRESSION)
+        max_miss_rows = max(0, int(config.FORK_INNER_OPEN_MAX_MISS_ROWS))
 
-        for row in branch_rows:
-            curr_y = int(row["y"])
-            curr_left_x = float(row["left_run"]["left_x"])
-            curr_right_x = float(row["right_run"]["right_x"])
+        # 按“从近到远（底部到上方）”排序，检查缺口是否向前方持续张开。
+        rows = sorted(branch_rows, key=lambda row: int(row["y"]), reverse=True)
 
-            if prev_y is not None:
-                row_gap = curr_y - prev_y - 1
-                if row_gap > max_miss_rows:
-                    return False
+        def _run_metrics(run_rows):
+            if len(run_rows) < min_rows:
+                return None
 
-                if prev_left_x is not None and abs(curr_left_x - prev_left_x) > max_jump:
-                    return False
-                if prev_right_x is not None and abs(curr_right_x - prev_right_x) > max_jump:
-                    return False
-                valid_pairs += 1
+            bottom_row = run_rows[0]
+            top_row = run_rows[-1]
+            left_growth = float(bottom_row["left_inner_x"]) - float(top_row["left_inner_x"])
+            right_growth = float(top_row["right_inner_x"]) - float(bottom_row["right_inner_x"])
+            gap_growth = float(top_row["gap_width"]) - float(bottom_row["gap_width"])
 
-            prev_left_x = curr_left_x
-            prev_right_x = curr_right_x
-            prev_y = curr_y
+            if (
+                left_growth < min_side_growth or
+                right_growth < min_side_growth or
+                gap_growth < min_gap_growth
+            ):
+                return None
 
-        return valid_pairs > 0
+            return {
+                "run_rows": run_rows,
+                "score": (
+                    len(run_rows),
+                    gap_growth,
+                    min(left_growth, right_growth),
+                ),
+            }
+
+        best_run = None
+        curr_run = [rows[0]]
+
+        for row in rows[1:]:
+            prev_row = curr_run[-1]
+            row_gap = int(prev_row["y"]) - int(row["y"]) - 1
+            left_step = float(prev_row["left_inner_x"]) - float(row["left_inner_x"])
+            right_step = float(row["right_inner_x"]) - float(prev_row["right_inner_x"])
+            gap_step = float(row["gap_width"]) - float(prev_row["gap_width"])
+
+            if (
+                row_gap > max_miss_rows or
+                left_step < -max_step_regression or
+                right_step < -max_step_regression or
+                gap_step < -max_step_regression
+            ):
+                candidate = _run_metrics(curr_run)
+                if candidate is not None and (
+                    best_run is None or candidate["score"] > best_run["score"]
+                ):
+                    best_run = candidate
+                curr_run = [row]
+                continue
+
+            curr_run.append(row)
+
+        candidate = _run_metrics(curr_run)
+        if candidate is not None and (
+            best_run is None or candidate["score"] > best_run["score"]
+        ):
+            best_run = candidate
+
+        if best_run is None:
+            return None
+        return best_run["run_rows"]
 
     def _detect_y_fork(self, search_mask):
         """识别 Y 型路口，并估计用于切分左右区域的分叉点."""
@@ -380,6 +428,12 @@ class RoadSegmentor:
             return {"active": False, "bottom_width": 0.0, "fork_point": None, "split_rows": 0}
 
         h, w = search_mask.shape[:2]
+        mask_rows = np.where(np.any(search_mask > 0, axis=1))[0]
+        if len(mask_rows) > 0:
+            top_y = int(mask_rows[0])
+        else:
+            top_y = 0
+
         bottom_margin = max(0, int(config.SEG_PATH_BOTTOM_MARGIN))
         bottom_band_height = max(1, int(config.FORK_BOTTOM_BAND_HEIGHT))
         bottom_y_end = max(1, h - bottom_margin)
@@ -397,61 +451,18 @@ class RoadSegmentor:
             widest_run = max(runs, key=lambda run: float(run["width"]))
             bottom_width = max(bottom_width, float(widest_run["width"]))
 
-        if bottom_width < float(config.FORK_MIN_BOTTOM_WIDTH):
-            return {
-                "active": False,
-                "bottom_width": bottom_width,
-                "fork_point": None,
-                "split_rows": 0,
-            }
+        # 暂时关闭“底部宽度必须足够大”的硬门槛，先观察全局分叉检测效果。
+        # if bottom_width < float(config.FORK_MIN_BOTTOM_WIDTH):
+        #     return {
+        #         "active": False,
+        #         "bottom_width": bottom_width,
+        #         "fork_point": None,
+        #         "split_rows": 0,
+        #     }
 
-        upper_center_y = int(round((h - 1) * float(config.FORK_UPPER_ROW_RATIO)))
-        upper_band_height = max(1, int(config.FORK_UPPER_BAND_HEIGHT))
-        upper_half = upper_band_height // 2
-        upper_y_start = max(0, upper_center_y - upper_half)
-        upper_y_end = min(h - 1, upper_center_y + upper_half)
-
-        upper_best = None
-        for sample_y in range(upper_y_start, upper_y_end + 1):
-            runs = self._find_mask_runs(
-                search_mask[sample_y],
-                config.FORK_MASK_GAP_THRESH,
-                config.FORK_MASK_MIN_BRANCH_PIXELS,
-            )
-            dual_branch = self._pick_dual_branch_runs(runs)
-            if dual_branch is None:
-                continue
-
-            pick_key = (
-                dual_branch["score"],
-                -abs(sample_y - upper_center_y),
-            )
-            if upper_best is None or pick_key > upper_best["pick_key"]:
-                fork_x = 0.5 * (
-                    float(dual_branch["left_run"]["right_x"]) +
-                    float(dual_branch["right_run"]["left_x"])
-                )
-                upper_best = {
-                    "left_run": dual_branch["left_run"],
-                    "right_run": dual_branch["right_run"],
-                    "separation": dual_branch["separation"],
-                    "y": int(sample_y),
-                    "fork_x": float(fork_x),
-                    "pick_key": pick_key,
-                }
-
-        if upper_best is None:
-            return {
-                "active": False,
-                "bottom_width": bottom_width,
-                "fork_point": None,
-                "split_rows": 0,
-            }
-
-        lowest_split = dict(upper_best)
-        split_rows = 0
+        # 分叉改为在整个有效高度范围里全局检查，而不是只盯住某个固定高度带。
         branch_rows = []
-        for sample_y in range(int(upper_best["y"]), bottom_y_start + 1):
+        for sample_y in range(top_y, bottom_y_start + 1):
             runs = self._find_mask_runs(
                 search_mask[sample_y],
                 config.FORK_MASK_GAP_THRESH,
@@ -461,8 +472,7 @@ class RoadSegmentor:
             if dual_branch is None:
                 continue
 
-            split_rows += 1
-            lowest_split = {
+            branch_rows.append({
                 "left_run": dual_branch["left_run"],
                 "right_run": dual_branch["right_run"],
                 "separation": dual_branch["separation"],
@@ -471,10 +481,14 @@ class RoadSegmentor:
                     float(dual_branch["left_run"]["right_x"]) +
                     float(dual_branch["right_run"]["left_x"])
                 ),
-            }
-            branch_rows.append(lowest_split)
+                "left_inner_x": float(dual_branch["left_run"]["right_x"]),
+                "right_inner_x": float(dual_branch["right_run"]["left_x"]),
+                "gap_width": float(
+                    dual_branch["right_run"]["left_x"] - dual_branch["left_run"]["right_x"]
+                ),
+            })
 
-        if not self._check_outer_edge_continuity(branch_rows):
+        if not branch_rows:
             return {
                 "active": False,
                 "bottom_width": bottom_width,
@@ -482,11 +496,22 @@ class RoadSegmentor:
                 "split_rows": 0,
             }
 
+        opening_run = self._select_inner_gap_opening_run(branch_rows)
+        if opening_run is None:
+            return {
+                "active": False,
+                "bottom_width": bottom_width,
+                "fork_point": None,
+                "split_rows": 0,
+            }
+
+        lowest_split = opening_run[0]
+
         return {
             "active": True,
             "bottom_width": bottom_width,
             "fork_point": (float(lowest_split["fork_x"]), float(lowest_split["y"])),
-            "split_rows": max(1, int(split_rows)),
+            "split_rows": max(1, int(len(opening_run))),
         }
 
     def _split_mask_by_fork(self, search_mask, fork_point):
