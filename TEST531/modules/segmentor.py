@@ -340,6 +340,40 @@ class RoadSegmentor:
                     }
         return best_pair
 
+    def _check_outer_edge_continuity(self, branch_rows):
+        """检查左右最外侧边界是否沿行方向保持连续，避免把突变轮廓误判成稳定岔路."""
+        if len(branch_rows) < 2:
+            return False
+
+        max_jump = float(config.FORK_OUTER_EDGE_MAX_JUMP)
+        max_miss_rows = max(0, int(config.FORK_OUTER_EDGE_MAX_MISS_ROWS))
+        prev_left_x = None
+        prev_right_x = None
+        prev_y = None
+        valid_pairs = 0
+
+        for row in branch_rows:
+            curr_y = int(row["y"])
+            curr_left_x = float(row["left_run"]["left_x"])
+            curr_right_x = float(row["right_run"]["right_x"])
+
+            if prev_y is not None:
+                row_gap = curr_y - prev_y - 1
+                if row_gap > max_miss_rows:
+                    return False
+
+                if prev_left_x is not None and abs(curr_left_x - prev_left_x) > max_jump:
+                    return False
+                if prev_right_x is not None and abs(curr_right_x - prev_right_x) > max_jump:
+                    return False
+                valid_pairs += 1
+
+            prev_left_x = curr_left_x
+            prev_right_x = curr_right_x
+            prev_y = curr_y
+
+        return valid_pairs > 0
+
     def _detect_y_fork(self, search_mask):
         """识别 Y 型路口，并估计用于切分左右区域的分叉点."""
         if search_mask is None or search_mask.size == 0:
@@ -416,6 +450,7 @@ class RoadSegmentor:
 
         lowest_split = dict(upper_best)
         split_rows = 0
+        branch_rows = []
         for sample_y in range(int(upper_best["y"]), bottom_y_start + 1):
             runs = self._find_mask_runs(
                 search_mask[sample_y],
@@ -436,6 +471,15 @@ class RoadSegmentor:
                     float(dual_branch["left_run"]["right_x"]) +
                     float(dual_branch["right_run"]["left_x"])
                 ),
+            }
+            branch_rows.append(lowest_split)
+
+        if not self._check_outer_edge_continuity(branch_rows):
+            return {
+                "active": False,
+                "bottom_width": bottom_width,
+                "fork_point": None,
+                "split_rows": 0,
             }
 
         return {
@@ -533,11 +577,13 @@ class RoadSegmentor:
             work_mask[:top_y, :] = 0
             work_edge[:top_y, :] = 0
 
-        bottom_y = h_seg - int(config.SEG_PATH_BOTTOM_MARGIN)
-        bottom_slice_height = int(config.SEG_PATH_BOTTOM_SLICE_HEIGHT)
+        bottom_touch_height = max(1, int(config.SEG_PATH_BOTTOM_TOUCH_HEIGHT))
         start_segments = []
         start_row_y = None
-        for sample_y in range(bottom_y, max(-1, bottom_y - bottom_slice_height), -1):
+        min_start_y = max(0, h_seg - bottom_touch_height)
+        # 只要在“图像真实底部 20 行”里触达过，就允许把它当作有效起始路径。
+        # 这里不再被 BOTTOM_MARGIN 缩掉，避免“明明已经贴近底部，但因为预留边距没扫到”。
+        for sample_y in range(h_seg - 1, min_start_y - 1, -1):
             row_segments = self._build_row_segments(work_mask[sample_y], work_edge[sample_y])
             if not row_segments:
                 continue
@@ -598,12 +644,11 @@ class RoadSegmentor:
                     }])
             else:
                 new_paths = []
-                used_segments = set()
 
                 for path in active_paths:
                     last_node = path[-1]
                     matched = False
-                    for seg_idx, segment in enumerate(best_segments):
+                    for segment in best_segments:
                         if not self._segments_can_connect(last_node, segment):
                             continue
 
@@ -616,24 +661,14 @@ class RoadSegmentor:
                             "pair_count": len(best_segments),
                         }
                         new_paths.append(path + [node])
-                        used_segments.add(seg_idx)
                         matched = True
 
                     if not matched:
                         new_paths.append(path)
 
-                for seg_idx, segment in enumerate(best_segments):
-                    if seg_idx in used_segments:
-                        continue
-                    new_paths.append([{
-                        "pt": (segment["center_x"], float(best_row_y)),
-                        "left_x": segment["left_x"],
-                        "right_x": segment["right_x"],
-                        "width": segment["width"],
-                        "local_center": segment["center_x"],
-                        "pair_count": len(best_segments),
-                    }])
-
+                # 这里严格要求“候选路径必须从底部起步”：
+                # 上层新出现但和底部既有路径连不上的片段，直接丢弃，
+                # 不能在中途重新开一路，否则会把悬空分支误当成可走路径。
                 active_paths = new_paths
                 if len(active_paths) > int(config.SEG_PATH_MAX_ACTIVE_PATHS):
                     active_paths = self._prune_active_paths(active_paths)

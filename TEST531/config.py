@@ -328,6 +328,12 @@ FORK_MIN_BRANCH_SEP = 18.0
 # 底部宽度判定时使用的底部带高度，单位是分割平面像素。
 FORK_BOTTOM_BAND_HEIGHT = 16
 
+# 分叉口外侧边界连续性约束。
+# 从上方分叉检测带一直看到底部带时，最左外边界和最右外边界都不应出现太大的跨行跳变，
+# 否则更像噪声、汇合路或者局部遮挡，不判成稳定岔路。
+FORK_OUTER_EDGE_MAX_JUMP = 18.0
+FORK_OUTER_EDGE_MAX_MISS_ROWS = 4
+
 # 检测目标扰动路径时使用的高斯扩散 sigma 预留值。
 # 值越大，未来如果启用目标影响路径，障碍物对路径的“排斥范围”会越宽。
 GAUSSIAN_SIGMA = 35.0
@@ -774,10 +780,10 @@ STONE_BRANCH_MIN_SEP = 12
 # 自底向上路径搜索参数。
 # 这些值决定了 mask 搜索的采样密度、连通判定和候选路径数量上限。
 # 如果分叉口容易漏掉某一支，或直道上路径抖动明显，优先看这里。
-SEG_PATH_SEARCH_STEP_Y = 5
+SEG_PATH_SEARCH_STEP_Y = 10
 
 # 同一层里，相邻白色像素之间如果断开超过这个阈值，就认为属于不同分支。
-SEG_PATH_GAP_THRESH = 5
+SEG_PATH_GAP_THRESH = 15
 
 # 路径搜索前，对二值 mask 底部局部做轻微膨胀，优先修补起步区域的小断裂。
 # 膨胀只作用于“搜索用 mask”，不会改动原始分割模型输出。
@@ -791,6 +797,7 @@ SEG_PATH_DILATE_BOTTOM_HEIGHT = 40
 # - MIN_START_PIXELS: 底部白像素至少达到多少才开始建路径
 SEG_PATH_BOTTOM_MARGIN = 5
 SEG_PATH_BOTTOM_SLICE_HEIGHT = 15
+SEG_PATH_BOTTOM_TOUCH_HEIGHT = 20
 SEG_PATH_MIN_START_PIXELS = 8
 
 # 向上搜索的最高比例位置（兜底值）。
