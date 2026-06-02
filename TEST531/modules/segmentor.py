@@ -622,7 +622,7 @@ class RoadSegmentor:
         if best_run is None:
             return None
 
-        return self._build_merge_guide_line(best_run, best_side)
+        return self._build_merge_guide_line(best_run, best_side, search_mask, edge_mask)
 
     def _split_mask_by_fork(self, search_mask, fork_point):
         """按“分叉点到底部中点”的分界线，把 mask 切成左右两大区域."""
@@ -844,8 +844,8 @@ class RoadSegmentor:
 
         return valid_candidates
 
-    def _build_merge_guide_line(self, merge_run, side_name):
-        """从单侧汇合尖角那一侧边界最底部的局部斜率构造一条向上的引导线."""
+    def _build_merge_guide_line(self, merge_run, side_name, search_mask, edge_mask):
+        """从单侧汇合尖角下半部分边界的局部斜率构造一条向上的引导线."""
         if merge_run is None:
             return None
 
@@ -859,32 +859,20 @@ class RoadSegmentor:
             return None
 
         if side_name == "left":
+            x_samples = np.array([float(row["left_inner_x"]) for row in fit_rows_data], dtype=np.float32)
             anchor_x = float(rows[-1]["left_inner_x"])
         else:
+            x_samples = np.array([float(row["right_inner_x"]) for row in fit_rows_data], dtype=np.float32)
             anchor_x = float(rows[-1]["right_inner_x"])
 
-        # 只取“最底部相邻两点”的局部斜率。
-        slope_dx_dy = None
-        for lower_row, upper_row in zip(fit_rows_data[:-1], fit_rows_data[1:]):
-            y0 = float(lower_row["y"])
-            y1 = float(upper_row["y"])
-            dy = y1 - y0
-            if abs(dy) < 1e-6:
-                continue
-
-            if side_name == "left":
-                x0 = float(lower_row["left_inner_x"])
-                x1 = float(upper_row["left_inner_x"])
-            else:
-                x0 = float(lower_row["right_inner_x"])
-                x1 = float(upper_row["right_inner_x"])
-
-            slope_dx_dy = (x1 - x0) / dy
-            break
-
-        if slope_dx_dy is None:
+        y_samples = np.array([float(row["y"]) for row in fit_rows_data], dtype=np.float32)
+        if len(np.unique(y_samples)) < 2:
             return None
 
+        # 只取尖角下半部分几行的局部斜率，再从尖角位置按这个斜率向上外推，
+        # 避免整段绝对拟合把趋势拉偏。
+        coeff = np.polyfit(y_samples, x_samples, 1)
+        slope_dx_dy = float(coeff[0])
         anchor_y = float(rows[-1]["y"])
         top_y = max(0.0, anchor_y - float(config.MERGE_GUIDE_EXTEND_ROWS))
         top_x = float(anchor_x + slope_dx_dy * (top_y - anchor_y))
