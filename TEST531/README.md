@@ -6,7 +6,7 @@
 
 - `Seg` 负责主控闭环，持续输出循迹控制量
 - `YOLO` 负责环境目标检测和路牌框检测
-- `OCR` 负责整图 `det + rec`，再把结果回匹配到 `sign / limit_sign`
+- `OCR` 负责整图 `det + rec`，再把结果回匹配到 `sign`；`limit_sign` 链路保留，但当前通过 `LIMIT_SIGN_ENABLED=False` 临时关闭
 - 各线程都优先保“最新帧”，必要时主动丢掉旧任务，避免累积延迟
 
 ## 项目结构
@@ -40,15 +40,44 @@
 3. `ocr_worker()`
    对整张 `TARGET_RES` 图执行 OCR `det + rec`，再把结果匹配回检测框
 4. `seg_worker()`
-   执行分割、路径搜索、逆透视和控制量估计
+   默认拆成 Seg 推理流水线和后处理流水线：当前线程做 NPU 推理，内部后处理线程做路径搜索、逆透视和控制量估计
 5. `serial_control_thread()`
    把视觉结果转成速度与舵机命令发给下位机
 6. Flask 推流线程
    将最终调试画面编码成 MJPEG 供网页预览
 
+当前默认配置下：
+
+- `SEG_PIPELINE_ENABLED=True`
+- `SEG_CORES=[0]`
+- `app.run(..., threaded=True)`
+
+固定业务线程大致如下：
+
+| 线程 | 数量 | 作用 |
+|---|---:|---|
+| 主线程 / Flask | 1 | 跑 Flask 服务 |
+| `ai_producer_thread` | 1 | 从共享内存取图，分发给 Seg / YOLO |
+| `serial_control_thread` | 1 | 下发速度和舵机命令 |
+| `seg_worker` | 1 | Seg NPU 推理 |
+| `postprocess_loop` | 1 | Seg 后处理、路径搜索、渲染；仅流水线模式开启 |
+| `yolo_worker` | 1 | 目标检测 |
+| `ocr_worker` | 1 | OCR det + rec |
+
+所以：
+
+- 流水线开启且不打开网页：固定约 `7` 个线程
+- 流水线开启并打开一个 `/video_feed`：通常约 `8` 个或更多线程
+- `SEG_PIPELINE_ENABLED=False` 时少一个 `postprocess_loop`
+- 串行模式不打开网页：固定约 `6` 个线程
+- 串行模式打开一个 `/video_feed`：通常约 `7` 个或更多线程
+
+`/video_feed` 会多占线程，是因为 Flask 使用 `threaded=True`。浏览器访问主页后，图片流是一个持续不断的 MJPEG 长连接，请求线程会一直负责向浏览器发送 JPEG 帧；刷新页面、多个浏览器窗口或断线重连时，短时间内可能看到更多请求线程。
+
 设计原则：
 
 - `seg_queue` 和 `yolo_queue` 都只保留最新帧
+- `seg_worker()` 内部的 `mask_queue` 也只保留最新 mask
 - `ocr_queue` 只保留很少量的新任务，旧任务会被主动丢掉
 - 目标是避免“上一帧还没算完，下一帧已经来了”的排队迟滞
 
@@ -75,7 +104,7 @@
 - `TARGET_RES`
   系统内部统一显示/检测坐标系，检测框、OCR 回写文字、网页叠框都在这里对齐
 - `SEG_SIZE`
-  分割与路径规划使用的 320x320 小图坐标系
+  分割与路径规划使用的模型输入坐标系。当前默认是 `416x160`，输入前先裁掉原图上半部分，只把下半图送进分割模型；历史 `320x320` 配置保存在 `320*320/` 目录中
 
 关键约定：
 
@@ -102,16 +131,18 @@
 
 ### 2. YOLO 检测逻辑
 
-`modules/detector.py` 当前支持两类输出格式：
+`modules/detector.py` 当前只按 detv3 official split RKNN 模型解析：
 
-- PP-YOLOE 官方 demo 风格的多分支输出
-- 单 tensor 的回退输出格式
+- `boxes`: `[N, 4]`，xyxy
+- `scores`: `[N, num_classes]`
+- Python 侧只喂 `0-255 RGB uint8`，mean/std 已固化在 RKNN 内部
 
 检测后处理的当前真实行为：
 
 - 先拿每个候选位置的最高分类得分
 - 再按“每个类别自己的阈值”过滤
 - 然后做按类别 NMS
+- 再按类别最大面积比例和贴边大框规则过滤异常框
 - 最终统一输出：
 
 ```python
@@ -125,9 +156,9 @@
 
 注意：
 
-- 现在已经不再使用面积或贴边几何规则过滤检测框
-- 当前只保留“框尺寸合法 + 类别置信度阈值”两层过滤
+- 当前不再兼容旧的多分支 / 单 tensor 检测模型输出
 - 类别阈值统一由 `YOLO_CONF_THRES + CLASS_MIN_SCORES` 控制
+- 异常大框过滤由 `YOLO_MAX_AREA_RATIO_BY_CLASS / YOLO_EDGE_*` 控制
 
 ### 3. OCR 触发逻辑
 
@@ -199,6 +230,8 @@
 
 ### 6. `limit_sign` 限速牌逻辑
 
+注意：当前 `config.py` 中 `LIMIT_SIGN_ENABLED=False`，所以 `limit_sign` 不触发 OCR，也不会写入 `speed_limit`。下面记录的是限速链路重新开启后的保留逻辑。
+
 限速牌当前逻辑分成两个阶段：
 
 1. 先把 OCR 文本中的数字字符提出来
@@ -228,22 +261,23 @@
 
 `modules/segmentor.py` 是当前主控核心，主要流程如下：
 
-1. 对 `SEG_SIZE` 小图执行分割
-2. 从分割输出中得到二值赛道 `mask`
-3. 先只对搜索用 `mask` 的底部局部做轻微膨胀，修补近车处的小断裂
-4. 先检查全图是否连续出现若干行“主白区宽度足够大”
-5. 只有满足这条宽带条件时，才全图搜索“单侧向下扩张的汇合尖角”
-6. 如果命中汇合尖角，就按尖角下半部分几行边界的局部斜率，从尖角位置向上补一条汇合引导线，并按单路模式继续搜索
-7. 如果没有命中汇合尖角，再去全图扫描“中间缺口双边张开”的连续区域，判断是否为真正的 Y 型岔路
-8. 一旦确认 Y 型岔路，就用“分叉点 -> 底部中点”的分界线把路面切成左右两大区域
-9. 在整图或左右分区内，自底向上分层搜索候选路径
-10. 路径必须从图像真实底部 `SEG_PATH_BOTTOM_TOUCH_HEIGHT` 行内起步，中途新冒出来但没接到底部的悬空候选会被丢弃
-11. 对候选路径按长度、平滑度、通道宽度、局部中心偏离做打分
-12. 如果检测到 `stone`，优先绕开石头更接近的那一支
-13. 如果没有明确石头干预，则默认偏向左支；如果 OCR 给出 `turn_intent`，再用 `LEFT / RIGHT` 覆盖默认偏向
-14. 对最终路径做多项式拟合
-15. 对拟合系数做 EMA 平滑
-16. 将拟合路径转换成单一 `steer_signal`，并渲染调试图
+1. `infer_mask()` 对 `SEG_SIZE` 小图执行分割，得到二值赛道 `mask`
+2. `seg_worker()` 把最新 `mask` 连同当时的 YOLO 框、`turn_intent` 放入内部 `mask_queue`
+3. `postprocess_mask()` 从最新 `mask` 开始做路径规划
+4. 先只对搜索用 `mask` 的底部局部做轻微膨胀，修补近车处的小断裂
+5. 先检查全图是否连续出现若干行“主白区宽度足够大”
+6. 只有满足这条宽带条件时，才全图搜索“单侧向下扩张的汇合尖角”
+7. 如果命中汇合尖角，就按固定赛道宽度反推缺失侧边界，补出一条汇合引导线，并按单路模式继续搜索
+8. 如果没有命中汇合尖角，再去全图扫描“中间缺口双边张开”的连续区域，判断是否为真正的 Y 型岔路
+9. 一旦确认 Y 型岔路，就用“分叉点 -> 底部中点”的分界线把路面切成左右两大区域
+10. 在整图或左右分区内，自底向上分层搜索候选路径
+11. 路径必须从图像真实底部 `SEG_PATH_BOTTOM_TOUCH_HEIGHT` 行内起步，中途新冒出来但没接到底部的悬空候选会被丢弃
+12. 对候选路径按长度、平滑度、通道宽度、局部中心偏离做打分
+13. 如果检测到 `stone`，优先绕开石头更接近的那一支
+14. 如果没有明确石头干预，则默认偏向左支；如果 OCR 给出 `turn_intent`，再用 `LEFT / RIGHT` 覆盖默认偏向
+15. 对最终路径做多项式拟合
+16. 对拟合系数做 EMA 平滑
+17. 将拟合路径转换成单一 `steer_signal`，并渲染调试图
 
 当前输出：
 
@@ -254,6 +288,10 @@
 
 补充说明：
 
+- `SEG_PIPELINE_ENABLED=True` 时，Seg 推理和上一帧 mask 后处理会重叠执行
+- `SEG_PIPELINE_ENABLED=False` 时，会回到旧串行模式：推理完当前帧后，立刻在同一线程里处理当前帧
+- 页面 `Seg FPS` 表示后处理线程实际产出控制量/预览画面的频率
+- 终端 `SegProfile total / est` 表示单帧从开始推理到渲染完成的端到端耗时估算
 - 当前岔路主判据已经不是“外边界断裂”，而是“中间缺口双边张开 + 缺口总体变大”
 - 当前还额外支持一种“汇合引导线”补线逻辑：只有先看到全图连续宽带，再检测到单侧下扩尖角时，才会按单路模式补线，而不是直接切成岔路
 - 当前代码里 `stone` 已经会参与左右分支选择，但还没有进一步写成更复杂的代价场避障
@@ -345,8 +383,8 @@ target_speed = 0                                # 若红/黄灯停车成立
 
 默认配置见 `config.py`：
 
-- 分割模型：`models/seg/ppliteseg_320_320_int8.rknn`
-- 检测模型：`models/det/detv2/ppyoloe_crn_m_80e_custom_raw_rk3588_fp16.rknn`
+- 分割模型：`models/seg/segv3/pipi416x160_argmax_rk3588_int8.rknn`
+- 检测模型：`models/det/detv3/ppyoloe_crn_m_80e_custom_official_split_rk3588_int8_512x384.rknn`
 - OCR det 模型：`models/ocr/ppocrv4_det_int8.rknn`
 - OCR rec 模型：`models/ocr/ppocrv4_rec_fp16.rknn`
 - OCR 字典：`models/ocr/keys.txt`
@@ -458,6 +496,8 @@ target_speed = 0                                # 若红/黄灯停车成立
 优先看这些参数：
 
 - `SEG_QUEUE_MAXSIZE / YOLO_QUEUE_MAXSIZE / OCR_QUEUE_MAXSIZE`
+- `SEG_PIPELINE_ENABLED`
+- `SEG_PIPELINE_QUEUE_MAXSIZE`
 - `JPEG_QUALITY`
 - `FPS_STATS_UPDATE_INTERVAL`
 - `CONTROL_LOOP_SLEEP`
@@ -472,12 +512,111 @@ target_speed = 0                                # 若红/黄灯停车成立
 - 想让 FPS 数字更新更灵敏
   适当减小 `FPS_STATS_UPDATE_INTERVAL`
 
+### 6. Seg 流水线与实测性能记录
+
+当前 `SEG_PIPELINE_ENABLED=True` 时，Seg 链路拆成两段：
+
+```text
+seg_queue -> infer_mask() -> mask_queue -> postprocess_mask() -> steer_signal / preview
+```
+
+其中：
+
+- `infer_mask()` 只做 RKNN 分割推理，输出二值 `mask`
+- `mask_queue` 只保留最新一帧，旧 mask 会被丢掉
+- `postprocess_mask()` 做路径搜索、拟合、控制量计算和调试渲染
+- `SegProfile total` 是单帧端到端耗时，不等同于页面 `Seg FPS`
+
+历史串行模式和流水线模式的现场对比如下：
+
+| 项目 | 串行 | 现在流水线 |
+|---|---:|---:|
+| 执行方式 | 推理完再后处理 | 推理和上一帧后处理同时跑 |
+| 页面 `Seg FPS` | 约 `16-25fps` | 约 `31fps` |
+| 控制刷新周期 | `40-60ms/次` | `30-33ms/次` |
+| 单帧端到端延迟 | 约 `40-60ms` | 约 `55-60ms` |
+| 控制使用的画面 | 当前帧结果 | 通常落后一帧左右 |
+| 舵机更新细腻度 | 一般 | 更连续 |
+| 高速反应速度 | 取决于 `total`，偏慢 | 刷新更快，但画面时间戳更旧 |
+| CPU / 线程调度压力 | 低一点 | 高一点 |
+| 稳定性 | 更简单稳 | 多一个队列/线程，需实测 |
+| 适合场景 | 看重低复杂度、低错位 | 看重控制更新频率 |
+
+一次 `320x320 / segv2` 流水线模式下的现场 `SegProfile` 样本：
+
+```text
+SegProfile infer=23.4ms prep=0.3ms search=10.4ms fit=8.2ms render=5.4ms total=56.2ms est=17.8fps
+SegProfile infer=22.8ms prep=0.4ms search=11.4ms fit=8.6ms render=5.7ms total=58.7ms est=17.0fps
+SegProfile infer=21.2ms prep=0.4ms search=10.0ms fit=7.9ms render=4.2ms total=52.5ms est=19.0fps
+SegProfile infer=21.8ms prep=0.4ms search=15.8ms fit=7.7ms render=3.1ms total=56.7ms est=17.6fps
+SegProfile infer=25.0ms prep=0.4ms search=13.4ms fit=7.8ms render=2.5ms total=63.1ms est=15.8fps
+SegProfile infer=18.5ms prep=0.6ms search=12.4ms fit=7.7ms render=5.2ms total=44.8ms est=22.3fps
+SegProfile infer=20.2ms prep=0.3ms search=10.6ms fit=7.5ms render=3.3ms total=42.7ms est=23.4fps
+SegProfile infer=19.9ms prep=0.1ms search=12.2ms fit=7.5ms render=3.1ms total=43.3ms est=23.1fps
+SegProfile infer=17.7ms prep=0.0ms search=10.0ms fit=7.8ms render=3.0ms total=38.7ms est=25.9fps
+SegProfile infer=18.9ms prep=0.0ms search=10.8ms fit=7.2ms render=3.9ms total=41.3ms est=24.2fps
+SegProfile infer=23.3ms prep=0.0ms search=12.9ms fit=9.0ms render=4.7ms total=50.1ms est=19.9fps
+```
+
+这组数据的观察结论：
+
+- 11 条样本平均约为：`infer=21.2ms prep=0.3ms search=11.8ms fit=7.9ms render=4.0ms total=49.8ms est=20.5fps`
+- `infer` 大多在 `18-25ms`
+- `search + fit` 大多在 `17-24ms`
+- `render` 大多在 `3-6ms`
+- `total` 大多在 `40-60ms`
+- 终端 `est` 是 `1 / total`，所以大多显示 `16-25fps`
+- 页面 `Seg FPS` 是实际产出控制量/预览图的频率，流水线下可以高于终端 `est`
+
+当前 `416x160 / segv3` 裁下半图模型的现场样本如下。这个版本页面上曾观察到 `Seg FPS` 约 `37-38fps`，但终端 `SegProfile est` 仍要按单帧 `total` 单独看：
+
+```text
+SegProfile infer=21.4ms prep=0.0ms search=10.1ms fit=14.2ms render=3.2ms queue_wait=7.9ms total=49.0ms est=20.4fps
+SegProfile infer=23.3ms prep=0.3ms search=11.1ms fit=11.0ms render=2.9ms queue_wait=4.5ms total=48.5ms est=20.6fps
+SegProfile infer=23.1ms prep=0.3ms search=10.5ms fit=13.8ms render=1.3ms queue_wait=7.4ms total=49.0ms est=20.4fps
+SegProfile infer=20.5ms prep=0.3ms search=13.0ms fit=7.1ms render=2.1ms queue_wait=6.8ms total=43.0ms est=23.3fps
+SegProfile infer=23.7ms prep=0.3ms search=12.8ms fit=4.2ms render=2.4ms queue_wait=4.5ms total=43.4ms est=23.1fps
+SegProfile infer=22.2ms prep=0.3ms search=9.3ms fit=5.7ms render=1.8ms queue_wait=2.4ms total=39.4ms est=25.4fps
+SegProfile infer=19.2ms prep=0.4ms search=10.8ms fit=5.0ms render=1.6ms queue_wait=6.4ms total=37.0ms est=27.0fps
+SegProfile infer=18.3ms prep=0.3ms search=9.6ms fit=5.3ms render=2.0ms queue_wait=2.7ms total=35.6ms est=28.1fps
+SegProfile infer=21.1ms prep=0.3ms search=13.7ms fit=5.2ms render=1.2ms queue_wait=4.5ms total=41.5ms est=24.1fps
+```
+
+`320x320 / segv2` 与当前 `416x160 / segv3` 的对比：
+
+| 项目 | `320x320 / segv2` 流水线记录 | 当前 `416x160 / segv3` 流水线记录 |
+|---|---:|---:|
+| 分割输入 | 全图 resize 到 `320x320` | 裁掉上半图，下半图 resize 到 `416x160` |
+| 页面 `Seg FPS` | 流水线下可到 `30fps+` | 现场最高约 `37-38fps`，波动时约 `25fps` |
+| 平均 `infer` | `21.2ms` | `21.4ms` |
+| 平均 `search + fit` | `19.7ms` | `19.1ms` |
+| 平均 `render` | `4.0ms` | `2.1ms` |
+| 平均 `total` | `49.8ms` | `42.9ms` |
+| 平均终端 `est` | `20.5fps` | `23.6fps` |
+| 规划适配 | 方形输入，包含较多上半图远处信息 | 宽屏下半图，横向更细，更适合金币、障碍物和近处路径规划 |
+
+这次对比的结论：
+
+- 当前 `416x160` 不是明显降低了 NPU 推理耗时；`infer` 基本仍在 `20ms` 左右
+- 端到端 `total` 从历史约 `49.8ms` 降到当前约 `42.9ms`，主要收益来自渲染和部分后处理
+- 页面 `Seg FPS` 能到 `37-38fps`，说明流水线吞吐更高；但车辆“看见到反应”的延迟仍主要看 `SegProfile total`
+- 虽然速度提升没有输入面积变化看起来那么大，但 `416x160` 对后续金币分段、障碍物绕行和近处 ROI 规划更合适
+
+因此：
+
+- 想让舵机更新更连续，主要看页面 `Seg FPS`
+- 想让车辆“看见到反应”更快，主要看 `SegProfile total`
+- 如果要继续降端到端延迟，优先压 `infer`、`search + fit` 和 `render`
+
 ## 当前实现里的几个容易误解的点
 
 1. OCR 现在是整图 `det + rec`，不是直接裁 YOLO 框识别。
-2. `limit_sign` 不是“等靠近牌子再降速”，而是确认通过后立即生效。
-3. 当前限速不会自动超时恢复，只会被新的限速牌覆盖。
-4. 实际写入的限速是 `识别数字 - 1`。
+2. 当前 `LIMIT_SIGN_ENABLED=False`，所以 `limit_sign` 不触发 OCR，也不写入 `speed_limit`。
+3. 如果重新开启限速，`limit_sign` 不是“等靠近牌子再降速”，而是确认通过后立即生效。
+4. 如果重新开启限速，限速不会自动超时恢复，只会被新的限速牌覆盖。
+5. 如果重新开启限速，实际写入的限速是 `识别数字 - 1`。
+6. 流水线模式下，页面 `Seg FPS` 和终端 `SegProfile est` 不相同是正常现象：前者是吞吐，后者是单帧端到端延迟换算。
+
 ## 启动方式
 
 直接运行：

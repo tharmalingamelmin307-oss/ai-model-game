@@ -52,8 +52,8 @@ JPEG_QUALITY = 75
 # ---------------------------------------------------------------------------
 # 分割模型路径。
 # 当前主控链路依赖这个模型输出赛道 mask，所以它直接影响路径规划和转向控制。
-# 这里的模型默认输入尺寸是 SEG_SIZE，对应下面的 320x320。
-SEG_MODEL = str(PROJECT_ROOT / "models/seg/segv2/ppliteseg_320_320_int8.rknn")
+# 这里的模型默认输入尺寸是 SEG_SIZE，对应下面的 416x160。
+SEG_MODEL = str(PROJECT_ROOT / "models/seg/segv3/pipi416x160_argmax_rk3588_int8.rknn")
 
 # 目标检测模型路径。
 # 当前使用的是 PP-YOLOE 的 RKNN 版本，输出后处理由 modules/detector.py 负责。
@@ -269,7 +269,12 @@ YOLO_SIZE = (512, 384)
 # 分割模型输入尺寸，格式为 (width, height)。
 # 分割线程直接用这张小图做主控路径搜索。
 # 这是实时控制链路的关键性能点之一。
-SEG_SIZE = (320, 320)
+SEG_SIZE = (416, 160)
+
+# 分割模型输入裁剪比例。
+# 0.5 表示先裁掉原图上半部分，只把下半部分 resize 到 SEG_SIZE。
+# 这个值要和当前 segv3 测试脚本里的 crop_y = h // 2 保持一致。
+SEG_INPUT_CROP_TOP_RATIO = 0.5
 
 # OCR 识别模型输入高度。
 # PaddleOCR 一类识别模型通常固定高度，再按宽高比自适应宽度。
@@ -284,6 +289,16 @@ REC_WIDTH = 320
 # 分割蒙版显示时的叠加透明度。
 # 只影响调试画面观感，不影响控制量计算。
 MASK_ALPHA = 0.4
+
+# 是否在预览画面上给整块分割 mask 染色。
+# False 时只画路径/边界/文字，不改变原图大面积颜色，也能减少一点渲染开销。
+SEG_DEBUG_DRAW_MASK = False
+
+# 裁剪分割模型预览合成阈值。
+# 网页预览仍以完整原图为底，只把 Seg 渲染图里相对原图明显变化的像素叠上去。
+# 值越小: mask/线更完整，但可能带入更多分割小图底色
+# 值越大: 原图保留更干净，但弱透明 mask 可能变淡
+SEG_PREVIEW_OVERLAY_DIFF_THRESH = 24
 
 
 # ---------------------------------------------------------------------------
@@ -317,18 +332,18 @@ DST_PTS = np.float32([
 FORK_MASK_MIN_BRANCH_PIXELS = 6
 
 # 上方分支判定时，两段白色区域之间最少要断开多少像素，才算“不连通”。
-FORK_MASK_GAP_THRESH = 12
+FORK_MASK_GAP_THRESH = 16
 
 # 上方左右分支之间最小横向分离距离，单位是分割平面像素。
-FORK_MIN_BRANCH_SEP = 18.0
+FORK_MIN_BRANCH_SEP = 23.0
 
 # 底部宽度判定时使用的底部带高度，单位是分割平面像素。
 FORK_BOTTOM_BAND_HEIGHT = 16
 
 # Y 岔路扫描范围，按分割平面 y 坐标配置。
-# 320x320 下这里表示扫描 160~299，比原来的 180~299 多看上方 20 行。
-FORK_SCAN_Y_TOP = 160
-FORK_SCAN_Y_BOTTOM = 299
+# segv3 已经裁掉上半图，原 320 空间的 160~299 对应当前 0~139。
+FORK_SCAN_Y_TOP = 0
+FORK_SCAN_Y_BOTTOM = 139
 
 # 分叉口“中间缺口双边张开”约束。
 # 当前更关注的是：
@@ -348,7 +363,7 @@ FORK_INNER_OPEN_MAX_STEP_REGRESSION = 3.0
 FORK_INNER_OPEN_MAX_MISS_ROWS = 2
 
 # 汇合场景扫描只看底部多少行。
-# 320x320 下设为 140 表示只扫描 y >= 180 的近处区域，减少 search 阶段逐行扫描耗时。
+# 当前 416x160 输入下设为 140 表示只扫描 y >= 20 的近处区域。
 SEG_SCENE_SCAN_BOTTOM_HEIGHT = 140
 
 # 汇合引导线参数。
@@ -356,34 +371,39 @@ SEG_SCENE_SCAN_BOTTOM_HEIGHT = 140
 # 再去搜索单侧汇合尖角。这里的宽度不要求中间联通，左右分支断开也会计入总宽。
 # 如果尖角成立，就按“可信侧边界 +/- 当前行完整赛道宽度”补出缺失侧边界，
 # 并按单路模式继续搜索，不再切成岔路。
-MERGE_GUIDE_SCAN_Y_TOP = 160
-MERGE_GUIDE_SCAN_Y_BOTTOM = 290
+MERGE_GUIDE_SCAN_Y_TOP = 0
+MERGE_GUIDE_SCAN_Y_BOTTOM = 130
 # 底部额外汇合扫描范围。
 # 这段不需要满足“足够宽/贴边连续行”的前置触发条件，直接参与汇合角点特征搜索。
-MERGE_GUIDE_FREE_SCAN_Y_TOP = 290
-MERGE_GUIDE_FREE_SCAN_Y_BOTTOM = 320
-MERGE_GUIDE_MIN_ROW_WIDTH = 220.0
+MERGE_GUIDE_FREE_SCAN_Y_TOP = 130
+MERGE_GUIDE_FREE_SCAN_Y_BOTTOM = 160
+MERGE_GUIDE_MIN_ROW_WIDTH = 286.0
 MERGE_GUIDE_MIN_WIDE_ROWS = 4
-MERGE_GUIDE_MIN_SIDE_DELTA = 10.0
-MERGE_GUIDE_OPPOSITE_MAX_DRIFT = 12.0
+MERGE_GUIDE_MIN_SIDE_DELTA = 13.0
+MERGE_GUIDE_OPPOSITE_MAX_DRIFT = 16.0
 # 塌陷侧成立后，对侧可信边界允许的逐行最大跳变。
 # 例如左侧塌陷时，右侧边界必须连续稳定，不能中途突然横跳。
-MERGE_GUIDE_OPPOSITE_MAX_STEP_JUMP = 8.0
+MERGE_GUIDE_OPPOSITE_MAX_STEP_JUMP = 10.0
 MERGE_GUIDE_MAX_MISS_ROWS = 2
 # 汇合补线命中后，沿 y 方向额外覆盖的行数。
 # 这里不是斜率外推；每一行仍按“可信侧边界 +/- 当前行完整赛道宽度”单独计算。
 MERGE_GUIDE_EXTEND_TOP_ROWS = 20
 MERGE_GUIDE_EXTEND_BOTTOM_ROWS = 90
 # 汇合补线最终允许保留的 y 范围。
-# 上部补线如果跑到 160 以上、下部补线如果跑到 320 以下之外，都直接丢弃。
-MERGE_GUIDE_LINE_Y_MIN = 160
-MERGE_GUIDE_LINE_Y_MAX = 320
+# segv3 裁剪坐标系里 0~159 就是原底部半图。
+MERGE_GUIDE_LINE_Y_MIN = 0
+MERGE_GUIDE_LINE_Y_MAX = 160
 
 # 汇合补线与可信对侧边界之间的横向保护间距。
 # 补左线时，如果它离右边界太近，就限制到“右边界 - gap”左侧；
 # 补右线时，如果它离左边界太近，就推到“左边界 + gap”右侧。
-MERGE_GUIDE_LINE_MIN_GAP = 10.0
+MERGE_GUIDE_LINE_MIN_GAP = 13.0
 MERGE_GUIDE_LINE_THICKNESS = 2
+
+# 固定赛道宽度表的来源坐标系。
+# 当前表仍然是旧 320x320 搜索平面里的样本；代码会按当前 SEG_SIZE 和裁剪比例映射到 416x160。
+SEG_FIXED_WIDTH_SOURCE_SIZE = (320, 320)
+SEG_FIXED_WIDTH_SOURCE_CROP_TOP_RATIO = 0.5
 
 # 320x320 搜索平面里各 y 行对应的固定赛道宽度。
 # 这组值来自现场采集的 Seg320Width 样本逐行取均值后固化，
@@ -407,7 +427,7 @@ SEG_FIXED_WIDTHS_320 = [
 # - 更谨慎，不容易触发锁定
 # 调小:
 # - 更容易把宽车道或轻微岔开也当成分叉
-PATH_LOCK_FORK_MIN_SEP = 28.0
+PATH_LOCK_FORK_MIN_SEP = 36.0
 
 # 会被投影到分割/鸟瞰图平面里的“规划相关类别”。
 # 当前这些目标暂时主要用于调试显示，不直接改写主路径。
@@ -553,6 +573,12 @@ FPS_STATS_UPDATE_INTERVAL = 1.0
 # 开启后每隔一段时间打印 inference / search / fit / render / total，用来定位掉帧瓶颈。
 SEG_PROFILE_LOG_ENABLED = True
 SEG_PROFILE_LOG_INTERVAL = 2.0
+
+# 主流程运行时耗时诊断日志。
+# 开启后会额外打印采集预处理、Seg 推理线程等待、发布、MJPEG 编码等耗时。
+# 用来判断页面 FPS 是卡在输入来帧、模型推理、后处理发布还是网页推流。
+MAIN_PROFILE_LOG_ENABLED = True
+MAIN_PROFILE_LOG_INTERVAL = 2.0
 
 
 # ---------------------------------------------------------------------------
@@ -782,7 +808,7 @@ SEG_EMA_ALPHA = 0.6
 # - TEMPORAL_MIN_OVERLAP_POINTS: 候选与上一帧路径至少重叠多少个采样点才参与时域打分
 # - HOLD_MISSING_FRAMES: 当前帧没搜到路径时，短暂沿用上一帧路径的最大帧数
 SEG_PATH_STABILITY_ENABLED = True
-SEG_PATH_MAX_FRAME_X_JUMP = 22.0
+SEG_PATH_MAX_FRAME_X_JUMP = 29.0
 SEG_PATH_TEMPORAL_SCORE_GAIN = 5.0
 SEG_PATH_TEMPORAL_SOFT_MAX_JUMP = 32.0
 SEG_PATH_TEMPORAL_EXCESS_SCORE_GAIN = 18.0
@@ -808,7 +834,7 @@ SEG_CENTERLINE_LARGEST_COMPONENT_ONLY = True
 SEG_CENTERLINE_ROW_STEP = 1
 
 # 同一层里，相邻白色像素之间如果断开超过这个阈值，就认为属于不同分支。
-SEG_PATH_GAP_THRESH = 15
+SEG_PATH_GAP_THRESH = 20
 
 # 路径搜索前，对二值 mask 底部局部做轻微膨胀，优先修补起步区域的小断裂。
 # 膨胀只作用于“搜索用 mask”，不会改动原始分割模型输出。
@@ -843,18 +869,18 @@ SEG_PATH_MIN_BRANCH_POINTS = 3
 
 # 一对左右边界之间至少要拉开多宽，才认为是有效通道。
 # 过小通常只是边缘毛刺或小洞，不适合拿来建路径节点。
-SEG_PATH_MIN_PAIR_WIDTH = 6
+SEG_PATH_MIN_PAIR_WIDTH = 8
 
 # 单行最多参与路径搜索的白区片段数量。
 # 复杂 mask 下过多碎片会让候选路径组合膨胀，直接拖慢 search / fit。
 SEG_PATH_MAX_ROW_SEGMENTS = 4
 
 # 相邻两层中心点横向差值小于该阈值时，认为它们可以连成同一路径。
-SEG_PATH_CONNECT_X_THRESH = 50
+SEG_PATH_CONNECT_X_THRESH = 65
 
 # 相邻两层的左右边界即使没有真正重叠，只要只差这么多像素，也允许视作同一路径。
 # 这个值主要用来给轻微断裂、轻微错位留一点连接余量。
-SEG_PATH_CONNECT_OVERLAP_MARGIN = 10
+SEG_PATH_CONNECT_OVERLAP_MARGIN = 13
 
 # 普通搜索同时保留的候选路径上限。
 # 调大能保留更多分支假设，但计算量和抖动风险也会上升。
@@ -889,8 +915,8 @@ SEG_PATH_DENSE_SAMPLES = 30
 # - 只保留落在当前路径纵向范围内、附近有 mask、且离当前中线不超过赛道半宽的金币点
 # - 路径按“底部路径点 -> 金币点 -> 最远路径点”从近到远分段重采样
 COIN_PATH_ENABLED = True
-COIN_PATH_ROI_Y_MIN = 200
-COIN_PATH_MASK_RADIUS = 8
+COIN_PATH_ROI_Y_MIN = 45
+COIN_PATH_MASK_RADIUS = 10
 COIN_PATH_HALF_WIDTH_SCALE = 1.0
 COIN_PATH_BYPASS_FRAME_JUMP = True
 

@@ -28,20 +28,25 @@ except ImportError:
 
 class RoadSegmentor:
     def __init__(self, core_id):
-        """初始化分割模型与 320 空间的逆透视矩阵."""
+        """初始化分割模型与分割空间的逆透视矩阵."""
         with suppress_rknn_init_output():
             self.rknn = RKNNLite()
 
             if self.rknn.load_rknn(config.SEG_MODEL) != 0 or self.rknn.init_runtime(core_mask=core_id) != 0:
                 raise RuntimeError("Seg 模型加载或初始化失败")
             
-        w_seg, h_seg = config.SEG_SIZE # 320, 320
+        w_seg, h_seg = config.SEG_SIZE
         src_seg = np.float32([[x * w_seg, y * h_seg] for x, y in config.SRC_PTS])
         dst_seg = np.float32([[x * w_seg, y * h_seg] for x, y in config.DST_PTS])
         # 透视矩阵直接建立在分割输入尺寸上，避免每次运行都重复计算。
         self.M_seg = cv2.getPerspectiveTransform(src_seg, dst_seg)
-        self.scale_x_to_seg = w_seg / float(config.TARGET_RES[0])
-        self.scale_y_to_seg = h_seg / float(config.TARGET_RES[1])
+        target_w, target_h = config.TARGET_RES
+        self.seg_crop_top_ratio = float(getattr(config, "SEG_INPUT_CROP_TOP_RATIO", 0.0))
+        self.seg_crop_top_ratio = max(0.0, min(0.95, self.seg_crop_top_ratio))
+        self.seg_crop_top_target_y = float(target_h) * self.seg_crop_top_ratio
+        self.seg_crop_target_h = max(1.0, float(target_h) - self.seg_crop_top_target_y)
+        self.scale_x_to_seg = w_seg / float(target_w)
+        self.scale_y_to_seg = h_seg / self.seg_crop_target_h
         self.planning_class_names = set(
             getattr(config, "PLANNING_CLASS_NAMES", ())
         )
@@ -56,6 +61,12 @@ class RoadSegmentor:
             dtype=np.float32,
         )
         self.fixed_track_width_indices = np.where(self.fixed_track_widths > 0)[0]
+        self.fixed_width_source_size = tuple(
+            getattr(config, "SEG_FIXED_WIDTH_SOURCE_SIZE", config.SEG_SIZE)
+        )
+        self.fixed_width_source_crop_top_ratio = float(
+            getattr(config, "SEG_FIXED_WIDTH_SOURCE_CROP_TOP_RATIO", 0.0)
+        )
 
         # -------------------------------------------------------------------
         # 时域滤波历史记忆
@@ -240,7 +251,7 @@ class RoadSegmentor:
         )
         return image
 
-    def _profile_add(self, infer_s, preprocess_s, search_s, fit_s, render_s, total_s):
+    def _profile_add(self, infer_s, preprocess_s, search_s, fit_s, render_s, total_s, queue_wait_s=None):
         """按阶段统计分割链路耗时，节流打印用于定位掉帧瓶颈。"""
         if not bool(getattr(config, "SEG_PROFILE_LOG_ENABLED", False)):
             return
@@ -252,14 +263,24 @@ class RoadSegmentor:
             "fit": float(fit_s),
             "render": float(render_s),
             "total": float(total_s),
+            "queue_wait": float(queue_wait_s) if queue_wait_s is not None else 0.0,
         }
+        # 把 measued total 与分阶段之和的差作为 overhead，便于保持打印一致性
+        stage_sum = (
+            current["infer"] + current["prep"] + current["search"] + current["fit"] + current["render"]
+        )
+        current_overhead = float(current["total"] - stage_sum)
+        current["overhead"] = current_overhead
+
         if self.profile_ema is None:
             self.profile_ema = current
         else:
             alpha = 0.85
+            # 将 overhead 纳入 EMA，使得各项平滑后仍能恢复出一致的 total
+            keys = set(list(self.profile_ema.keys()) + list(current.keys()))
             self.profile_ema = {
-                key: alpha * float(self.profile_ema.get(key, 0.0)) + (1.0 - alpha) * value
-                for key, value in current.items()
+                key: alpha * float(self.profile_ema.get(key, 0.0)) + (1.0 - alpha) * float(current.get(key, 0.0))
+                for key in keys
             }
 
         now = time.time()
@@ -269,7 +290,17 @@ class RoadSegmentor:
         self.profile_last_log = now
 
         avg = self.profile_ema
-        fps_est = 1.0 / max(float(avg["total"]), 1e-6)
+        # 使用各阶段平滑后的和作为显示的 total（包含 overhead）以保证一致性
+        total_for_print = (
+            float(avg.get("infer", 0.0))
+            + float(avg.get("prep", 0.0))
+            + float(avg.get("search", 0.0))
+            + float(avg.get("fit", 0.0))
+            + float(avg.get("render", 0.0))
+            + float(avg.get("overhead", 0.0))
+        )
+        queue_wait_avg = float(avg.get("queue_wait", 0.0))
+        fps_est = 1.0 / max(float(total_for_print), 1e-6)
         print(
             "SegProfile "
             f"infer={avg['infer'] * 1000.0:.1f}ms "
@@ -277,7 +308,8 @@ class RoadSegmentor:
             f"search={avg['search'] * 1000.0:.1f}ms "
             f"fit={avg['fit'] * 1000.0:.1f}ms "
             f"render={avg['render'] * 1000.0:.1f}ms "
-            f"total={avg['total'] * 1000.0:.1f}ms "
+            f"queue_wait={queue_wait_avg * 1000.0:.1f}ms "
+            f"total={total_for_print * 1000.0:.1f}ms "
             f"est={fps_est:.1f}fps",
             flush=True,
         )
@@ -971,8 +1003,24 @@ class RoadSegmentor:
         if self.fixed_track_widths.size == 0:
             return fallback_width
 
-        idx = int(np.clip(round(float(y)), 0, self.fixed_track_widths.size - 1))
-        width = float(self.fixed_track_widths[idx])
+        idx_float = float(y)
+        width_scale = 1.0
+        curr_w, curr_h = config.SEG_SIZE
+        if self.fixed_track_widths.size != int(curr_h):
+            source_w = float(self.fixed_width_source_size[0])
+            source_h = float(self.fixed_width_source_size[1])
+            source_crop_y = source_h * max(0.0, min(0.95, self.fixed_width_source_crop_top_ratio))
+            source_bottom_h = max(1.0, source_h - source_crop_y)
+            curr_h_float = max(1.0, float(curr_h))
+            if curr_h_float > 1.0:
+                idx_float = source_crop_y + (float(y) / (curr_h_float - 1.0)) * (source_bottom_h - 1.0)
+            else:
+                idx_float = source_crop_y
+            if source_w > 0.0:
+                width_scale = float(curr_w) / source_w
+
+        idx = int(np.clip(round(idx_float), 0, self.fixed_track_widths.size - 1))
+        width = float(self.fixed_track_widths[idx]) * width_scale
         if width > 0.0:
             return width
 
@@ -982,7 +1030,7 @@ class RoadSegmentor:
                     int(np.argmin(np.abs(self.fixed_track_width_indices - idx)))
                 ]
             )
-            nearest_width = float(self.fixed_track_widths[nearest_idx])
+            nearest_width = float(self.fixed_track_widths[nearest_idx]) * width_scale
             if nearest_width > 0.0:
                 return nearest_width
 
@@ -1578,6 +1626,8 @@ class RoadSegmentor:
         x, y, w, h = rect
         if w <= 1 or h <= 1:
             return None
+        if float(y) + float(h) <= self.seg_crop_top_target_y:
+            return None
 
         corners = np.array([
             [x, y],
@@ -1587,7 +1637,7 @@ class RoadSegmentor:
         ], dtype=np.float32)
 
         corners[:, 0] *= self.scale_x_to_seg
-        corners[:, 1] *= self.scale_y_to_seg
+        corners[:, 1] = (corners[:, 1] - self.seg_crop_top_target_y) * self.scale_y_to_seg
         corners[:, 0] = np.clip(corners[:, 0], 0, w_seg - 1)
         corners[:, 1] = np.clip(corners[:, 1], 0, h_seg - 1)
         return corners
@@ -1888,6 +1938,7 @@ class RoadSegmentor:
         fps_stats,
         infer_s=0.0,
         total_start=None,
+        preview_frame=None,
     ):
         """对已推理出的 mask 做路径规划、控制量计算和调试渲染.
 
@@ -1904,7 +1955,9 @@ class RoadSegmentor:
         t_total_start = time.perf_counter() if total_start is None else float(total_start)
         w_seg, h_seg = config.SEG_SIZE   # 320, 320
         
-        # ai_view 是最终调试图的底板，保持在 320 空间，后续再由主线程放大。
+        # ai_view 是最终调试图的底板，默认保持在分割空间，后续再由主线程放大。
+        # 如果主线程传入完整预览图，则后面直接在完整图下半 ROI 上叠加 mask/路径，
+        # 避免把 416x160 裁剪图整块放大导致明显色差。
         blob = blob_rgb_320
         ai_view = cv2.cvtColor(blob, cv2.COLOR_RGB2BGR)
         mask = (mask > 0).astype(np.uint8)
@@ -2164,11 +2217,40 @@ class RoadSegmentor:
         # 5. 调试渲染
         # -------------------------------------------------------------------
         t_render_start = time.perf_counter()
-        colored_roi = np.zeros_like(ai_view)
-        colored_roi[mask == 1] = [0, 255, 0]
-        ai_view = cv2.addWeighted(ai_view, 1.0 - config.MASK_ALPHA, colored_roi, config.MASK_ALPHA, 0)
-        # 路径直接画在分割调试平面里，主线程只负责整体缩放和其它信息叠加。
-        ai_view = self.draw_path_overlay(ai_view)
+        if preview_frame is not None:
+            target_w, target_h = config.TARGET_RES
+            if preview_frame.shape[1] != target_w or preview_frame.shape[0] != target_h:
+                ai_view = cv2.resize(preview_frame, config.TARGET_RES, interpolation=cv2.INTER_LINEAR)
+            else:
+                ai_view = preview_frame.copy()
+
+            crop_ratio = float(getattr(config, "SEG_INPUT_CROP_TOP_RATIO", 0.0))
+            crop_ratio = max(0.0, min(0.95, crop_ratio))
+            crop_y = int(round(target_h * crop_ratio))
+            crop_y = max(0, min(target_h - 1, crop_y))
+            bottom_h = target_h - crop_y
+            bottom_roi = ai_view[crop_y:, :]
+
+            if bool(getattr(config, "SEG_DEBUG_DRAW_MASK", True)):
+                mask_bottom = cv2.resize(mask, (target_w, bottom_h), interpolation=cv2.INTER_NEAREST)
+                mask_pixels = mask_bottom == 1
+                if np.any(mask_pixels):
+                    overlay_color = np.array([0, 255, 0], dtype=np.float32)
+                    alpha = float(config.MASK_ALPHA)
+                    bottom_roi[mask_pixels] = (
+                        bottom_roi[mask_pixels].astype(np.float32) * (1.0 - alpha) +
+                        overlay_color * alpha
+                    ).astype(np.uint8)
+
+            # 路径和边界仍按分割空间坐标存储，直接画在下半 ROI 上即可保持比例。
+            self.draw_path_overlay(bottom_roi)
+        else:
+            if bool(getattr(config, "SEG_DEBUG_DRAW_MASK", True)):
+                colored_roi = np.zeros_like(ai_view)
+                colored_roi[mask == 1] = [0, 255, 0]
+                ai_view = cv2.addWeighted(ai_view, 1.0 - config.MASK_ALPHA, colored_roi, config.MASK_ALPHA, 0)
+            # 路径直接画在分割调试平面里，主线程只负责整体缩放和其它信息叠加。
+            ai_view = self.draw_path_overlay(ai_view)
 
         if bool(getattr(config, "SEG_DEBUG_DRAW_BIRD_VIEW", True)):
             bird_eye_mask = cv2.warpPerspective(mask, self.M_seg, (w_seg, h_seg), flags=cv2.INTER_NEAREST)
@@ -2267,13 +2349,25 @@ class RoadSegmentor:
             config.SEG_DEBUG_TEXT_THICKNESS,
         )
         t_render_end = time.perf_counter()
+        preprocess_s = t_preprocess_end - t_preprocess_start
+        search_s = t_search_end - t_search_start
+        fit_s = t_fit_end - t_fit_start
+        render_s = t_render_end - t_render_start
+        # 本地处理总时长（不含队列等待/排队延迟）
+        local_total = float(infer_s) + float(preprocess_s) + float(search_s) + float(fit_s) + float(render_s)
+        # 队列等待时间/排队延迟: 从外部传入的 total_start 到本地 preprocess 开始的间隔
+        # total_start 通常是在推理开始前记录，所以剔除 infer_s 后得到真正的排队等待时间
+        queue_wait = float(t_preprocess_start - (float(t_total_start) + float(infer_s)))
+        if queue_wait < 0.0:
+            queue_wait = 0.0
         self._profile_add(
             infer_s=float(infer_s),
-            preprocess_s=t_preprocess_end - t_preprocess_start,
-            search_s=t_search_end - t_search_start,
-            fit_s=t_fit_end - t_fit_start,
-            render_s=t_render_end - t_render_start,
-            total_s=t_render_end - t_total_start,
+            preprocess_s=preprocess_s,
+            search_s=search_s,
+            fit_s=fit_s,
+            render_s=render_s,
+            total_s=local_total,
+            queue_wait_s=queue_wait,
         )
 
         return steer_signal, ai_view

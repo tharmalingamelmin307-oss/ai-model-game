@@ -69,6 +69,7 @@ ocr_queue = Queue(maxsize=config.OCR_QUEUE_MAXSIZE)
 global_yolo_boxes = []
 global_yolo_frame_id = -1
 log_cache = {}
+profile_cache = {}
 
 
 def remove_shm_from_resource_tracker():
@@ -111,6 +112,41 @@ def log_once(key, message):
         log_cache[key] = {"time": time.time(), "state": "__once__"}
 
 
+def profile_log(key, label, metrics, min_interval=None):
+    """用 EMA 节流打印主流程耗时，数值单位统一按毫秒展示."""
+    if not bool(getattr(config, "MAIN_PROFILE_LOG_ENABLED", False)):
+        return
+
+    now = time.time()
+    if min_interval is None:
+        min_interval = float(getattr(config, "MAIN_PROFILE_LOG_INTERVAL", 2.0))
+
+    with log_lock:
+        item = profile_cache.get(key)
+        if item is None:
+            ema = {name: float(value) for name, value in metrics.items()}
+            item = {"ema": ema, "time": 0.0}
+            profile_cache[key] = item
+        else:
+            alpha = 0.85
+            ema = item["ema"]
+            for name, value in metrics.items():
+                ema[name] = alpha * float(ema.get(name, 0.0)) + (1.0 - alpha) * float(value)
+
+        if now - float(item.get("time", 0.0)) < min_interval:
+            return
+        item["time"] = now
+
+        parts = []
+        for name, value in item["ema"].items():
+            value = float(value)
+            if name.endswith("_fps"):
+                parts.append(f"{name}={value:.1f}")
+            else:
+                parts.append(f"{name}={value * 1000.0:.1f}ms")
+        print(f"{label} " + " ".join(parts), flush=True)
+
+
 def get_preview_host():
     """返回适合局域网浏览器访问的预览主机地址."""
     bind_host = str(config.FLASK_HOST)
@@ -134,6 +170,55 @@ def print_preview_url():
     """启动时主动打印一条可点击的网页推流地址."""
     host = get_preview_host()
     print(f"AI推流网页: http://{host}:{config.STREAM_PORT}/", flush=True)
+
+
+def make_seg_input(frame_rgb):
+    """按当前分割模型约定生成 RGB 输入图."""
+    crop_ratio = float(getattr(config, "SEG_INPUT_CROP_TOP_RATIO", 0.0))
+    crop_ratio = max(0.0, min(0.95, crop_ratio))
+    if crop_ratio > 0.0:
+        h = frame_rgb.shape[0]
+        crop_y = int(round(h * crop_ratio))
+        frame_rgb = frame_rgb[crop_y:, :, :]
+
+    return cv2.resize(frame_rgb, config.SEG_SIZE, interpolation=cv2.INTER_LINEAR)
+
+
+def expand_seg_render_to_target(rendered_img, base_frame=None):
+    """把裁剪坐标系的 Seg 调试图贴回 TARGET_RES 预览画布."""
+    target_w, target_h = config.TARGET_RES
+    crop_ratio = float(getattr(config, "SEG_INPUT_CROP_TOP_RATIO", 0.0))
+    crop_ratio = max(0.0, min(0.95, crop_ratio))
+    if crop_ratio <= 0.0:
+        if rendered_img.shape[1] == target_w and rendered_img.shape[0] == target_h:
+            return rendered_img
+        return cv2.resize(rendered_img, config.TARGET_RES, interpolation=cv2.INTER_NEAREST)
+
+    crop_y = int(round(target_h * crop_ratio))
+    crop_y = max(0, min(target_h - 1, crop_y))
+    bottom_h = target_h - crop_y
+    seg_view = cv2.resize(rendered_img, (target_w, bottom_h), interpolation=cv2.INTER_NEAREST)
+    if base_frame is not None:
+        if base_frame.shape[1] != target_w or base_frame.shape[0] != target_h:
+            canvas = cv2.resize(base_frame, config.TARGET_RES, interpolation=cv2.INTER_LINEAR)
+        else:
+            canvas = base_frame.copy()
+        base_bottom = canvas[crop_y:, :]
+        diff = cv2.absdiff(seg_view, base_bottom)
+        diff_gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+        overlay_mask = diff_gray > int(getattr(config, "SEG_PREVIEW_OVERLAY_DIFF_THRESH", 24))
+        base_bottom[overlay_mask] = seg_view[overlay_mask]
+    else:
+        canvas = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+        canvas[crop_y:, :] = seg_view
+    return canvas
+
+
+def unpack_seg_item(item):
+    """兼容旧的纯 seg_blob 队列项和新的 (seg_blob, preview_frame) 队列项."""
+    if isinstance(item, tuple) and len(item) == 2:
+        return item
+    return item, None
 
 
 # ==============================================================================
@@ -758,17 +843,13 @@ def seg_worker(core_id):
         log_once(f"seg_init_error_{core_id}", f"Seg启动失败(Core {core_id}): {e}")
         return
 
-    def publish_seg_result(steer_signal, rendered_img, current_yolo_boxes, fps_start_holder):
+    def publish_seg_result(steer_signal, rendered_img, current_yolo_boxes, fps_start_holder, preview_frame=None):
         global global_preview_frame
 
         zebra_stopline, traffic_light_state = extract_scene_control_signals(current_yolo_boxes)
         if rendered_img is not None:
             if rendered_img.shape[1] != config.TARGET_RES[0] or rendered_img.shape[0] != config.TARGET_RES[1]:
-                rendered_img = cv2.resize(
-                    rendered_img,
-                    config.TARGET_RES,
-                    interpolation=cv2.INTER_NEAREST
-                )
+                rendered_img = expand_seg_render_to_target(rendered_img, preview_frame)
             rendered_img = draw_yolo_boxes(rendered_img, current_yolo_boxes)
             rendered_img = draw_zebra_stopline(rendered_img, zebra_stopline)
 
@@ -903,9 +984,10 @@ def seg_worker(core_id):
     if not bool(getattr(config, "SEG_PIPELINE_ENABLED", True)):
         fps_start_holder = [fps_start_time]
         while True:
-            blob_rgb_320 = seg_queue.get()
-            if blob_rgb_320 is None:
+            seg_item = seg_queue.get()
+            if seg_item is None:
                 break
+            blob_rgb_320, preview_frame = unpack_seg_item(seg_item)
 
             with data_lock:
                 current_yolo_boxes = [obj.copy() for obj in global_yolo_boxes]
@@ -923,6 +1005,7 @@ def seg_worker(core_id):
                     rendered_img,
                     current_yolo_boxes,
                     fps_start_holder,
+                    preview_frame=preview_frame,
                 )
             except Exception as e:
                 throttled_log(
@@ -937,13 +1020,16 @@ def seg_worker(core_id):
 
     def postprocess_loop():
         while True:
+            t_get_start = time.perf_counter()
             item = mask_queue.get()
+            t_after_get = time.perf_counter()
             if item is None:
                 break
 
-            blob_rgb_320, mask, infer_s, total_start, current_yolo_boxes, turn_intent = item
+            blob_rgb_320, preview_frame, mask, infer_s, total_start, current_yolo_boxes, turn_intent = item
 
             try:
+                t_post_start = time.perf_counter()
                 steer_signal, rendered_img = seg.postprocess_mask(
                     blob_rgb_320,
                     mask,
@@ -952,12 +1038,26 @@ def seg_worker(core_id):
                     fps_stats,
                     infer_s=infer_s,
                     total_start=total_start,
+                    preview_frame=preview_frame,
                 )
+                t_post_end = time.perf_counter()
                 publish_seg_result(
                     steer_signal,
                     rendered_img,
                     current_yolo_boxes,
                     fps_start_holder,
+                    preview_frame=preview_frame,
+                )
+                t_publish_end = time.perf_counter()
+                profile_log(
+                    "seg_post_loop",
+                    "SegPostLoop",
+                    {
+                        "wait_mask": t_after_get - t_get_start,
+                        "post": t_post_end - t_post_start,
+                        "publish": t_publish_end - t_post_end,
+                        "loop": t_publish_end - t_get_start,
+                    },
                 )
             except Exception as e:
                 throttled_log(
@@ -969,18 +1069,25 @@ def seg_worker(core_id):
     threading.Thread(target=postprocess_loop, daemon=True).start()
 
     while True:
-        blob_rgb_320 = seg_queue.get()
-        if blob_rgb_320 is None:
+        t_get_start = time.perf_counter()
+        seg_item = seg_queue.get()
+        t_after_get = time.perf_counter()
+        if seg_item is None:
             mask_queue.put(None)
             break
+        blob_rgb_320, preview_frame = unpack_seg_item(seg_item)
 
         total_start = time.perf_counter()
+        t_lock_start = time.perf_counter()
         with data_lock:
             current_yolo_boxes = [obj.copy() for obj in global_yolo_boxes]
             turn_intent = global_control_data.get("turn_intent", -1)
+        t_lock_end = time.perf_counter()
 
         try:
+            t_infer_start = time.perf_counter()
             mask, infer_s = seg.infer_mask(blob_rgb_320)
+            t_infer_end = time.perf_counter()
         except Exception as e:
             throttled_log(
                 f"seg_infer_error_{core_id}",
@@ -989,12 +1096,28 @@ def seg_worker(core_id):
             )
             continue
 
+        dropped_post = 0
         if mask_queue.full():
             try:
                 mask_queue.get_nowait()
+                dropped_post = 1
             except:
                 pass
-        mask_queue.put((blob_rgb_320, mask, infer_s, total_start, current_yolo_boxes, turn_intent))
+        t_put_start = time.perf_counter()
+        mask_queue.put((blob_rgb_320, preview_frame, mask, infer_s, total_start, current_yolo_boxes, turn_intent))
+        t_put_end = time.perf_counter()
+        profile_log(
+            "seg_infer_loop",
+            "SegInferLoop",
+            {
+                "wait_input": t_after_get - t_get_start,
+                "lock": t_lock_end - t_lock_start,
+                "infer": t_infer_end - t_infer_start,
+                "put_mask": t_put_end - t_put_start,
+                "loop": t_put_end - t_get_start,
+                "drop_post_fps": float(dropped_post),
+            },
+        )
 
 # ==============================================================================
 # 基础支撑线程：串口控制
@@ -1154,6 +1277,7 @@ def ai_producer_thread():
             last_fid = 0
 
             while True:
+                t_frame_start = time.perf_counter()
                 header = bytes(shm.buf[:config.SHM_HEADER_SIZE])
                 fid, w, h = struct.unpack('QII', header)
                 if fid == last_fid:
@@ -1167,16 +1291,25 @@ def ai_producer_thread():
                     buffer=shm.buf[config.SHM_HEADER_SIZE: config.SHM_HEADER_SIZE + w * h * 3]
                 )
 
+                t_copy_start = time.perf_counter()
                 frame_rgb = cv2.flip(img_view.copy(), 0)
+                t_copy_end = time.perf_counter()
+                frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+                vis_img_large = cv2.resize(frame_bgr, config.TARGET_RES, interpolation=cv2.INTER_LINEAR)
+                t_vis_end = time.perf_counter()
 
-                # 分割分支直接使用 320x320 RGB 小图，尽可能减轻主控制链路负担。
-                seg_blob = cv2.resize(frame_rgb, config.SEG_SIZE, interpolation=cv2.INTER_NEAREST)
+                # 分割分支按当前模型约定裁剪/缩放 RGB 小图，尽可能减轻主控制链路负担。
+                seg_blob = make_seg_input(frame_rgb)
+                t_seg_end = time.perf_counter()
+                dropped_seg = 0
                 if seg_queue.full():
                     try:
                         seg_queue.get_nowait()
+                        dropped_seg = 1
                     except:
                         pass
-                seg_queue.put(seg_blob)
+                seg_queue.put((seg_blob, vis_img_large))
+                t_seg_put_end = time.perf_counter()
 
                 # 检测分支直接生成 YOLO 输入尺寸的小图，避免大图先放大再缩小。
                 # 同时保留一份 TARGET_RES 大图，供:
@@ -1184,16 +1317,32 @@ def ai_producer_thread():
                 # - OCR 整图 det + rec
                 # - OCR 结果回写后的页面可视化
                 # 注意: 检测框最终也会映射到 TARGET_RES 坐标系，所以这里要保持一致。
-                frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
                 det_img = cv2.resize(frame_bgr, config.YOLO_SIZE, interpolation=cv2.INTER_LINEAR)
-                vis_img_large = cv2.resize(frame_bgr, config.TARGET_RES, interpolation=cv2.INTER_LINEAR)
+                t_yolo_end = time.perf_counter()
 
+                dropped_yolo = 0
                 if yolo_queue.full():
                     try:
                         yolo_queue.get_nowait()
+                        dropped_yolo = 1
                     except:
                         pass
                 yolo_queue.put((det_img, vis_img_large, (w, h), int(fid)))
+                t_frame_end = time.perf_counter()
+                profile_log(
+                    "producer_loop",
+                    "ProducerProfile",
+                    {
+                        "copy_flip": t_copy_end - t_copy_start,
+                        "vis_resize": t_vis_end - t_copy_end,
+                        "seg_prep": t_seg_end - t_vis_end,
+                        "seg_put": t_seg_put_end - t_seg_end,
+                        "yolo_prep": t_yolo_end - t_seg_put_end,
+                        "total": t_frame_end - t_frame_start,
+                        "drop_seg_fps": float(dropped_seg),
+                        "drop_yolo_fps": float(dropped_yolo),
+                    },
+                )
 
         except Exception as e:
             log_once("shm_attach_error", f"共享内存拉流异常: {e}")
@@ -1226,16 +1375,28 @@ def video_feed():
                 time.sleep(config.VIDEO_FEED_IDLE_SLEEP)
                 continue
 
+            t_encode_start = time.perf_counter()
             ret, buffer = cv2.imencode(
                 '.jpg',
                 current_frame,
                 [int(cv2.IMWRITE_JPEG_QUALITY), config.JPEG_QUALITY]
             )
+            t_encode_end = time.perf_counter()
             if not ret:
                 continue
 
             yield (b'--frame\r\n'
                    b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+            t_yield_end = time.perf_counter()
+            profile_log(
+                "video_feed_loop",
+                "VideoFeedProfile",
+                {
+                    "jpeg": t_encode_end - t_encode_start,
+                    "yield": t_yield_end - t_encode_end,
+                    "frame": t_yield_end - t_encode_start,
+                },
+            )
             time.sleep(config.VIDEO_FEED_FRAME_SLEEP)
 
     return Response(gen(), mimetype='multipart/x-mixed-replace; boundary=frame')
