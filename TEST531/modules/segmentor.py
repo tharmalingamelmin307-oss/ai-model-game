@@ -67,6 +67,7 @@ class RoadSegmentor:
         self.fixed_width_source_crop_top_ratio = float(
             getattr(config, "SEG_FIXED_WIDTH_SOURCE_CROP_TOP_RATIO", 0.0)
         )
+        self._dump_track_width_table_once()
 
         # -------------------------------------------------------------------
         # 时域滤波历史记忆
@@ -96,6 +97,64 @@ class RoadSegmentor:
         }
         self.profile_ema = None
         self.profile_last_log = 0.0
+
+    def selected_left_boundary_x_at_target_y(self, target_y):
+        """返回当前选中路径左边界在 TARGET_RES 坐标系下的 x."""
+        left_boundary = self.last_main_overlay.get("left")
+        if left_boundary is None:
+            return None
+
+        y_seg = (float(target_y) - self.seg_crop_top_target_y) * self.scale_y_to_seg
+        if y_seg < 0.0 or y_seg > float(config.SEG_SIZE[1] - 1):
+            return None
+
+        x_seg = self._boundary_x_at_y(left_boundary, y_seg)
+        if x_seg is None:
+            return None
+        if self.scale_x_to_seg <= 0.0:
+            return None
+        return float(x_seg) / self.scale_x_to_seg
+
+    def selected_right_boundary_x_at_target_y(self, target_y):
+        """返回当前选中路径右边界在 TARGET_RES 坐标系下的 x."""
+        right_boundary = self.last_main_overlay.get("right")
+        if right_boundary is None:
+            return None
+
+        y_seg = (float(target_y) - self.seg_crop_top_target_y) * self.scale_y_to_seg
+        if y_seg < 0.0 or y_seg > float(config.SEG_SIZE[1] - 1):
+            return None
+
+        x_seg = self._boundary_x_at_y(right_boundary, y_seg)
+        if x_seg is None:
+            return None
+        if self.scale_x_to_seg <= 0.0:
+            return None
+        return float(x_seg) / self.scale_x_to_seg
+
+    def _dump_track_width_table_once(self):
+        """启动时一次性打印完整赛道宽度表，便于固化成新标定数据."""
+        if not bool(getattr(config, "TRACK_WIDTH_DUMP_ONCE", True)):
+            return
+        if self.fixed_track_widths.size == 0:
+            print("TrackWidthTable EMPTY", flush=True)
+            return
+
+        curr_w, curr_h = config.SEG_SIZE
+        if self.fixed_track_widths.size == int(curr_h):
+            widths = np.array(self.fixed_track_widths, dtype=np.float32)
+        else:
+            source_h = float(self.fixed_width_source_size[1])
+            source_crop_y = source_h * max(0.0, min(0.95, self.fixed_width_source_crop_top_ratio))
+            source_bottom_h = max(1.0, source_h - source_crop_y)
+            width_scale = (float(curr_h) / source_bottom_h) if source_bottom_h > 0.0 else 1.0
+            src_x = np.arange(self.fixed_track_widths.size, dtype=np.float32)
+            dst_x = np.linspace(0.0, max(0.0, float(self.fixed_track_widths.size - 1)), num=int(curr_h))
+            widths = np.interp(dst_x, src_x, self.fixed_track_widths).astype(np.float32) * width_scale
+
+        print(f"TrackWidthTable SEG_SIZE={curr_w}x{curr_h}", flush=True)
+        for idx, width in enumerate(widths):
+            print(f"TrackWidth y={idx}:W={float(width):.1f}", flush=True)
 
     def _store_main_overlay(
         self,
@@ -1811,6 +1870,7 @@ class RoadSegmentor:
         """只使用 coin 底部中点画点，并按这些点从底部依次分段拟合路径."""
         debug = {
             "coin_points": [],
+            "control_points": None,
             "active": False,
         }
         base = np.array(base_path, dtype=np.float32).reshape((-1, 2))
@@ -1839,6 +1899,9 @@ class RoadSegmentor:
             bottom_center = np.mean(bottom_pts, axis=0)
             cx = float(np.clip(bottom_center[0], 0.0, float(w_seg - 1)))
             cy = float(np.clip(bottom_center[1], 0.0, float(h_seg - 1)))
+            bottom_ignore_rows = float(getattr(config, "COIN_PATH_ROI_BOTTOM_IGNORE_ROWS", 0.0))
+            if bottom_ignore_rows > 0.0 and cy >= float(h_seg) - bottom_ignore_rows:
+                continue
             if cy < float(getattr(config, "COIN_PATH_ROI_Y_MIN", 0.0)):
                 continue
             if not (path_y_min <= cy <= path_y_max):
@@ -1859,6 +1922,16 @@ class RoadSegmentor:
             return base, debug
 
         debug["coin_points"] = coin_points
+        if bool(getattr(config, "COIN_PATH_CONTROL_FIRST_SEGMENT_ONLY", True)):
+            nearest_coin = coin_points[0]
+            bottom_y = float(np.max(planned[:, 1]))
+            first_coin_y = float(nearest_coin[1])
+            low_y = min(bottom_y, first_coin_y)
+            high_y = max(bottom_y, first_coin_y)
+            segment_mask = (planned[:, 1] >= low_y) & (planned[:, 1] <= high_y)
+            control_points = planned[segment_mask]
+            if len(control_points) >= 2:
+                debug["control_points"] = control_points.astype(np.float32)
 
         debug["active"] = True
         return planned, debug
@@ -2177,8 +2250,16 @@ class RoadSegmentor:
             self.last_poly_coeffs = poly_coeffs
             self.last_path_points_orig = path_points_orig.copy()
             self.missing_path_frames = 0
-            steer_signal = self._compute_weighted_steer_signal(path_points_orig, w_seg, h_seg)
-
+            control_path_points = path_points_orig
+            if (
+                coin_path_debug is not None and
+                coin_path_debug.get("active") and
+                coin_path_debug.get("control_points") is not None
+            ):
+                control_path_points = coin_path_debug["control_points"]
+            steer_signal = self._compute_weighted_steer_signal(control_path_points, w_seg, h_seg)
+            if control_path_points is not path_points_orig:
+                steer_signal *= float(getattr(config, "COIN_PATH_CONTROL_GAIN", 1.0))
             pts_final_orig = path_points_orig.reshape((-1, 1, 2))
             pts_final_bird = cv2.perspectiveTransform(pts_final_orig, self.M_seg)
             boundary_left_bird = cv2.perspectiveTransform(boundary_left_orig, self.M_seg)

@@ -518,6 +518,8 @@ STEER_SIGNAL_MIN_DY = 8.0
 # - zebra_stopline_y: 停止线在 TARGET_RES 坐标系中的 y 值
 # - traffic_light_state: 当前交通灯状态，允许值 red / yellow / green / ""
 # - traffic_stop_active: 当前是否已经进入“红黄灯强制停车”状态
+# - person_stop_active: 当前是否已经进入“行人强制停车”状态
+# - person_*: 行人停车/放行判定用的最近状态
 # - actual_servo_pwm: 当前串口线程真正准备下发的舵机 PWM
 # - target_speed: 当前串口线程真正准备下发的目标速度档位
 DEFAULT_CONTROL_DATA = {
@@ -531,6 +533,20 @@ DEFAULT_CONTROL_DATA = {
     "zebra_stopline_y": None,
     "traffic_light_state": "",
     "traffic_stop_active": False,
+    "person_stop_active": False,
+    "person_bottom_y": None,
+    "person_bottom_center_x": None,
+    "person_bottom_right_x": None,
+    "person_dist_to_bottom": None,
+    "person_left_boundary_x": None,
+    "person_right_boundary_x": None,
+    "person_clear_line_x": None,
+    "person_stop_event": "",
+    "person_clear_frames": 0,
+    "person_miss_frames": 0,
+    "person_last_frame_id": -1,
+    "person_last_bottom_center_x": None,
+    "person_released_outside_left": False,
     "actual_servo_pwm": SERVO_CENTER,
     "target_speed": 10,
 }
@@ -571,13 +587,13 @@ FPS_STATS_UPDATE_INTERVAL = 1.0
 
 # Seg 阶段耗时诊断日志。
 # 开启后每隔一段时间打印 inference / search / fit / render / total，用来定位掉帧瓶颈。
-SEG_PROFILE_LOG_ENABLED = True
+SEG_PROFILE_LOG_ENABLED = False
 SEG_PROFILE_LOG_INTERVAL = 2.0
 
 # 主流程运行时耗时诊断日志。
 # 开启后会额外打印采集预处理、Seg 推理线程等待、发布、MJPEG 编码等耗时。
 # 用来判断页面 FPS 是卡在输入来帧、模型推理、后处理发布还是网页推流。
-MAIN_PROFILE_LOG_ENABLED = True
+MAIN_PROFILE_LOG_ENABLED = False
 MAIN_PROFILE_LOG_INTERVAL = 2.0
 
 
@@ -608,6 +624,12 @@ LOG_INTERVAL_TURN_INTENT = 2.0
 # 红绿灯停车条件满足、强制停车链路触发时的日志节流。
 LOG_INTERVAL_TRAFFIC_STOP_DETAIL = 2.0
 
+# 行人停车条件满足、强制停车链路触发时的日志节流。
+LOG_INTERVAL_PERSON_STOP_DETAIL = 1.0
+
+# 检测到行人但未必已经触发停车时的状态日志节流。
+LOG_INTERVAL_PERSON_DETECT_DETAIL = 2.0
+
 # 串口发送异常日志节流。
 LOG_INTERVAL_SERIAL_ERROR = 2.0
 
@@ -617,6 +639,7 @@ LOG_INTERVAL_SERIAL_ERROR = 2.0
 # 下面这些名字会在 main.py 里用来从 CLASS_NAMES 里反查类别 id。
 # 这样做的好处是：只要模型类别名顺序保持一致，就不必把所有逻辑都写死成数字。
 ZEBRA_CROSSING_CLASS_NAME = "zebra_crossing"
+PERSON_CLASS_NAME = "person"
 TRAFFIC_LIGHT_RED_CLASS_NAME = "traffic_light_red"
 TRAFFIC_LIGHT_GREEN_CLASS_NAME = "traffic_light_green"
 TRAFFIC_LIGHT_YELLOW_CLASS_NAME = "traffic_light_yellow"
@@ -624,9 +647,23 @@ TRAFFIC_LIGHT_YELLOW_CLASS_NAME = "traffic_light_yellow"
 # 当上面的类别名在 CLASS_NAMES 里找不到时，回退使用的固定类别 id。
 # 正常情况下这些值不应该生效；它们更像是一层容错保护。
 ZEBRA_CROSSING_CLASS_ID_FALLBACK = 5
+PERSON_CLASS_ID_FALLBACK = 2
 TRAFFIC_LIGHT_RED_CLASS_ID_FALLBACK = 6
 TRAFFIC_LIGHT_GREEN_CLASS_ID_FALLBACK = 7
 TRAFFIC_LIGHT_YELLOW_CLASS_ID_FALLBACK = 8
+
+# 行人停车逻辑。
+# 触发不做路径 ROI 过滤，和斑马线类似，只看 person 框底边是否足够靠近画面底部。
+# 恢复前进需要同时满足:
+# - 行人底部中心连续向左移动若干帧
+# - person 框底部中心已经越过当前选中路的释放线
+PERSON_STOP_TRIGGER_DIST = 300
+PERSON_CLEAR_MOVE_FRAMES = 2
+PERSON_CLEAR_MIN_LEFT_DX = 3.0
+# 行人放行线位置。0.0 是当前道路左边界，0.5 是道路中线，1.0 是右边界。
+# 当前行人从右往左穿行，越过中线后就允许恢复前进，避免等完全出界导致起步过晚。
+PERSON_CLEAR_LANE_RATIO = 0.50
+PERSON_STOP_MISS_RELEASE_FRAMES = 3
 
 # 限速牌真正生效时的速度偏移量。
 # 例如 OCR 读到 20，若这里为 1，则实际下发上限是 19。
@@ -907,6 +944,19 @@ SEG_PATH_TOP_TIER_SCORE_GAP = 150.0
 # 最终拟合路径重新采样成多少个密集点，用来计算 steer_signal 和画线。
 SEG_PATH_DENSE_SAMPLES = 30
 
+# 金币分段路径启用时，舵机控制只看“车身底部 -> 最近金币”的第一段。
+# 画线和路径历史仍保留完整分段路径；没有有效金币时自动回退到整条路径控制。
+COIN_PATH_CONTROL_FIRST_SEGMENT_ONLY = True
+# 金币第一段控制的转向增益。
+# 第一段通常比整条路径更短，默认给一点额外放大，避免看起来“转不过去”。
+COIN_PATH_CONTROL_GAIN = 1.35
+
+# 终端打印当前赛道宽度的节流间隔，单位秒。
+TRACK_WIDTH_LOG_INTERVAL = 1.5
+
+# 启动时是否把当前映射后的完整赛道宽度表一次性打印出来。
+TRACK_WIDTH_DUMP_ONCE = True
+
 # ---------------------------------------------------------------------------
 # 金币分段路径参数
 # ---------------------------------------------------------------------------
@@ -915,7 +965,10 @@ SEG_PATH_DENSE_SAMPLES = 30
 # - 只保留落在当前路径纵向范围内、附近有 mask、且离当前中线不超过赛道半宽的金币点
 # - 路径按“底部路径点 -> 金币点 -> 最远路径点”从近到远分段重采样
 COIN_PATH_ENABLED = True
-COIN_PATH_ROI_Y_MIN = 45
+COIN_PATH_ROI_Y_MIN = 20
+# 底部忽略区。落在分割输入底部这些行内的 coin 不参与路径规划。
+# 用来过滤车身/尾巴刚露进画面底部时被误识别成金币的情况。
+COIN_PATH_ROI_BOTTOM_IGNORE_ROWS = 30
 COIN_PATH_MASK_RADIUS = 10
 COIN_PATH_HALF_WIDTH_SCALE = 1.0
 COIN_PATH_BYPASS_FRAME_JUMP = True

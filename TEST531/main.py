@@ -368,6 +368,146 @@ def extract_scene_control_signals(boxes):
     return zebra_stopline, best_light_state
 
 
+def extract_person_stop_candidate(boxes, frame_id):
+    """取最靠近车身的 person 框底边，用于行人停车状态机."""
+    person_cls_id = (
+        config.CLASS_NAMES.index(config.PERSON_CLASS_NAME)
+        if config.PERSON_CLASS_NAME in config.CLASS_NAMES
+        else config.PERSON_CLASS_ID_FALLBACK
+    )
+
+    best = None
+    best_bottom_y = -1.0
+    target_w, target_h = config.TARGET_RES
+
+    for obj in boxes:
+        if obj.get("class_id", -1) != person_cls_id:
+            continue
+        rect = obj.get("rect", [0, 0, 0, 0])
+        if len(rect) != 4:
+            continue
+
+        x, y, w, h = [float(v) for v in rect]
+        if w <= 0.0 or h <= 0.0:
+            continue
+
+        bottom_y = float(np.clip(y + h, 0.0, float(target_h - 1)))
+        if bottom_y <= best_bottom_y:
+            continue
+
+        x1 = float(np.clip(x, 0.0, float(target_w - 1)))
+        x2 = float(np.clip(x + w, 0.0, float(target_w - 1)))
+        best_bottom_y = bottom_y
+        best = {
+            "frame_id": int(frame_id),
+            "bottom_y": bottom_y,
+            "bottom_center_x": 0.5 * (x1 + x2),
+            "bottom_right_x": max(x1, x2),
+            "dist_to_bottom": float(target_h) - bottom_y,
+            "score": float(obj.get("score", 0.0)),
+        }
+
+    return best
+
+
+def update_person_stop_state(state, person_info, left_boundary_x, right_boundary_x, yolo_frame_id):
+    """行人靠近时停车；连续左移且越过道路释放线后放行."""
+    active = bool(state.get("person_stop_active", False))
+    prev_active = active
+    released_outside_left = bool(state.get("person_released_outside_left", False))
+    yolo_frame_id = int(yolo_frame_id)
+    last_frame_id = int(state.get("person_last_frame_id", -1))
+    if yolo_frame_id == last_frame_id:
+        if person_info is not None:
+            state["person_left_boundary_x"] = left_boundary_x
+            state["person_right_boundary_x"] = right_boundary_x
+        return active
+
+    clear_frames = int(state.get("person_clear_frames", 0))
+    miss_frames = int(state.get("person_miss_frames", 0))
+
+    if person_info is None:
+        miss_frames += 1
+        clear_frames = 0
+        if active and miss_frames >= int(config.PERSON_STOP_MISS_RELEASE_FRAMES):
+            active = False
+        if miss_frames >= int(config.PERSON_STOP_MISS_RELEASE_FRAMES):
+            released_outside_left = False
+        state["person_stop_active"] = active
+        state["person_bottom_y"] = None
+        state["person_bottom_center_x"] = None
+        state["person_bottom_right_x"] = None
+        state["person_dist_to_bottom"] = None
+        state["person_left_boundary_x"] = None
+        state["person_right_boundary_x"] = None
+        state["person_clear_line_x"] = None
+        state["person_miss_frames"] = miss_frames
+        state["person_clear_frames"] = clear_frames
+        state["person_last_frame_id"] = yolo_frame_id
+        state["person_last_bottom_center_x"] = None
+        state["person_released_outside_left"] = released_outside_left
+        state["person_stop_event"] = "release_missing" if prev_active and not active else ""
+        return active
+
+    bottom_center_x = float(person_info["bottom_center_x"])
+    bottom_right_x = float(person_info["bottom_right_x"])
+    bottom_y = float(person_info["bottom_y"])
+    dist_to_bottom = float(person_info["dist_to_bottom"])
+    last_center = state.get("person_last_bottom_center_x")
+    moving_left = (
+        last_center is not None and
+        bottom_center_x <= float(last_center) - float(config.PERSON_CLEAR_MIN_LEFT_DX)
+    )
+    clear_line_x = None
+    if left_boundary_x is not None and right_boundary_x is not None:
+        lane_ratio = float(getattr(config, "PERSON_CLEAR_LANE_RATIO", 0.50))
+        lane_ratio = max(0.0, min(1.0, lane_ratio))
+        clear_line_x = float(left_boundary_x) + (float(right_boundary_x) - float(left_boundary_x)) * lane_ratio
+    elif left_boundary_x is not None:
+        clear_line_x = float(left_boundary_x)
+    crossed_clear_line = clear_line_x is not None and bottom_center_x <= float(clear_line_x)
+    trigger_dist = float(config.PERSON_STOP_TRIGGER_DIST)
+    near_bottom = dist_to_bottom <= trigger_dist
+
+    if not crossed_clear_line:
+        released_outside_left = False
+
+    if near_bottom and not released_outside_left:
+        active = True
+    miss_frames = 0
+
+    if active and moving_left and crossed_clear_line:
+        clear_frames += 1
+    else:
+        clear_frames = 0
+
+    if active and clear_frames >= int(config.PERSON_CLEAR_MOVE_FRAMES):
+        active = False
+        clear_frames = 0
+        released_outside_left = True
+
+    state["person_stop_active"] = active
+    state["person_bottom_y"] = bottom_y
+    state["person_bottom_center_x"] = bottom_center_x
+    state["person_bottom_right_x"] = bottom_right_x
+    state["person_dist_to_bottom"] = dist_to_bottom
+    state["person_left_boundary_x"] = left_boundary_x
+    state["person_right_boundary_x"] = right_boundary_x
+    state["person_clear_line_x"] = clear_line_x
+    state["person_clear_frames"] = clear_frames
+    state["person_miss_frames"] = miss_frames
+    state["person_last_frame_id"] = yolo_frame_id
+    state["person_last_bottom_center_x"] = bottom_center_x
+    state["person_released_outside_left"] = released_outside_left
+    if not prev_active and active:
+        state["person_stop_event"] = "stop"
+    elif prev_active and not active:
+        state["person_stop_event"] = "release_clear_line"
+    else:
+        state["person_stop_event"] = ""
+    return active
+
+
 def draw_zebra_stopline(image, zebra_stopline):
     """把斑马线框底部当作截至线画出来，并向左右延长."""
     if image is None or zebra_stopline is None:
@@ -843,10 +983,24 @@ def seg_worker(core_id):
         log_once(f"seg_init_error_{core_id}", f"Seg启动失败(Core {core_id}): {e}")
         return
 
-    def publish_seg_result(steer_signal, rendered_img, current_yolo_boxes, fps_start_holder, preview_frame=None):
+    def publish_seg_result(
+        steer_signal,
+        rendered_img,
+        current_yolo_boxes,
+        fps_start_holder,
+        current_yolo_frame_id=-1,
+        preview_frame=None,
+    ):
         global global_preview_frame
 
         zebra_stopline, traffic_light_state = extract_scene_control_signals(current_yolo_boxes)
+        person_info = extract_person_stop_candidate(current_yolo_boxes, current_yolo_frame_id)
+        person_left_boundary_x = None
+        person_right_boundary_x = None
+        if person_info is not None:
+            person_left_boundary_x = seg.selected_left_boundary_x_at_target_y(person_info["bottom_y"])
+            person_right_boundary_x = seg.selected_right_boundary_x_at_target_y(person_info["bottom_y"])
+
         if rendered_img is not None:
             if rendered_img.shape[1] != config.TARGET_RES[0] or rendered_img.shape[0] != config.TARGET_RES[1]:
                 rendered_img = expand_seg_render_to_target(rendered_img, preview_frame)
@@ -857,6 +1011,13 @@ def seg_worker(core_id):
             global_control_data["steer_signal"] = steer_signal
             global_control_data["traffic_light_state"] = traffic_light_state
             global_control_data["zebra_stopline_y"] = None if zebra_stopline is None else int(zebra_stopline[1])
+            person_stop_active = update_person_stop_state(
+                global_control_data,
+                person_info,
+                person_left_boundary_x,
+                person_right_boundary_x,
+                current_yolo_frame_id,
+            )
 
             actual_servo = global_control_data.get("actual_servo_pwm", config.SERVO_CENTER)
             actual_speed = global_control_data.get("target_speed", config.CONTROL_MIN_SPEED)
@@ -948,10 +1109,15 @@ def seg_worker(core_id):
                     config.PREVIEW_TEXT_THICKNESS,
                     cv2.LINE_AA
                 )
+            stop_text = ""
             if traffic_stop_active:
+                stop_text = "STOP_BY_LIGHT"
+            elif person_stop_active:
+                stop_text = "STOP_BY_PERSON"
+            if stop_text:
                 cv2.putText(
                     rendered_img,
-                    "STOP_BY_LIGHT",
+                    stop_text,
                     config.PREVIEW_TEXT_POS_STOP,
                     cv2.FONT_HERSHEY_SIMPLEX,
                     config.PREVIEW_TEXT_FONT_SCALE,
@@ -991,6 +1157,7 @@ def seg_worker(core_id):
 
             with data_lock:
                 current_yolo_boxes = [obj.copy() for obj in global_yolo_boxes]
+                current_yolo_frame_id = int(global_yolo_frame_id)
                 turn_intent = global_control_data.get("turn_intent", -1)
 
             try:
@@ -1005,6 +1172,7 @@ def seg_worker(core_id):
                     rendered_img,
                     current_yolo_boxes,
                     fps_start_holder,
+                    current_yolo_frame_id=current_yolo_frame_id,
                     preview_frame=preview_frame,
                 )
             except Exception as e:
@@ -1026,7 +1194,7 @@ def seg_worker(core_id):
             if item is None:
                 break
 
-            blob_rgb_320, preview_frame, mask, infer_s, total_start, current_yolo_boxes, turn_intent = item
+            blob_rgb_320, preview_frame, mask, infer_s, total_start, current_yolo_boxes, current_yolo_frame_id, turn_intent = item
 
             try:
                 t_post_start = time.perf_counter()
@@ -1046,6 +1214,7 @@ def seg_worker(core_id):
                     rendered_img,
                     current_yolo_boxes,
                     fps_start_holder,
+                    current_yolo_frame_id=current_yolo_frame_id,
                     preview_frame=preview_frame,
                 )
                 t_publish_end = time.perf_counter()
@@ -1081,6 +1250,7 @@ def seg_worker(core_id):
         t_lock_start = time.perf_counter()
         with data_lock:
             current_yolo_boxes = [obj.copy() for obj in global_yolo_boxes]
+            current_yolo_frame_id = int(global_yolo_frame_id)
             turn_intent = global_control_data.get("turn_intent", -1)
         t_lock_end = time.perf_counter()
 
@@ -1104,7 +1274,7 @@ def seg_worker(core_id):
             except:
                 pass
         t_put_start = time.perf_counter()
-        mask_queue.put((blob_rgb_320, preview_frame, mask, infer_s, total_start, current_yolo_boxes, turn_intent))
+        mask_queue.put((blob_rgb_320, preview_frame, mask, infer_s, total_start, current_yolo_boxes, current_yolo_frame_id, turn_intent))
         t_put_end = time.perf_counter()
         profile_log(
             "seg_infer_loop",
@@ -1128,7 +1298,7 @@ def serial_control_thread():
     当前速度控制是三层叠加关系:
     1. 先根据 steer_signal 幅度得到 dynamic_target_speed
     2. 如果 speed_limit 已生效，再把它作为速度上限
-    3. 如果红/黄灯且停止线已接近，则强制把速度打到 0
+    3. 如果红/黄灯且停止线已接近，或行人停车状态激活，则强制把速度打到 0
     """
     try:
         ser = serial.Serial(config.SERIAL_PORT, config.BAUD_RATE, timeout=config.SERIAL_TIMEOUT)
@@ -1155,6 +1325,15 @@ def serial_control_thread():
             zebra_stopline_y = global_control_data.get("zebra_stopline_y")
             traffic_light_state = str(global_control_data.get("traffic_light_state", ""))
             traffic_stop_active = bool(global_control_data.get("traffic_stop_active", False))
+            person_stop_active = bool(global_control_data.get("person_stop_active", False))
+            person_dist_to_bottom = global_control_data.get("person_dist_to_bottom")
+            person_left_boundary_x = global_control_data.get("person_left_boundary_x")
+            person_right_boundary_x = global_control_data.get("person_right_boundary_x")
+            person_clear_line_x = global_control_data.get("person_clear_line_x")
+            person_bottom_center_x = global_control_data.get("person_bottom_center_x")
+            person_bottom_right_x = global_control_data.get("person_bottom_right_x")
+            person_clear_frames = int(global_control_data.get("person_clear_frames", 0))
+            person_stop_event = str(global_control_data.get("person_stop_event", ""))
 
         try:
             if np.isnan(steer_signal) or np.isinf(steer_signal):
@@ -1190,6 +1369,8 @@ def serial_control_thread():
 
             if traffic_stop_active:
                 target_speed = 0
+            if person_stop_active:
+                target_speed = 0
 
             limit_applied = speed_limit is not None and dynamic_target_speed > int(speed_limit)
 
@@ -1206,11 +1387,24 @@ def serial_control_thread():
             limit_applied = False
             steer_signal = 0.0
             stopline_dist_to_bottom = None
+            person_dist_to_bottom = None
+            person_left_boundary_x = None
+            person_right_boundary_x = None
+            person_clear_line_x = None
+            person_bottom_center_x = None
+            person_bottom_right_x = None
+            person_clear_frames = 0
+            person_stop_event = ""
+            if traffic_stop_active or person_stop_active:
+                target_speed = 0
 
         with data_lock:
             global_control_data["traffic_stop_active"] = traffic_stop_active
+            global_control_data["person_stop_active"] = person_stop_active
             global_control_data["actual_servo_pwm"] = servo_pwm
             global_control_data["target_speed"] = target_speed
+            if person_stop_event:
+                global_control_data["person_stop_event"] = ""
 
         if traffic_stop_active:
             light_text = traffic_light_state or "无"
@@ -1222,6 +1416,36 @@ def serial_control_thread():
                 f"阈值={stop_trigger_dist} 已停车=是",
                 state=(light_text, zebra_dist_text, int(stop_trigger_dist)),
                 min_interval=config.LOG_INTERVAL_TRAFFIC_STOP_DETAIL
+            )
+
+        person_dist_text = "无" if person_dist_to_bottom is None else f"{float(person_dist_to_bottom):.1f}"
+        left_boundary_text = "无" if person_left_boundary_x is None else f"{float(person_left_boundary_x):.1f}"
+        right_boundary_text = "无" if person_right_boundary_x is None else f"{float(person_right_boundary_x):.1f}"
+        clear_line_text = "无" if person_clear_line_x is None else f"{float(person_clear_line_x):.1f}"
+        center_x_text = "无" if person_bottom_center_x is None else f"{float(person_bottom_center_x):.1f}"
+        right_x_text = "无" if person_bottom_right_x is None else f"{float(person_bottom_right_x):.1f}"
+        stop_text = "是" if person_stop_active else "否"
+
+        if person_stop_event == "stop":
+            throttled_log(
+                "person_stop_event",
+                ">>> 行人: 停",
+                state=("stop",),
+                min_interval=0.0,
+            )
+        elif person_stop_event == "release_clear_line":
+            throttled_log(
+                "person_stop_event",
+                ">>> 行人: 走",
+                state=("release_clear_line",),
+                min_interval=0.0,
+            )
+        elif person_stop_event == "release_missing":
+            throttled_log(
+                "person_stop_event",
+                ">>> 行人: 走",
+                state=("release_missing",),
+                min_interval=0.0,
             )
 
         if ser:
