@@ -193,7 +193,7 @@ ZEBRA_STOPLINE_EXTEND_RATIO = 0.35
 # - 停止线足够接近画面底部
 # 才会触发强制停车。
 # 当前先放宽到 240，优先验证停车链路是否能触发。
-ZEBRA_STOPLINE_TRIGGER_DIST = 300
+ZEBRA_STOPLINE_TRIGGER_DIST = 240
 
 # YOLO 默认置信度阈值。
 # 当某个类别没有在 CLASS_MIN_SCORES 里单独指定时，就回退到这个值。
@@ -657,7 +657,7 @@ TRAFFIC_LIGHT_YELLOW_CLASS_ID_FALLBACK = 8
 # 恢复前进需要同时满足:
 # - 行人底部中心连续向左移动若干帧
 # - person 框底部中心已经越过当前选中路的释放线
-PERSON_STOP_TRIGGER_DIST = 300
+PERSON_STOP_TRIGGER_DIST = 10
 PERSON_CLEAR_MOVE_FRAMES = 2
 PERSON_CLEAR_MIN_LEFT_DX = 3.0
 # 行人放行线位置。0.0 是当前道路左边界，0.5 是道路中线，1.0 是右边界。
@@ -953,9 +953,6 @@ COIN_PATH_CONTROL_GAIN = 1.35
 
 # 终端打印当前赛道宽度的节流间隔，单位秒。
 TRACK_WIDTH_LOG_INTERVAL = 1.5
-
-# 启动时是否把当前映射后的完整赛道宽度表一次性打印出来。
-TRACK_WIDTH_DUMP_ONCE = True
 
 # ---------------------------------------------------------------------------
 # 金币分段路径参数

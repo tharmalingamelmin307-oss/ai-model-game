@@ -67,7 +67,6 @@ class RoadSegmentor:
         self.fixed_width_source_crop_top_ratio = float(
             getattr(config, "SEG_FIXED_WIDTH_SOURCE_CROP_TOP_RATIO", 0.0)
         )
-        self._dump_track_width_table_once()
 
         # -------------------------------------------------------------------
         # 时域滤波历史记忆
@@ -131,30 +130,6 @@ class RoadSegmentor:
         if self.scale_x_to_seg <= 0.0:
             return None
         return float(x_seg) / self.scale_x_to_seg
-
-    def _dump_track_width_table_once(self):
-        """启动时一次性打印完整赛道宽度表，便于固化成新标定数据."""
-        if not bool(getattr(config, "TRACK_WIDTH_DUMP_ONCE", True)):
-            return
-        if self.fixed_track_widths.size == 0:
-            print("TrackWidthTable EMPTY", flush=True)
-            return
-
-        curr_w, curr_h = config.SEG_SIZE
-        if self.fixed_track_widths.size == int(curr_h):
-            widths = np.array(self.fixed_track_widths, dtype=np.float32)
-        else:
-            source_h = float(self.fixed_width_source_size[1])
-            source_crop_y = source_h * max(0.0, min(0.95, self.fixed_width_source_crop_top_ratio))
-            source_bottom_h = max(1.0, source_h - source_crop_y)
-            width_scale = (float(curr_h) / source_bottom_h) if source_bottom_h > 0.0 else 1.0
-            src_x = np.arange(self.fixed_track_widths.size, dtype=np.float32)
-            dst_x = np.linspace(0.0, max(0.0, float(self.fixed_track_widths.size - 1)), num=int(curr_h))
-            widths = np.interp(dst_x, src_x, self.fixed_track_widths).astype(np.float32) * width_scale
-
-        print(f"TrackWidthTable SEG_SIZE={curr_w}x{curr_h}", flush=True)
-        for idx, width in enumerate(widths):
-            print(f"TrackWidth y={idx}:W={float(width):.1f}", flush=True)
 
     def _store_main_overlay(
         self,
@@ -1398,22 +1373,10 @@ class RoadSegmentor:
             return None
 
         h, w = search_mask.shape[:2]
-        run_ys = [int(row["y"]) for row in rows]
-        top_y = max(0, min(run_ys) - int(config.MERGE_GUIDE_EXTEND_TOP_ROWS))
-        bottom_y = min(h - 1, max(run_ys) + int(config.MERGE_GUIDE_EXTEND_BOTTOM_ROWS))
-        line_y_min = int(np.clip(int(config.MERGE_GUIDE_LINE_Y_MIN), 0, h - 1))
-        line_y_max = int(np.clip(int(config.MERGE_GUIDE_LINE_Y_MAX), 0, h - 1))
-        if line_y_max < line_y_min:
-            line_y_min, line_y_max = line_y_max, line_y_min
-        top_y = max(top_y, line_y_min)
-        bottom_y = min(bottom_y, line_y_max)
-        if bottom_y < top_y:
-            return None
-
         min_gap = max(0.0, float(config.MERGE_GUIDE_LINE_MIN_GAP))
 
         guide_pts = []
-        for y_int in range(top_y, bottom_y + 1):
+        for y_int in range(0, h):
             xs = np.where(search_mask[y_int] > 0)[0]
             if len(xs) < int(config.SEG_PATH_MIN_BRANCH_POINTS):
                 continue
@@ -1763,6 +1726,37 @@ class RoadSegmentor:
         slopes = (pts[:, 0] - bottom_mid_x) / dy
         row_weights = np.clip(pts[:, 1], 0.0, bottom_y)
         return float(np.sum(slopes * row_weights))
+
+    def _build_single_row_control_points(self, path_points, img_h, y_ratio=None):
+        """把整条路径压成单行控制点，降低无金币时的抖动."""
+        if path_points is None or len(path_points) == 0:
+            return None
+
+        if y_ratio is None:
+            y_ratio = float(getattr(config, "SEG_STEER_SAMPLE_Y_RATIO", 0.6))
+
+        pts = np.array(path_points, dtype=np.float32).reshape((-1, 2))
+        sample_y = float(np.clip((float(img_h) - 1.0) * float(y_ratio), 0.0, float(img_h - 1)))
+        sample_x = self._path_x_at_y_points(pts, sample_y)
+        if sample_x is None:
+            return None
+        return np.array([[float(sample_x), sample_y]], dtype=np.float32)
+
+    def _select_bottom_band_control_points(self, path_points, img_h, band_height=None):
+        """只保留底部固定高度内的路径点参与无金币控制."""
+        if path_points is None or len(path_points) == 0:
+            return None
+
+        if band_height is None:
+            band_height = 96.0
+
+        pts = np.array(path_points, dtype=np.float32).reshape((-1, 2))
+        bottom_y = float(img_h) - 1.0
+        y_min = max(0.0, bottom_y - float(band_height) + 1.0)
+        selected = pts[pts[:, 1] >= y_min]
+        if len(selected) == 0:
+            return None
+        return selected.astype(np.float32)
 
     def _path_x_at_y_points(self, path_points, y):
         """在一组路径点上按 y 插值得到 x."""
@@ -2251,12 +2245,13 @@ class RoadSegmentor:
             self.last_path_points_orig = path_points_orig.copy()
             self.missing_path_frames = 0
             control_path_points = path_points_orig
-            if (
-                coin_path_debug is not None and
-                coin_path_debug.get("active") and
-                coin_path_debug.get("control_points") is not None
-            ):
-                control_path_points = coin_path_debug["control_points"]
+            if coin_path_debug is not None and coin_path_debug.get("active"):
+                if coin_path_debug.get("control_points") is not None:
+                    control_path_points = coin_path_debug["control_points"]
+            else:
+                bottom_band_points = self._select_bottom_band_control_points(path_points_orig, h_seg, band_height=96.0)
+                if bottom_band_points is not None:
+                    control_path_points = bottom_band_points
             steer_signal = self._compute_weighted_steer_signal(control_path_points, w_seg, h_seg)
             if control_path_points is not path_points_orig:
                 steer_signal *= float(getattr(config, "COIN_PATH_CONTROL_GAIN", 1.0))
