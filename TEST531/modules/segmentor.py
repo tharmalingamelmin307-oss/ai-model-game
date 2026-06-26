@@ -82,6 +82,11 @@ class RoadSegmentor:
             "y_fork_active": False,
             "merge_side": None,
         }
+        self.merge_state_active = False
+        self.merge_state_hit_frames = 0
+        self.merge_state_exit_frames = 0
+        self.merge_state_info = None
+        self.merge_state_side = None
         self.locked_coin = None
         self.locked_coin_miss_frames = 0
         self.last_main_overlay = {
@@ -771,6 +776,7 @@ class RoadSegmentor:
     def _collect_branch_rows(self, search_mask, edge_mask, top_y, bottom_y):
         """收集指定 y 范围内的双白区行，并统计是否满足汇合入口条件."""
         branch_rows = []
+        edge_rows = []
         trigger_row_width = float(config.MERGE_GUIDE_MIN_ROW_WIDTH)
         trigger_rows_need = max(1, int(config.MERGE_GUIDE_MIN_WIDE_ROWS))
         curr_trigger_streak = 0
@@ -779,7 +785,15 @@ class RoadSegmentor:
         for sample_y in range(top_y, bottom_y + 1):
             row = search_mask[sample_y]
             xs = np.where(search_mask[sample_y] > 0)[0]
-            edge_touch = bool(row[0] > 0 or row[-1] > 0)
+            left_edge_touch = bool(row[0] > 0)
+            right_edge_touch = bool(row[-1] > 0)
+            edge_touch = bool(left_edge_touch or right_edge_touch)
+            if edge_touch:
+                edge_rows.append({
+                    "y": int(sample_y),
+                    "left_edge_touch": left_edge_touch,
+                    "right_edge_touch": right_edge_touch,
+                })
             wide_enough = len(xs) > 0 and float(xs[-1] - xs[0]) >= trigger_row_width
             if edge_touch or wide_enough:
                 curr_trigger_streak += 1
@@ -809,17 +823,24 @@ class RoadSegmentor:
                 "left_inner_x": float(left_seg["right_x"]),
                 "right_inner_x": float(right_seg["left_x"]),
                 "gap_width": float(right_seg["left_x"] - left_seg["right_x"]),
+                "left_edge_touch": left_edge_touch,
+                "right_edge_touch": right_edge_touch,
             })
 
-        return branch_rows, max_trigger_streak >= trigger_rows_need
+        return branch_rows, edge_rows, max_trigger_streak >= trigger_rows_need
 
-    def _select_merge_run(self, branch_rows, side_name):
+    def _select_merge_run(self, branch_rows, side_name, edge_rows=None):
         """在全图双白区行里寻找单侧向下扩张的汇合尖角."""
         if len(branch_rows) < 2:
             return None
+        edge_rows = [] if edge_rows is None else edge_rows
 
         max_miss_rows = max(0, int(config.MERGE_GUIDE_MAX_MISS_ROWS))
         min_side_delta = float(config.MERGE_GUIDE_MIN_SIDE_DELTA)
+        min_inner_angle_deg = float(getattr(config, "MERGE_GUIDE_MIN_INNER_ANGLE_DEG", 0.0))
+        min_inner_sharpness = float(getattr(config, "MERGE_GUIDE_MIN_INNER_SHARPNESS", 0.0))
+        require_edge_above = bool(getattr(config, "MERGE_GUIDE_REQUIRE_EDGE_ABOVE_INNER", True))
+        min_edge_above_rows = max(1, int(getattr(config, "MERGE_GUIDE_MIN_EDGE_ABOVE_ROWS", 1)))
         opposite_max_drift = float(config.MERGE_GUIDE_OPPOSITE_MAX_DRIFT)
         opposite_max_step_jump = float(getattr(config, "MERGE_GUIDE_OPPOSITE_MAX_STEP_JUMP", opposite_max_drift))
         rows = sorted(branch_rows, key=lambda row: int(row["y"]), reverse=True)
@@ -830,18 +851,40 @@ class RoadSegmentor:
 
             bottom_row = run_rows[0]
             top_row = run_rows[-1]
+            top_y = int(top_row["y"])
             gap_shrink = float(bottom_row["gap_width"]) - float(top_row["gap_width"])
 
             if side_name == "left":
                 primary_collapse = float(top_row["left_inner_x"]) - float(bottom_row["left_inner_x"])
+                primary_values = [float(row["left_inner_x"]) for row in run_rows]
                 opposite_values = [float(row["right_inner_x"]) for row in run_rows]
+                edge_key = "left_edge_touch"
             else:
                 primary_collapse = float(bottom_row["right_inner_x"]) - float(top_row["right_inner_x"])
+                primary_values = [float(row["right_inner_x"]) for row in run_rows]
                 opposite_values = [float(row["left_inner_x"]) for row in run_rows]
+                edge_key = "right_edge_touch"
 
             # 第一阶段：先确认当前侧确实存在汇合塌陷/收口特征。
             if primary_collapse < min_side_delta or gap_shrink < min_side_delta:
                 return None
+
+            y_span = max(1.0, abs(float(bottom_row["y"]) - float(top_row["y"])))
+            inner_angle_deg = float(np.degrees(np.arctan2(max(0.0, primary_collapse), y_span)))
+            if inner_angle_deg < min_inner_angle_deg:
+                return None
+            primary_steps = np.abs(np.diff(np.array(primary_values, dtype=np.float32)))
+            inner_sharpness = float(np.max(primary_steps) / max(primary_collapse, 1e-6)) if len(primary_steps) > 0 else 0.0
+            if inner_sharpness < min_inner_sharpness:
+                return None
+
+            if require_edge_above:
+                edge_above_rows = [
+                    row for row in edge_rows
+                    if bool(row.get(edge_key, False)) and int(row["y"]) <= top_y
+                ]
+                if len(edge_above_rows) < min_edge_above_rows:
+                    return None
 
             # 第二阶段：只有塌陷成立后，才检查对侧可信边界是否连续、没有大跳变。
             opposite_drift = abs(opposite_values[-1] - opposite_values[0])
@@ -856,6 +899,8 @@ class RoadSegmentor:
                 # 先过塌陷/收口，再过对侧连续性；通过后按塌陷/收口强度排序。
                 "score": (
                     primary_collapse + gap_shrink,
+                    inner_angle_deg,
+                    inner_sharpness,
                     len(run_rows),
                     -opposite_drift,
                     -opposite_step_jump,
@@ -904,25 +949,28 @@ class RoadSegmentor:
         if cond_bottom_y < cond_top_y:
             cond_top_y, cond_bottom_y = cond_bottom_y, cond_top_y
 
-        cond_branch_rows, merge_trigger_ok = self._collect_branch_rows(
+        cond_branch_rows, cond_edge_rows, merge_trigger_ok = self._collect_branch_rows(
             search_mask,
             edge_mask,
             cond_top_y,
             cond_bottom_y,
         )
         branch_rows = cond_branch_rows if merge_trigger_ok else []
+        edge_rows = cond_edge_rows if merge_trigger_ok else []
 
         free_top_y = int(np.clip(int(getattr(config, "MERGE_GUIDE_FREE_SCAN_Y_TOP", h)), 0, h - 1))
         free_bottom_y = int(np.clip(int(getattr(config, "MERGE_GUIDE_FREE_SCAN_Y_BOTTOM", h)), 0, h - 1))
         free_top_y = max(free_top_y, scene_top_y)
         if free_bottom_y < free_top_y:
             free_top_y, free_bottom_y = free_bottom_y, free_top_y
-        free_branch_rows, _ = self._collect_branch_rows(
+        free_branch_rows, free_edge_rows, _ = self._collect_branch_rows(
             search_mask,
             edge_mask,
             free_top_y,
             free_bottom_y,
         )
+        if free_edge_rows:
+            edge_rows.extend(free_edge_rows)
         if free_branch_rows:
             rows_by_y = {int(row["y"]): row for row in branch_rows}
             for row in free_branch_rows:
@@ -932,8 +980,8 @@ class RoadSegmentor:
         if not branch_rows:
             return None
 
-        left_run = self._select_merge_run(branch_rows, "left")
-        right_run = self._select_merge_run(branch_rows, "right")
+        left_run = self._select_merge_run(branch_rows, "left", edge_rows)
+        right_run = self._select_merge_run(branch_rows, "right", edge_rows)
 
         best_side = None
         best_run = None
@@ -961,6 +1009,81 @@ class RoadSegmentor:
             "side": best_side,
             "guide_polyline": guide_polyline,
         }
+
+    def _merge_bottom_width_exit_ready(self, search_mask):
+        """底部连续若干行总白区宽度小于阈值时，认为汇合补线可以退出."""
+        if search_mask is None or search_mask.size == 0:
+            return False
+
+        h, _ = search_mask.shape[:2]
+        rows_need = max(1, int(getattr(config, "MERGE_STATE_EXIT_BOTTOM_ROWS", 5)))
+        width_thresh = float(getattr(config, "MERGE_STATE_EXIT_WIDTH_THRESH", 340.0))
+        start_y = max(0, h - rows_need)
+        for y in range(start_y, h):
+            xs = np.where(search_mask[y] > 0)[0]
+            if len(xs) == 0:
+                return False
+            row_width = float(xs[-1] - xs[0])
+            if row_width >= width_thresh:
+                return False
+        no_edge_top = int(np.clip(int(getattr(config, "MERGE_STATE_EXIT_NO_EDGE_Y_TOP", 40)), 0, h - 1))
+        no_edge_bottom = int(np.clip(int(getattr(config, "MERGE_STATE_EXIT_NO_EDGE_Y_BOTTOM", 150)), 0, h - 1))
+        if no_edge_bottom < no_edge_top:
+            no_edge_top, no_edge_bottom = no_edge_bottom, no_edge_top
+        for y in range(no_edge_top, no_edge_bottom + 1):
+            row = search_mask[y]
+            if row[0] > 0 or row[-1] > 0:
+                return False
+        return True
+
+    def _update_merge_state(self, merge_detect_info, search_mask):
+        """汇合补线状态机：三帧确认进入，底部宽度连续恢复两帧退出."""
+        confirm_frames = max(1, int(getattr(config, "MERGE_STATE_CONFIRM_FRAMES", 3)))
+        exit_confirm_frames = max(1, int(getattr(config, "MERGE_STATE_EXIT_CONFIRM_FRAMES", 2)))
+
+        detected_side = None if merge_detect_info is None else merge_detect_info.get("side")
+        if self.merge_state_active and self.merge_state_side in ("left", "right"):
+            if detected_side == self.merge_state_side:
+                self.merge_state_hit_frames += 1
+                self.merge_state_info = merge_detect_info
+            elif detected_side is None:
+                self.merge_state_hit_frames = 0
+            else:
+                # 当前边还在，不允许直接跳到另一边；先按退出流程走。
+                detected_side = None
+                merge_detect_info = None
+                self.merge_state_hit_frames = 0
+        else:
+            if merge_detect_info is not None:
+                self.merge_state_hit_frames += 1
+                self.merge_state_info = merge_detect_info
+            else:
+                self.merge_state_hit_frames = 0
+
+        if not self.merge_state_active:
+            self.merge_state_exit_frames = 0
+            if self.merge_state_hit_frames >= confirm_frames and self.merge_state_info is not None:
+                self.merge_state_active = True
+                self.merge_state_side = self.merge_state_info.get("side")
+            else:
+                return None
+
+        if self._merge_bottom_width_exit_ready(search_mask):
+            self.merge_state_exit_frames += 1
+        else:
+            self.merge_state_exit_frames = 0
+
+        if self.merge_state_exit_frames >= exit_confirm_frames:
+            self.merge_state_active = False
+            self.merge_state_hit_frames = 0
+            self.merge_state_exit_frames = 0
+            self.merge_state_info = None
+            self.merge_state_side = None
+            return None
+
+        if self.merge_state_info is not None:
+            self.merge_state_side = self.merge_state_info.get("side")
+        return self.merge_state_info
 
     def _split_mask_by_fork(self, search_mask, fork_point):
         """按“分叉点到底部中点”的分界线，把 mask 切成左右两大区域."""
@@ -1727,7 +1850,20 @@ class RoadSegmentor:
         dy = np.maximum(bottom_y - pts[:, 1], min_dy)
         slopes = (pts[:, 0] - bottom_mid_x) / dy
         row_weights = np.clip(pts[:, 1], 0.0, bottom_y)
-        return float(np.sum(slopes * row_weights))
+        slope_signal = float(np.sum(slopes * row_weights))
+
+        offset_min_from_bottom = float(getattr(config, "STEER_SIGNAL_OFFSET_ROW_MIN_FROM_BOTTOM", 5.0))
+        offset_max_from_bottom = float(getattr(config, "STEER_SIGNAL_OFFSET_ROW_MAX_FROM_BOTTOM", 15.0))
+        offset_y_min = bottom_y - max(offset_min_from_bottom, offset_max_from_bottom)
+        offset_y_max = bottom_y - min(offset_min_from_bottom, offset_max_from_bottom)
+        offset_pts = pts[(pts[:, 1] >= offset_y_min) & (pts[:, 1] <= offset_y_max)]
+        if len(offset_pts) > 0:
+            bottom_offset = float(np.mean(offset_pts[:, 0]) - bottom_mid_x)
+        else:
+            bottom_idx = int(np.argmax(pts[:, 1]))
+            bottom_offset = float(pts[bottom_idx, 0] - bottom_mid_x)
+        offset_gain = float(getattr(config, "STEER_SIGNAL_BOTTOM_OFFSET_GAIN", 0.0))
+        return slope_signal + bottom_offset * offset_gain
 
     def _build_single_row_control_points(self, path_points, img_h, y_ratio=None):
         """把整条路径压成单行控制点，降低无金币时的抖动."""
@@ -2154,10 +2290,26 @@ class RoadSegmentor:
         search_mask = self._prepare_search_mask(mask)
         search_edge_mask = self._extract_edge_mask(search_mask)
         merge_detect_info = self._detect_merge_guide(search_mask, search_edge_mask)
-        merge_guide_info = merge_detect_info
+        merge_guide_info = self._update_merge_state(merge_detect_info, search_mask)
         merge_side = None
         if merge_guide_info is not None:
             merge_side = merge_guide_info.get("side")
+            if merge_detect_info is None or merge_guide_info is not merge_detect_info:
+                current_guide_polyline = self._build_merge_guide_line(
+                    [0, 1],
+                    merge_side,
+                    search_mask,
+                    search_edge_mask,
+                )
+                if current_guide_polyline is not None:
+                    merge_guide_info = {
+                        "side": merge_side,
+                        "guide_polyline": current_guide_polyline,
+                    }
+                else:
+                    merge_guide_info = None
+                    merge_side = None
+        if merge_guide_info is not None:
             search_mask = self._apply_merge_guide(
                 search_mask,
                 merge_guide_info.get("guide_polyline"),
@@ -2385,6 +2537,9 @@ class RoadSegmentor:
             "fork_active": bool(fork_active),
             "y_fork_active": bool(y_fork_active),
             "merge_side": merge_side,
+            "merge_state_active": bool(self.merge_state_active),
+            "merge_state_hit_frames": int(self.merge_state_hit_frames),
+            "merge_state_exit_frames": int(self.merge_state_exit_frames),
         }
         self._store_main_overlay(
             pts_final_orig,

@@ -380,6 +380,11 @@ MERGE_GUIDE_FREE_SCAN_Y_BOTTOM = 160
 MERGE_GUIDE_MIN_ROW_WIDTH = 286.0
 MERGE_GUIDE_MIN_WIDE_ROWS = 4
 MERGE_GUIDE_MIN_SIDE_DELTA = 13.0
+# 汇合塌陷侧内边界需要有足够斜率/锐度，避免门或远处贴边造成的平缓漂移误判。
+MERGE_GUIDE_MIN_INNER_ANGLE_DEG = 10.0
+MERGE_GUIDE_MIN_INNER_SHARPNESS = 0.10
+MERGE_GUIDE_REQUIRE_EDGE_ABOVE_INNER = True
+MERGE_GUIDE_MIN_EDGE_ABOVE_ROWS = 2
 MERGE_GUIDE_OPPOSITE_MAX_DRIFT = 16.0
 # 塌陷侧成立后，对侧可信边界允许的逐行最大跳变。
 # 例如左侧塌陷时，右侧边界必须连续稳定，不能中途突然横跳。
@@ -399,6 +404,13 @@ MERGE_GUIDE_LINE_Y_MAX = 160
 # 补右线时，如果它离左边界太近，就推到“左边界 + gap”右侧。
 MERGE_GUIDE_LINE_MIN_GAP = 13.0
 MERGE_GUIDE_LINE_THICKNESS = 2
+# 汇合状态机：连续命中若干帧才进入补线；进入后等底部赛道宽度稳定恢复再退出。
+MERGE_STATE_CONFIRM_FRAMES = 3
+MERGE_STATE_EXIT_BOTTOM_ROWS = 5
+MERGE_STATE_EXIT_WIDTH_THRESH = 340.0
+MERGE_STATE_EXIT_CONFIRM_FRAMES = 2
+MERGE_STATE_EXIT_NO_EDGE_Y_TOP = 40
+MERGE_STATE_EXIT_NO_EDGE_Y_BOTTOM = 130
 
 # 固定赛道宽度表的来源坐标系。
 # 当前表仍然是旧 320x320 搜索平面里的样本；代码会按当前 SEG_SIZE 和裁剪比例映射到 416x160。
@@ -489,7 +501,7 @@ SERVO_MIN, SERVO_MAX = 590, 910
 # 调小:
 # - 舵机更稳
 # - 但可能转不过弯
-STEER_SIGNAL_PWM_GAIN = 0.004
+STEER_SIGNAL_PWM_GAIN = 0.005
 
 # 用单一转向控制量做动态降速时的增益。
 # 控制量绝对值越大，说明当前横向偏差/路径趋势越强，目标速度会随之降低。
@@ -498,6 +510,11 @@ STEER_SIGNAL_SPEED_GAIN = 0.002
 # 计算“点到底部中点连线斜率”时使用的最小纵向间距。
 # 作用是防止路径底部附近的点因为 dy 过小，把控制量瞬间放得过大。
 STEER_SIGNAL_MIN_DY = 8.0
+# 额外横向偏移项：取路径中最靠近车底的点，直接按 x 偏差补到控制量里。
+# 这样路径整体横移但斜率较小时，也能产生足够转向。
+STEER_SIGNAL_BOTTOM_OFFSET_GAIN = 18.0
+STEER_SIGNAL_OFFSET_ROW_MIN_FROM_BOTTOM = 15.0
+STEER_SIGNAL_OFFSET_ROW_MAX_FROM_BOTTOM = 30.0
 
 
 # ---------------------------------------------------------------------------
@@ -657,7 +674,7 @@ TRAFFIC_LIGHT_YELLOW_CLASS_ID_FALLBACK = 8
 # 恢复前进需要同时满足:
 # - 行人底部中心连续向左移动若干帧
 # - person 框底部中心已经越过当前选中路的释放线
-PERSON_STOP_TRIGGER_DIST = 200    #貌似200也不是很多（720）
+PERSON_STOP_TRIGGER_DIST = 240    #貌似200也不是很多（720）
 PERSON_CLEAR_MOVE_FRAMES = 2
 PERSON_CLEAR_MIN_LEFT_DX = 3.0
 # 行人放行线位置。0.0 是当前道路左边界，0.5 是道路中线，1.0 是右边界。
@@ -762,7 +779,7 @@ CONTROL_MAX_SPEED = 30
 # 速度平滑。上升慢一点，避免金币/弯道控制量变化时突然加速；下降保留更快响应。
 CONTROL_SPEED_SMOOTH_ENABLED = True
 CONTROL_SPEED_MAX_STEP_UP = 1
-CONTROL_SPEED_MAX_STEP_DOWN = 4
+CONTROL_SPEED_MAX_STEP_DOWN = 2
 
 # 串口数据包头尾。
 # 只有在你同时修改上下位机通信协议时才需要调整。
