@@ -57,7 +57,7 @@ class RoadSegmentor:
             getattr(config, "PLANNING_CIRCLE_CLASS_NAMES", ())
         )
         self.fixed_track_widths = np.array(
-            getattr(config, "SEG_FIXED_WIDTHS_320", ()),
+            getattr(config, "SEG_FIXED_WIDTHS_320_SMOOTH", getattr(config, "SEG_FIXED_WIDTHS_320", ())),
             dtype=np.float32,
         )
         self.fixed_track_width_indices = np.where(self.fixed_track_widths > 0)[0]
