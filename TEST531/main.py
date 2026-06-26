@@ -1021,15 +1021,11 @@ def seg_worker(core_id):
 
             actual_servo = global_control_data.get("actual_servo_pwm", config.SERVO_CENTER)
             actual_speed = global_control_data.get("target_speed", config.CONTROL_MIN_SPEED)
-<<<<<<< Updated upstream
-            speed_limit = global_control_data.get("speed_limit")
-=======
             speed_limit = (
                 global_control_data.get("speed_limit")
                 if bool(getattr(config, "LIMIT_SIGN_ENABLED", True))
                 else None
             )
->>>>>>> Stashed changes
             traffic_stop_active = global_control_data.get("traffic_stop_active", False)
 
             fps_stats["seg_frames"] += 1
@@ -1321,6 +1317,7 @@ def serial_control_thread():
             f"串口打开失败: {config.SERIAL_PORT} @ {config.BAUD_RATE}, 错误: {e}",
         )
     serial_first_packet_logged = False
+    last_output_speed = int(config.CONTROL_MIN_SPEED)
 
     while True:
         with data_lock:
@@ -1370,8 +1367,6 @@ def serial_control_thread():
                 stopline_dist_to_bottom <= stop_trigger_dist
             )
 
-<<<<<<< Updated upstream
-=======
             if traffic_light_state in ("red", "yellow", "green"):
                 zebra_dist_text = "无" if stopline_dist_to_bottom is None else str(stopline_dist_to_bottom)
                 throttled_log(
@@ -1386,7 +1381,6 @@ def serial_control_thread():
                     min_interval=config.LOG_INTERVAL_TRAFFIC_STOP_DETAIL
                 )
 
->>>>>>> Stashed changes
             if traffic_light_state == "green":
                 traffic_stop_active = False
             elif traffic_light_state in ("red", "yellow") and stop_ready:
@@ -1398,6 +1392,21 @@ def serial_control_thread():
                 target_speed = 0
 
             limit_applied = speed_limit is not None and dynamic_target_speed > int(speed_limit)
+            if bool(getattr(config, "CONTROL_SPEED_SMOOTH_ENABLED", True)):
+                if target_speed <= 0:
+                    last_output_speed = 0
+                else:
+                    if last_output_speed <= 0:
+                        last_output_speed = min(int(target_speed), int(config.CONTROL_MIN_SPEED))
+                    elif int(target_speed) > last_output_speed:
+                        step_up = max(1, int(getattr(config, "CONTROL_SPEED_MAX_STEP_UP", 1)))
+                        last_output_speed = min(int(target_speed), last_output_speed + step_up)
+                    elif int(target_speed) < last_output_speed:
+                        step_down = max(1, int(getattr(config, "CONTROL_SPEED_MAX_STEP_DOWN", 4)))
+                        last_output_speed = max(int(target_speed), last_output_speed - step_down)
+                    else:
+                        last_output_speed = int(target_speed)
+                target_speed = int(last_output_speed)
 
             raw_pwm = (
                 config.SERVO_CENTER

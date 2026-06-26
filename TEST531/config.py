@@ -193,11 +193,7 @@ ZEBRA_STOPLINE_EXTEND_RATIO = 0.35
 # - 停止线足够接近画面底部
 # 才会触发强制停车。
 # 当前先放宽到 240，优先验证停车链路是否能触发。
-<<<<<<< Updated upstream
-ZEBRA_STOPLINE_TRIGGER_DIST = 240
-=======
 ZEBRA_STOPLINE_TRIGGER_DIST = 300
->>>>>>> Stashed changes
 
 # YOLO 默认置信度阈值。
 # 当某个类别没有在 CLASS_MIN_SCORES 里单独指定时，就回退到这个值。
@@ -493,15 +489,11 @@ SERVO_MIN, SERVO_MAX = 590, 910
 # 调小:
 # - 舵机更稳
 # - 但可能转不过弯
-STEER_SIGNAL_PWM_GAIN = 0.003
+STEER_SIGNAL_PWM_GAIN = 0.004
 
 # 用单一转向控制量做动态降速时的增益。
 # 控制量绝对值越大，说明当前横向偏差/路径趋势越强，目标速度会随之降低。
-<<<<<<< Updated upstream
-STEER_SIGNAL_SPEED_GAIN = 0.02
-=======
 STEER_SIGNAL_SPEED_GAIN = 0.002
->>>>>>> Stashed changes
 
 # 计算“点到底部中点连线斜率”时使用的最小纵向间距。
 # 作用是防止路径底部附近的点因为 dy 过小，把控制量瞬间放得过大。
@@ -665,11 +657,7 @@ TRAFFIC_LIGHT_YELLOW_CLASS_ID_FALLBACK = 8
 # 恢复前进需要同时满足:
 # - 行人底部中心连续向左移动若干帧
 # - person 框底部中心已经越过当前选中路的释放线
-<<<<<<< Updated upstream
-PERSON_STOP_TRIGGER_DIST = 10
-=======
-PERSON_STOP_TRIGGER_DIST = 30
->>>>>>> Stashed changes
+PERSON_STOP_TRIGGER_DIST = 200    #貌似200也不是很多（720）
 PERSON_CLEAR_MOVE_FRAMES = 2
 PERSON_CLEAR_MIN_LEFT_DX = 3.0
 # 行人放行线位置。0.0 是当前道路左边界，0.5 是道路中线，1.0 是右边界。
@@ -771,6 +759,10 @@ SERIAL_TIMEOUT = 0.1
 # - CONTROL_MAX_SPEED: 直道或轻弯时允许的最高速度
 CONTROL_MIN_SPEED = 10
 CONTROL_MAX_SPEED = 30
+# 速度平滑。上升慢一点，避免金币/弯道控制量变化时突然加速；下降保留更快响应。
+CONTROL_SPEED_SMOOTH_ENABLED = True
+CONTROL_SPEED_MAX_STEP_UP = 1
+CONTROL_SPEED_MAX_STEP_DOWN = 4
 
 # 串口数据包头尾。
 # 只有在你同时修改上下位机通信协议时才需要调整。
@@ -956,12 +948,13 @@ SEG_PATH_TOP_TIER_SCORE_GAP = 150.0
 # 最终拟合路径重新采样成多少个密集点，用来计算 steer_signal 和画线。
 SEG_PATH_DENSE_SAMPLES = 30
 
-# 金币分段路径启用时，舵机控制只看“车身底部 -> 最近金币”的第一段。
-# 画线和路径历史仍保留完整分段路径；没有有效金币时自动回退到整条路径控制。
+# 金币分段路径启用时，舵机控制最多只看车身底部往上这段距离。
+# 金币比这个更远时，仍按普通底部窗口控制；金币进入窗口内后才按距离给比例增益。
 COIN_PATH_CONTROL_FIRST_SEGMENT_ONLY = True
-# 金币第一段控制的转向增益。
-# 第一段通常比整条路径更短，默认给一点额外放大，避免看起来“转不过去”。
-COIN_PATH_CONTROL_GAIN = 1.35
+COIN_PATH_CONTROL_BAND_HEIGHT = 96.0
+# 金币进入控制窗口后的参考距离。实际增益约为 BAND_HEIGHT / 金币距离。
+# 例如 BAND=96，金币距底部 60 行，则增益约 1.6；超过 96 行则不加增益。
+COIN_PATH_CONTROL_REFERENCE_ROWS = 96.0
 
 # 终端打印当前赛道宽度的节流间隔，单位秒。
 TRACK_WIDTH_LOG_INTERVAL = 1.5
@@ -974,13 +967,19 @@ TRACK_WIDTH_LOG_INTERVAL = 1.5
 # - 只保留落在当前路径纵向范围内、附近有 mask、且离当前中线不超过赛道半宽的金币点
 # - 路径按“底部路径点 -> 金币点 -> 最远路径点”从近到远分段重采样
 COIN_PATH_ENABLED = True
-COIN_PATH_ROI_Y_MIN = 20
+COIN_PATH_ROI_Y_MIN = 15
 # 底部忽略区。落在分割输入底部这些行内的 coin 不参与路径规划。
 # 用来过滤车身/尾巴刚露进画面底部时被误识别成金币的情况。
-COIN_PATH_ROI_BOTTOM_IGNORE_ROWS = 30
+COIN_PATH_ROI_BOTTOM_IGNORE_ROWS = 15
 COIN_PATH_MASK_RADIUS = 10
 COIN_PATH_HALF_WIDTH_SCALE = 1.0
 COIN_PATH_BYPASS_FRAME_JUMP = True
+# 金币锁定/跟踪参数。
+# 新目标只从 ROI 内选择；锁定后即使进入底部忽略区，也会继续沿用或局部更新。
+COIN_TRACK_MAX_MISS_FRAMES = 2
+COIN_TRACK_SEARCH_RADIUS = 36.0
+COIN_TRACK_MAX_AREA = 2400.0
+COIN_TRACK_EAT_Y_MARGIN = 6.0
 
 # 鸟瞰图上规划目标点的调试样式参数。
 SEG_DEBUG_PLANNING_DOT_RADIUS = 4

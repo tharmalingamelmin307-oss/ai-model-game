@@ -82,6 +82,8 @@ class RoadSegmentor:
             "y_fork_active": False,
             "merge_side": None,
         }
+        self.locked_coin = None
+        self.locked_coin_miss_frames = 0
         self.last_main_overlay = {
             "path": None,
             "left": None,
@@ -1859,12 +1861,129 @@ class RoadSegmentor:
         half_width = 0.5 * fixed_width * float(getattr(config, "COIN_PATH_HALF_WIDTH_SCALE", 1.0))
         return abs(float(coin_x) - path_x) <= half_width
 
+    def _coin_measurement_from_item(self, item, w_seg, h_seg):
+        """从 coin 检测框取底部中心、面积和置信度."""
+        seg_box = item.get("seg_box")
+        if seg_box is None:
+            return None
+        box = np.array(seg_box, dtype=np.float32).reshape((-1, 2))
+        if len(box) < 4:
+            return None
+
+        bottom_indices = np.argsort(box[:, 1])[-2:]
+        bottom_pts = box[bottom_indices]
+        bottom_center = np.mean(bottom_pts, axis=0)
+        cx = float(np.clip(bottom_center[0], 0.0, float(w_seg - 1)))
+        cy = float(np.clip(bottom_center[1], 0.0, float(h_seg - 1)))
+        area = float(max(0.0, np.max(box[:, 0]) - np.min(box[:, 0])) * max(0.0, np.max(box[:, 1]) - np.min(box[:, 1])))
+        return {
+            "point": (cx, cy),
+            "area": area,
+            "score": float(item.get("score", 0.0)),
+        }
+
+    def _coin_measurement_usable(self, measurement, base, mask, left_boundary, right_boundary, *, for_new_lock):
+        """过滤明显不可靠的 coin；新锁定目标额外要求在配置 ROI 内."""
+        if measurement is None:
+            return False
+
+        cx, cy = measurement["point"]
+        max_area = float(getattr(config, "COIN_TRACK_MAX_AREA", 0.0))
+        if max_area > 0.0 and float(measurement.get("area", 0.0)) > max_area:
+            return False
+
+        if for_new_lock:
+            bottom_ignore_rows = float(getattr(config, "COIN_PATH_ROI_BOTTOM_IGNORE_ROWS", 0.0))
+            if bottom_ignore_rows > 0.0 and cy >= float(config.SEG_SIZE[1]) - bottom_ignore_rows:
+                return False
+            if cy < float(getattr(config, "COIN_PATH_ROI_Y_MIN", 0.0)):
+                return False
+
+        path_y_min = float(np.min(base[:, 1]))
+        path_y_max = float(np.max(base[:, 1]))
+        if not (path_y_min <= cy <= path_y_max):
+            return False
+
+        mask_radius = int(getattr(config, "COIN_PATH_MASK_RADIUS", 8))
+        if not self._point_near_mask(mask, (cx, cy), mask_radius):
+            return False
+        return self._coin_inside_selected_lane(cx, cy, base, left_boundary, right_boundary)
+
+    def _update_locked_coin(self, coin_measurements, base, h_seg, mask, left_boundary, right_boundary):
+        """锁定当前金币；短暂跟丢时沿用旧点，超时后切换到新目标."""
+        search_radius = float(getattr(config, "COIN_TRACK_SEARCH_RADIUS", 36.0))
+        max_miss = max(0, int(getattr(config, "COIN_TRACK_MAX_MISS_FRAMES", 2)))
+        eat_margin = max(0.0, float(getattr(config, "COIN_TRACK_EAT_Y_MARGIN", 6.0)))
+        eat_y = float(h_seg - 1) - eat_margin
+
+        usable_for_update = [
+            m for m in coin_measurements
+            if self._coin_measurement_usable(m, base, mask, left_boundary, right_boundary, for_new_lock=False)
+        ]
+
+        new_candidates = [
+            m for m in coin_measurements
+            if self._coin_measurement_usable(m, base, mask, left_boundary, right_boundary, for_new_lock=True)
+        ]
+
+        def _append_future_coins(current_point):
+            current_x, current_y = current_point
+            future = []
+            for m in new_candidates:
+                mx, my = m["point"]
+                if abs(float(mx) - float(current_x)) <= 1e-3 and abs(float(my) - float(current_y)) <= 1e-3:
+                    continue
+                if float(my) < float(current_y):
+                    future.append(m["point"])
+            future.sort(key=lambda pt: (-float(pt[1]), float(pt[0])))
+            return [current_point] + future
+
+        if self.locked_coin is not None:
+            locked_x, locked_y = self.locked_coin["point"]
+            if locked_y >= eat_y:
+                self.locked_coin = None
+                self.locked_coin_miss_frames = 0
+                return []
+            else:
+                local_matches = [
+                    m for m in usable_for_update
+                    if abs(float(m["point"][1]) - locked_y) <= search_radius and
+                    abs(float(m["point"][0]) - locked_x) <= search_radius
+                ]
+                if local_matches:
+                    best = min(
+                        local_matches,
+                        key=lambda m: (
+                            abs(float(m["point"][1]) - locked_y),
+                            abs(float(m["point"][0]) - locked_x),
+                        ),
+                    )
+                    self.locked_coin = best
+                    self.locked_coin_miss_frames = 0
+                    return _append_future_coins(best["point"])
+
+                self.locked_coin_miss_frames += 1
+                if self.locked_coin_miss_frames <= max_miss:
+                    return _append_future_coins(self.locked_coin["point"])
+                self.locked_coin = None
+                self.locked_coin_miss_frames = 0
+
+        if not new_candidates:
+            return []
+
+        best = max(new_candidates, key=lambda m: (float(m["point"][1]), float(m.get("score", 0.0))))
+        self.locked_coin = best
+        self.locked_coin_miss_frames = 0
+        return _append_future_coins(best["point"])
+
     def _apply_coin_path_planning(self, base_path, planning_items, w_seg, h_seg, mask=None,
                                   left_boundary=None, right_boundary=None):
         """只使用 coin 底部中点画点，并按这些点从底部依次分段拟合路径."""
         debug = {
             "coin_points": [],
+            "control_coin": None,
             "control_points": None,
+            "control_gain": 1.0,
             "active": False,
         }
         base = np.array(base_path, dtype=np.float32).reshape((-1, 2))
@@ -1874,58 +1993,49 @@ class RoadSegmentor:
         ):
             return base, debug
 
-        path_y_min = float(np.min(base[:, 1]))
-        path_y_max = float(np.max(base[:, 1]))
-        coin_points = []
+        coin_measurements = []
 
         for item in planning_items:
             if item.get("class_name", "") != "coin":
                 continue
-            seg_box = item.get("seg_box")
-            if seg_box is None:
-                continue
-            box = np.array(seg_box, dtype=np.float32).reshape((-1, 2))
-            if len(box) < 4:
-                continue
+            measurement = self._coin_measurement_from_item(item, w_seg, h_seg)
+            if measurement is not None:
+                coin_measurements.append(measurement)
 
-            bottom_indices = np.argsort(box[:, 1])[-2:]
-            bottom_pts = box[bottom_indices]
-            bottom_center = np.mean(bottom_pts, axis=0)
-            cx = float(np.clip(bottom_center[0], 0.0, float(w_seg - 1)))
-            cy = float(np.clip(bottom_center[1], 0.0, float(h_seg - 1)))
-            bottom_ignore_rows = float(getattr(config, "COIN_PATH_ROI_BOTTOM_IGNORE_ROWS", 0.0))
-            if bottom_ignore_rows > 0.0 and cy >= float(h_seg) - bottom_ignore_rows:
-                continue
-            if cy < float(getattr(config, "COIN_PATH_ROI_Y_MIN", 0.0)):
-                continue
-            if not (path_y_min <= cy <= path_y_max):
-                continue
-            mask_radius = int(getattr(config, "COIN_PATH_MASK_RADIUS", 8))
-            if not self._point_near_mask(mask, (cx, cy), mask_radius):
-                continue
-            if not self._coin_inside_selected_lane(cx, cy, base, left_boundary, right_boundary):
-                continue
-            coin_points.append((cx, cy))
+        coin_points = self._update_locked_coin(
+            coin_measurements,
+            base,
+            h_seg,
+            mask,
+            left_boundary,
+            right_boundary,
+        )
 
         if not coin_points:
             return base, debug
 
-        coin_points = sorted(coin_points, key=lambda pt: (-float(pt[1]), float(pt[0])))
         planned, changed = self._build_segmented_coin_path(base, coin_points, w_seg)
         if not changed:
             return base, debug
 
         debug["coin_points"] = coin_points
+        debug["control_coin"] = coin_points[0]
         if bool(getattr(config, "COIN_PATH_CONTROL_FIRST_SEGMENT_ONLY", True)):
-            nearest_coin = coin_points[0]
+            nearest_coin = debug["control_coin"]
             bottom_y = float(np.max(planned[:, 1]))
             first_coin_y = float(nearest_coin[1])
-            low_y = min(bottom_y, first_coin_y)
-            high_y = max(bottom_y, first_coin_y)
+            band_height = float(getattr(config, "COIN_PATH_CONTROL_BAND_HEIGHT", 96.0))
+            control_top_y = max(float(np.min(planned[:, 1])), bottom_y - max(1.0, band_height) + 1.0)
+            low_y = max(min(bottom_y, first_coin_y), control_top_y)
+            high_y = bottom_y
             segment_mask = (planned[:, 1] >= low_y) & (planned[:, 1] <= high_y)
             control_points = planned[segment_mask]
             if len(control_points) >= 2:
                 debug["control_points"] = control_points.astype(np.float32)
+                coin_distance_rows = max(1.0, bottom_y - first_coin_y)
+                if coin_distance_rows < band_height:
+                    reference_rows = float(getattr(config, "COIN_PATH_CONTROL_REFERENCE_ROWS", band_height))
+                    debug["control_gain"] = max(1.0, reference_rows / coin_distance_rows)
 
         debug["active"] = True
         return planned, debug
@@ -2043,12 +2153,8 @@ class RoadSegmentor:
         pts_final_bird = None
         search_mask = self._prepare_search_mask(mask)
         search_edge_mask = self._extract_edge_mask(search_mask)
-<<<<<<< Updated upstream
-        merge_guide_info = self._detect_merge_guide(search_mask, search_edge_mask)
-=======
         merge_detect_info = self._detect_merge_guide(search_mask, search_edge_mask)
         merge_guide_info = merge_detect_info
->>>>>>> Stashed changes
         merge_side = None
         if merge_guide_info is not None:
             merge_side = merge_guide_info.get("side")
@@ -2258,8 +2364,8 @@ class RoadSegmentor:
                 if bottom_band_points is not None:
                     control_path_points = bottom_band_points
             steer_signal = self._compute_weighted_steer_signal(control_path_points, w_seg, h_seg)
-            if control_path_points is not path_points_orig:
-                steer_signal *= float(getattr(config, "COIN_PATH_CONTROL_GAIN", 1.0))
+            if coin_path_debug is not None and coin_path_debug.get("active"):
+                steer_signal *= float(coin_path_debug.get("control_gain", 1.0))
             pts_final_orig = path_points_orig.reshape((-1, 1, 2))
             pts_final_bird = cv2.perspectiveTransform(pts_final_orig, self.M_seg)
             boundary_left_bird = cv2.perspectiveTransform(boundary_left_orig, self.M_seg)
