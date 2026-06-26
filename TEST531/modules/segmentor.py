@@ -2043,7 +2043,12 @@ class RoadSegmentor:
         pts_final_bird = None
         search_mask = self._prepare_search_mask(mask)
         search_edge_mask = self._extract_edge_mask(search_mask)
+<<<<<<< Updated upstream
         merge_guide_info = self._detect_merge_guide(search_mask, search_edge_mask)
+=======
+        merge_detect_info = self._detect_merge_guide(search_mask, search_edge_mask)
+        merge_guide_info = merge_detect_info
+>>>>>>> Stashed changes
         merge_side = None
         if merge_guide_info is not None:
             merge_side = merge_guide_info.get("side")

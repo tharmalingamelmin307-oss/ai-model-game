@@ -1021,7 +1021,15 @@ def seg_worker(core_id):
 
             actual_servo = global_control_data.get("actual_servo_pwm", config.SERVO_CENTER)
             actual_speed = global_control_data.get("target_speed", config.CONTROL_MIN_SPEED)
+<<<<<<< Updated upstream
             speed_limit = global_control_data.get("speed_limit")
+=======
+            speed_limit = (
+                global_control_data.get("speed_limit")
+                if bool(getattr(config, "LIMIT_SIGN_ENABLED", True))
+                else None
+            )
+>>>>>>> Stashed changes
             traffic_stop_active = global_control_data.get("traffic_stop_active", False)
 
             fps_stats["seg_frames"] += 1
@@ -1362,6 +1370,23 @@ def serial_control_thread():
                 stopline_dist_to_bottom <= stop_trigger_dist
             )
 
+<<<<<<< Updated upstream
+=======
+            if traffic_light_state in ("red", "yellow", "green"):
+                zebra_dist_text = "无" if stopline_dist_to_bottom is None else str(stopline_dist_to_bottom)
+                throttled_log(
+                    "traffic_light_state_detail",
+                    "红绿灯状态: "
+                    f"灯色={traffic_light_state} "
+                    f"停车线到底部距离={zebra_dist_text} "
+                    f"阈值={stop_trigger_dist} "
+                    f"stop_ready={'是' if stop_ready else '否'} "
+                    f"已停车={'是' if traffic_stop_active else '否'}",
+                    state=(traffic_light_state, zebra_dist_text, int(stop_trigger_dist), bool(stop_ready), bool(traffic_stop_active)),
+                    min_interval=config.LOG_INTERVAL_TRAFFIC_STOP_DETAIL
+                )
+
+>>>>>>> Stashed changes
             if traffic_light_state == "green":
                 traffic_stop_active = False
             elif traffic_light_state in ("red", "yellow") and stop_ready:

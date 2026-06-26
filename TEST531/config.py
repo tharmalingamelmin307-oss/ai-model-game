@@ -193,7 +193,11 @@ ZEBRA_STOPLINE_EXTEND_RATIO = 0.35
 # - 停止线足够接近画面底部
 # 才会触发强制停车。
 # 当前先放宽到 240，优先验证停车链路是否能触发。
+<<<<<<< Updated upstream
 ZEBRA_STOPLINE_TRIGGER_DIST = 240
+=======
+ZEBRA_STOPLINE_TRIGGER_DIST = 300
+>>>>>>> Stashed changes
 
 # YOLO 默认置信度阈值。
 # 当某个类别没有在 CLASS_MIN_SCORES 里单独指定时，就回退到这个值。
@@ -493,7 +497,11 @@ STEER_SIGNAL_PWM_GAIN = 0.003
 
 # 用单一转向控制量做动态降速时的增益。
 # 控制量绝对值越大，说明当前横向偏差/路径趋势越强，目标速度会随之降低。
+<<<<<<< Updated upstream
 STEER_SIGNAL_SPEED_GAIN = 0.02
+=======
+STEER_SIGNAL_SPEED_GAIN = 0.002
+>>>>>>> Stashed changes
 
 # 计算“点到底部中点连线斜率”时使用的最小纵向间距。
 # 作用是防止路径底部附近的点因为 dy 过小，把控制量瞬间放得过大。
@@ -657,7 +665,11 @@ TRAFFIC_LIGHT_YELLOW_CLASS_ID_FALLBACK = 8
 # 恢复前进需要同时满足:
 # - 行人底部中心连续向左移动若干帧
 # - person 框底部中心已经越过当前选中路的释放线
+<<<<<<< Updated upstream
 PERSON_STOP_TRIGGER_DIST = 10
+=======
+PERSON_STOP_TRIGGER_DIST = 30
+>>>>>>> Stashed changes
 PERSON_CLEAR_MOVE_FRAMES = 2
 PERSON_CLEAR_MIN_LEFT_DX = 3.0
 # 行人放行线位置。0.0 是当前道路左边界，0.5 是道路中线，1.0 是右边界。
