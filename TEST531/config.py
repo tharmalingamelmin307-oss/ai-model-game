@@ -519,14 +519,14 @@ SERVO_MIN, SERVO_MAX = 590, 910
 
 # 单一转向控制量换算到舵机 PWM 的增益。
 # 当前控制量定义为：
-# “路径上每个点到图像最底部中点连线的斜率 * 该点行号”的总和。
+# “路径上每个点到图像底部中点连线的斜率 * 该点行号”的总和。
 # 调大:
 # - 舵机转向更积极
 # - 但更容易抖或打满
 # 调小:
 # - 舵机更稳
 # - 但可能转不过弯
-STEER_SIGNAL_PWM_GAIN = 0.005
+STEER_SIGNAL_PWM_GAIN = 0.015
 
 # 用单一转向控制量做动态降速时的增益。
 # 控制量绝对值越大，说明当前横向偏差/路径趋势越强，目标速度会随之降低。
@@ -535,11 +535,15 @@ STEER_SIGNAL_SPEED_GAIN = 0.002
 # 计算“点到底部中点连线斜率”时使用的最小纵向间距。
 # 作用是防止路径底部附近的点因为 dy 过小，把控制量瞬间放得过大。
 STEER_SIGNAL_MIN_DY = 8.0
-# 额外横向偏移项：取路径中最靠近车底的点，直接按 x 偏差补到控制量里。
-# 这样路径整体横移但斜率较小时，也能产生足够转向。
-STEER_SIGNAL_BOTTOM_OFFSET_GAIN = 18.0
+# 额外横向偏移控制项已停用，暂不参与控制量。
+STEER_SIGNAL_BOTTOM_OFFSET_GAIN = 0.0
 STEER_SIGNAL_OFFSET_ROW_MIN_FROM_BOTTOM = 15.0
 STEER_SIGNAL_OFFSET_ROW_MAX_FROM_BOTTOM = 30.0
+# 无金币/无车时，控制只看中下部这一段，底部最靠下 30 行不参与。
+STEER_SIGNAL_NO_TARGET_ROW_MIN = 60.0
+STEER_SIGNAL_NO_TARGET_ROW_MAX = 130.0
+# 无目标控制增益：补偿去掉底部 30 行后整体控制量变小的问题。
+STEER_SIGNAL_NO_TARGET_GAIN = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -1002,6 +1006,29 @@ COIN_PATH_CONTROL_REFERENCE_ROWS = 96.0
 TRACK_WIDTH_LOG_INTERVAL = 1.5
 
 # ---------------------------------------------------------------------------
+# 车辆避障路径参数
+# ---------------------------------------------------------------------------
+# 检测到 car 时，把车框左侧两个角点向左偏移后作为避障目标点。
+# 这些目标点会像金币锚点一样插入路径，使车优先从障碍车左侧绕过。
+CAR_AVOIDANCE_ENABLED = True
+CAR_AVOIDANCE_TARGET_LEFT_OFFSET = 90.0
+CAR_AVOIDANCE_TOP_LEFT_OFFSET = 70.0
+CAR_AVOIDANCE_TOP_ANCHOR_HEIGHT_RATIO = 1.0 / 3.0
+CAR_AVOIDANCE_AREA_SCALE_ENABLED = True
+CAR_AVOIDANCE_AREA_SCALE_MIN_AREA = 1200.0
+CAR_AVOIDANCE_AREA_SCALE_MAX_AREA = 14000.0
+CAR_AVOIDANCE_AREA_SCALE_MIN = 1.2
+CAR_AVOIDANCE_AREA_SCALE_MAX = 1.8
+CAR_AVOIDANCE_EDGE_SKIP_BOTTOM_ANCHOR = True
+CAR_AVOIDANCE_EDGE_MARGIN = 8.0
+CAR_AVOIDANCE_BOTTOM_LEAD_ROWS = 30.0
+CAR_AVOIDANCE_BOTTOM_NEAR_ROWS = 12.0
+CAR_AVOIDANCE_MISS_FRAMES = 2
+CAR_AVOIDANCE_MASK_RADIUS = 10
+CAR_AVOIDANCE_MIN_SCORE = 0.0
+CAR_AVOIDANCE_MAX_AREA = 0.0
+
+# ---------------------------------------------------------------------------
 # 金币分段路径参数
 # ---------------------------------------------------------------------------
 # 只处理 coin:
@@ -1010,18 +1037,21 @@ TRACK_WIDTH_LOG_INTERVAL = 1.5
 # - 路径按“底部路径点 -> 金币点 -> 最远路径点”从近到远分段重采样
 COIN_PATH_ENABLED = True
 COIN_PATH_ROI_Y_MIN = 15
-# 底部忽略区。落在分割输入底部这些行内的 coin 不参与路径规划。
-# 用来过滤车身/尾巴刚露进画面底部时被误识别成金币的情况。
-COIN_PATH_ROI_BOTTOM_IGNORE_ROWS = 15
+# coin 底部边缘严格区。靠近分割输入底边时，用“当前路径中线 +/- 赛道半宽”
+# 再额外收窄，压掉车尾/路边被误识别成 coin 的情况。
+COIN_PATH_ROI_BOTTOM_STRICT_ROWS = 80
+COIN_PATH_BOTTOM_HALF_WIDTH_SCALE = 0.42
+COIN_PATH_EDGE_REJECT_ENABLED = True
+COIN_PATH_EDGE_REJECT_MARGIN = 8.0
 COIN_PATH_MASK_RADIUS = 10
 COIN_PATH_HALF_WIDTH_SCALE = 1.0
 COIN_PATH_BYPASS_FRAME_JUMP = True
-# 金币锁定/跟踪参数。
-# 新目标只从 ROI 内选择；锁定后即使进入底部忽略区，也会继续沿用或局部更新。
+# 金币锁定/过滤参数。新目标不做连续帧确认，但锁定后允许短暂丢失沿用。
 COIN_TRACK_MAX_MISS_FRAMES = 2
 COIN_TRACK_SEARCH_RADIUS = 36.0
 COIN_TRACK_MAX_AREA = 2400.0
 COIN_TRACK_EAT_Y_MARGIN = 6.0
+COIN_TRACK_BOTTOM_TOO_CLOSE_ROWS = 8.0
 
 # 鸟瞰图上规划目标点的调试样式参数。
 SEG_DEBUG_PLANNING_DOT_RADIUS = 4
@@ -1058,6 +1088,9 @@ SEG_DEBUG_MERGE_GUIDE_THICKNESS = 2
 SEG_DEBUG_COIN_PATH_ENABLED = True
 SEG_DEBUG_COIN_PATH_COLOR = (0, 255, 255)
 SEG_DEBUG_COIN_PATH_DOT_RADIUS = 4
+SEG_DEBUG_COIN_BOTTOM_STRICT_LINE_ENABLED = True
+SEG_DEBUG_COIN_BOTTOM_STRICT_LINE_COLOR = (0, 0, 255)
+SEG_DEBUG_COIN_BOTTOM_STRICT_LINE_THICKNESS = 1
 SEG_DEBUG_PIP_DIVISOR = 3
 SEG_DEBUG_PIP_BORDER_COLOR = (255, 255, 255)
 SEG_DEBUG_PIP_BORDER_THICKNESS = 1

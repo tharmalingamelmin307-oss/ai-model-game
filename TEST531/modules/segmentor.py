@@ -87,6 +87,8 @@ class RoadSegmentor:
         self.merge_state_exit_frames = 0
         self.merge_state_info = None
         self.merge_state_side = None
+        self.locked_car = None
+        self.locked_car_miss_frames = 0
         self.locked_coin = None
         self.locked_coin_miss_frames = 0
         self.last_main_overlay = {
@@ -201,6 +203,7 @@ class RoadSegmentor:
         merge_guide_thickness = max(1, int(round(config.SEG_DEBUG_MERGE_GUIDE_THICKNESS * scale)))
         bottom_mid_radius = max(1, int(round(config.SEG_DEBUG_BOTTOM_MID_RADIUS * scale)))
         coin_dot_radius = max(1, int(round(config.SEG_DEBUG_COIN_PATH_DOT_RADIUS * scale)))
+        coin_strict_line_thickness = max(1, int(round(getattr(config, "SEG_DEBUG_COIN_BOTTOM_STRICT_LINE_THICKNESS", 1) * scale)))
 
         def _scale_point(pt):
             return (
@@ -257,6 +260,20 @@ class RoadSegmentor:
                 merge_guide_thickness,
                 cv2.LINE_AA,
             )
+
+        if bool(getattr(config, "SEG_DEBUG_COIN_BOTTOM_STRICT_LINE_ENABLED", True)):
+            strict_rows = float(getattr(config, "COIN_PATH_ROI_BOTTOM_STRICT_ROWS", 0.0))
+            if strict_rows > 0.0:
+                strict_y = int(round((float(base_h) - strict_rows) * scale_y))
+                strict_y = max(0, min(img_h - 1, strict_y))
+                cv2.line(
+                    image,
+                    (0, strict_y),
+                    (img_w - 1, strict_y),
+                    getattr(config, "SEG_DEBUG_COIN_BOTTOM_STRICT_LINE_COLOR", (0, 0, 255)),
+                    coin_strict_line_thickness,
+                    cv2.LINE_AA,
+                )
 
         coin_path_debug = overlay.get("coin_path")
         if bool(getattr(config, "SEG_DEBUG_COIN_PATH_ENABLED", True)) and coin_path_debug:
@@ -1852,18 +1869,8 @@ class RoadSegmentor:
         row_weights = np.clip(pts[:, 1], 0.0, bottom_y)
         slope_signal = float(np.sum(slopes * row_weights))
 
-        offset_min_from_bottom = float(getattr(config, "STEER_SIGNAL_OFFSET_ROW_MIN_FROM_BOTTOM", 5.0))
-        offset_max_from_bottom = float(getattr(config, "STEER_SIGNAL_OFFSET_ROW_MAX_FROM_BOTTOM", 15.0))
-        offset_y_min = bottom_y - max(offset_min_from_bottom, offset_max_from_bottom)
-        offset_y_max = bottom_y - min(offset_min_from_bottom, offset_max_from_bottom)
-        offset_pts = pts[(pts[:, 1] >= offset_y_min) & (pts[:, 1] <= offset_y_max)]
-        if len(offset_pts) > 0:
-            bottom_offset = float(np.mean(offset_pts[:, 0]) - bottom_mid_x)
-        else:
-            bottom_idx = int(np.argmax(pts[:, 1]))
-            bottom_offset = float(pts[bottom_idx, 0] - bottom_mid_x)
-        offset_gain = float(getattr(config, "STEER_SIGNAL_BOTTOM_OFFSET_GAIN", 0.0))
-        return slope_signal + bottom_offset * offset_gain
+        # 底部额外偏移项先停用，仅保留主斜率累计控制量。
+        return slope_signal
 
     def _build_single_row_control_points(self, path_points, img_h, y_ratio=None):
         """把整条路径压成单行控制点，降低无金币时的抖动."""
@@ -1895,6 +1902,21 @@ class RoadSegmentor:
         if len(selected) == 0:
             return None
         return selected.astype(np.float32)
+
+    def _select_no_target_control_points(self, path_points, img_h):
+        """无金币/无车时，使用中下部指定行段参与控制，避开最底部几行."""
+        if path_points is None or len(path_points) == 0:
+            return None
+
+        pts = np.array(path_points, dtype=np.float32).reshape((-1, 2))
+        row_min = float(getattr(config, "STEER_SIGNAL_NO_TARGET_ROW_MIN", 60.0))
+        row_max = float(getattr(config, "STEER_SIGNAL_NO_TARGET_ROW_MAX", 130.0))
+        lo = max(0.0, min(row_min, row_max))
+        hi = min(float(img_h) - 1.0, max(row_min, row_max))
+        selected = pts[(pts[:, 1] >= lo) & (pts[:, 1] <= hi)]
+        if len(selected) > 0:
+            return selected.astype(np.float32)
+        return self._select_bottom_band_control_points(path_points, img_h, band_height=max(1.0, float(img_h) - lo))
 
     def _path_x_at_y_points(self, path_points, y):
         """在一组路径点上按 y 插值得到 x."""
@@ -1930,8 +1952,8 @@ class RoadSegmentor:
             return False
         return bool(np.any(mask[y1:y2, x1:x2] > 0))
 
-    def _build_segmented_coin_path(self, base_path, coin_points, w_seg):
-        """用金币底部点作为硬锚点，从底部往远处分段重采样路径."""
+    def _build_segmented_coin_path(self, base_path, coin_points, w_seg, *, min_anchors=3):
+        """按锚点从底部往远处分段重采样路径。"""
         planned = np.array(base_path, dtype=np.float32).reshape((-1, 2)).copy()
         if len(planned) < 2 or not coin_points:
             return planned, False
@@ -1948,7 +1970,7 @@ class RoadSegmentor:
                 anchors.append((float(np.clip(cx, 0.0, float(w_seg - 1))), cy))
         anchors.append((float(far_pt[0]), float(far_pt[1])))
 
-        if len(anchors) < 3:
+        if len(anchors) < min_anchors:
             return planned, False
 
         anchors = sorted(anchors, key=lambda pt: float(pt[1]))
@@ -2011,10 +2033,15 @@ class RoadSegmentor:
         bottom_center = np.mean(bottom_pts, axis=0)
         cx = float(np.clip(bottom_center[0], 0.0, float(w_seg - 1)))
         cy = float(np.clip(bottom_center[1], 0.0, float(h_seg - 1)))
-        area = float(max(0.0, np.max(box[:, 0]) - np.min(box[:, 0])) * max(0.0, np.max(box[:, 1]) - np.min(box[:, 1])))
+        x_min = float(np.min(box[:, 0]))
+        x_max = float(np.max(box[:, 0]))
+        y_min = float(np.min(box[:, 1]))
+        y_max = float(np.max(box[:, 1]))
+        area = float(max(0.0, x_max - x_min) * max(0.0, y_max - y_min))
         return {
             "point": (cx, cy),
             "area": area,
+            "box": (x_min, y_min, x_max, y_max),
             "score": float(item.get("score", 0.0)),
         }
 
@@ -2028,10 +2055,21 @@ class RoadSegmentor:
         if max_area > 0.0 and float(measurement.get("area", 0.0)) > max_area:
             return False
 
+        if bool(getattr(config, "COIN_PATH_EDGE_REJECT_ENABLED", False)):
+            box = measurement.get("box")
+            if box is not None:
+                x_min, _y_min, x_max, y_max = [float(v) for v in box]
+                bottom_y = float(np.max(base[:, 1]))
+                bottom_strict_rows = float(getattr(config, "COIN_PATH_ROI_BOTTOM_STRICT_ROWS", 0.0))
+                edge_margin = max(0.0, float(getattr(config, "COIN_PATH_EDGE_REJECT_MARGIN", 0.0)))
+                in_bottom_strict = bottom_strict_rows > 0.0 and y_max >= bottom_y - bottom_strict_rows
+                if in_bottom_strict and (x_min <= edge_margin or x_max >= float(config.SEG_SIZE[0] - 1) - edge_margin):
+                    return False
+
+        if not self._coin_bottom_strict_point_usable(cx, cy, base):
+            return False
+
         if for_new_lock:
-            bottom_ignore_rows = float(getattr(config, "COIN_PATH_ROI_BOTTOM_IGNORE_ROWS", 0.0))
-            if bottom_ignore_rows > 0.0 and cy >= float(config.SEG_SIZE[1]) - bottom_ignore_rows:
-                return False
             if cy < float(getattr(config, "COIN_PATH_ROI_Y_MIN", 0.0)):
                 return False
 
@@ -2044,6 +2082,26 @@ class RoadSegmentor:
         if not self._point_near_mask(mask, (cx, cy), mask_radius):
             return False
         return self._coin_inside_selected_lane(cx, cy, base, left_boundary, right_boundary)
+
+    def _coin_bottom_strict_point_usable(self, coin_x, coin_y, base):
+        """底部严格区内，coin 必须靠近当前路径中线且范围额外收窄。"""
+        cx = float(coin_x)
+        cy = float(coin_y)
+        bottom_strict_rows = float(getattr(config, "COIN_PATH_ROI_BOTTOM_STRICT_ROWS", 0.0))
+        bottom_y = float(np.max(np.array(base, dtype=np.float32).reshape((-1, 2))[:, 1]))
+        if bottom_strict_rows > 0.0 and cy >= bottom_y - bottom_strict_rows:
+            path_x = self._path_x_at_y_points(base, cy)
+            if path_x is None:
+                return False
+            fixed_width = self._fixed_track_width_at_y(cy, 0.0)
+            if fixed_width <= 0.0:
+                return False
+            half_width = 0.5 * fixed_width * float(getattr(config, "COIN_PATH_HALF_WIDTH_SCALE", 1.0))
+            strict_scale = float(getattr(config, "COIN_PATH_BOTTOM_HALF_WIDTH_SCALE", 1.0))
+            half_width *= strict_scale
+            if half_width <= 0.0 or abs(float(cx) - path_x) > half_width:
+                return False
+        return True
 
     def _update_locked_coin(self, coin_measurements, base, h_seg, mask, left_boundary, right_boundary):
         """锁定当前金币；短暂跟丢时沿用旧点，超时后切换到新目标."""
@@ -2076,44 +2134,73 @@ class RoadSegmentor:
 
         if self.locked_coin is not None:
             locked_x, locked_y = self.locked_coin["point"]
+            if not self._coin_bottom_strict_point_usable(locked_x, locked_y, base):
+                self.locked_coin = None
+                self.locked_coin_miss_frames = 0
+                return []
             if locked_y >= eat_y:
                 self.locked_coin = None
                 self.locked_coin_miss_frames = 0
                 return []
-            else:
-                local_matches = [
-                    m for m in usable_for_update
-                    if abs(float(m["point"][1]) - locked_y) <= search_radius and
-                    abs(float(m["point"][0]) - locked_x) <= search_radius
-                ]
-                if local_matches:
-                    best = min(
-                        local_matches,
-                        key=lambda m: (
-                            abs(float(m["point"][1]) - locked_y),
-                            abs(float(m["point"][0]) - locked_x),
-                        ),
-                    )
-                    self.locked_coin = best
-                    self.locked_coin_miss_frames = 0
-                    return _append_future_coins(best["point"])
 
-                self.locked_coin_miss_frames += 1
-                if self.locked_coin_miss_frames <= max_miss:
-                    return _append_future_coins(self.locked_coin["point"])
+            local_matches = [
+                m for m in usable_for_update
+                if abs(float(m["point"][1]) - locked_y) <= search_radius and
+                abs(float(m["point"][0]) - locked_x) <= search_radius
+            ]
+            if local_matches:
+                best = min(
+                    local_matches,
+                    key=lambda m: (
+                        abs(float(m["point"][1]) - locked_y),
+                        abs(float(m["point"][0]) - locked_x),
+                    ),
+                )
+                self.locked_coin = best
+                self.locked_coin_miss_frames = 0
+                best_x, best_y = best["point"]
+                if not self._coin_bottom_strict_point_usable(best_x, best_y, base):
+                    self.locked_coin = None
+                    self.locked_coin_miss_frames = 0
+                    return []
+                return _append_future_coins(best["point"])
+
+            bottom_strict_rows = float(getattr(config, "COIN_PATH_ROI_BOTTOM_STRICT_ROWS", 0.0))
+            bottom_y = float(np.max(base[:, 1]))
+            if bottom_strict_rows > 0.0 and locked_y >= bottom_y - bottom_strict_rows:
                 self.locked_coin = None
                 self.locked_coin_miss_frames = 0
+                return []
+
+            self.locked_coin_miss_frames += 1
+            if self.locked_coin_miss_frames <= max_miss:
+                if not self._coin_bottom_strict_point_usable(locked_x, locked_y, base):
+                    self.locked_coin = None
+                    self.locked_coin_miss_frames = 0
+                    return []
+                return _append_future_coins(self.locked_coin["point"])
+            self.locked_coin = None
+            self.locked_coin_miss_frames = 0
 
         if not new_candidates:
             return []
 
-        best = max(new_candidates, key=lambda m: (float(m["point"][1]), float(m.get("score", 0.0))))
+        sorted_candidates = sorted(
+            new_candidates,
+            key=lambda m: (float(m["point"][1]), float(m.get("score", 0.0))),
+            reverse=True,
+        )
+        best = sorted_candidates[0]
+        bottom_too_close_rows = float(getattr(config, "COIN_TRACK_BOTTOM_TOO_CLOSE_ROWS", 0.0))
+        if bottom_too_close_rows > 0.0 and best["point"][1] >= float(np.max(base[:, 1])) - bottom_too_close_rows:
+            if len(sorted_candidates) > 1:
+                best = sorted_candidates[1]
         self.locked_coin = best
         self.locked_coin_miss_frames = 0
         return _append_future_coins(best["point"])
 
     def _apply_coin_path_planning(self, base_path, planning_items, w_seg, h_seg, mask=None,
-                                  left_boundary=None, right_boundary=None):
+                                  left_boundary=None, right_boundary=None, blocked_y_ranges=None):
         """只使用 coin 底部中点画点，并按这些点从底部依次分段拟合路径."""
         debug = {
             "coin_points": [],
@@ -2136,6 +2223,16 @@ class RoadSegmentor:
                 continue
             measurement = self._coin_measurement_from_item(item, w_seg, h_seg)
             if measurement is not None:
+                cy = float(measurement["point"][1])
+                blocked = False
+                for y1, y2 in (blocked_y_ranges or []):
+                    lo = min(float(y1), float(y2))
+                    hi = max(float(y1), float(y2))
+                    if lo <= cy <= hi:
+                        blocked = True
+                        break
+                if blocked:
+                    continue
                 coin_measurements.append(measurement)
 
         coin_points = self._update_locked_coin(
@@ -2173,6 +2270,101 @@ class RoadSegmentor:
                     reference_rows = float(getattr(config, "COIN_PATH_CONTROL_REFERENCE_ROWS", band_height))
                     debug["control_gain"] = max(1.0, reference_rows / coin_distance_rows)
 
+        debug["active"] = True
+        return planned, debug
+
+    def _apply_car_avoidance_path_planning(self, base_path, planning_items, w_seg, h_seg, mask=None,
+                                           left_boundary=None, right_boundary=None):
+        """检测到 car 时，取车框左侧两角向左偏移作为绕障锚点."""
+        debug = {
+            "car_points": [],
+            "blocked_y_range": None,
+            "active": False,
+        }
+        base = np.array(base_path, dtype=np.float32).reshape((-1, 2))
+        if len(base) < 2 or not bool(getattr(config, "CAR_AVOIDANCE_ENABLED", True)):
+            return base, debug
+
+        candidates = []
+        for item in planning_items:
+            if item.get("class_name", "") != "car":
+                continue
+            if float(item.get("score", 0.0)) < float(getattr(config, "CAR_AVOIDANCE_MIN_SCORE", 0.0)):
+                continue
+            seg_box = item.get("seg_box")
+            if seg_box is None:
+                continue
+            box = np.array(seg_box, dtype=np.float32).reshape((-1, 2))
+            if len(box) < 4:
+                continue
+
+            area = float(max(0.0, np.max(box[:, 0]) - np.min(box[:, 0])) * max(0.0, np.max(box[:, 1]) - np.min(box[:, 1])))
+            max_area = float(getattr(config, "CAR_AVOIDANCE_MAX_AREA", 0.0))
+            if max_area > 0.0 and area > max_area:
+                continue
+
+            y_sorted = np.argsort(box[:, 1])
+            bottom_pts = box[y_sorted[-2:]]
+            top_pts = box[y_sorted[:2]]
+            bottom_left_x = float(np.min(bottom_pts[:, 0]))
+            top_left_x = float(np.min(top_pts[:, 0]))
+            raw_bottom_y = float(np.max(bottom_pts[:, 1]))
+            raw_top_y = float(np.min(top_pts[:, 1]))
+            anchor_ratio = float(getattr(config, "CAR_AVOIDANCE_TOP_ANCHOR_HEIGHT_RATIO", 2.0 / 3.0))
+            anchor_ratio = max(0.0, min(1.0, anchor_ratio))
+            anchor_top_y = raw_top_y + (raw_bottom_y - raw_top_y) * anchor_ratio
+            anchor_top_x = top_left_x + (bottom_left_x - top_left_x) * anchor_ratio
+            path_y_min = float(np.min(base[:, 1]))
+            path_y_max = float(np.max(base[:, 1]))
+            top_y = float(np.clip(anchor_top_y, path_y_min, path_y_max))
+            bottom_y = float(np.clip(raw_bottom_y, path_y_min, path_y_max))
+
+            offset_scale = 1.0
+            if bool(getattr(config, "CAR_AVOIDANCE_AREA_SCALE_ENABLED", False)):
+                scale_min_area = float(getattr(config, "CAR_AVOIDANCE_AREA_SCALE_MIN_AREA", 0.0))
+                scale_max_area = float(getattr(config, "CAR_AVOIDANCE_AREA_SCALE_MAX_AREA", scale_min_area))
+                scale_min = float(getattr(config, "CAR_AVOIDANCE_AREA_SCALE_MIN", 1.0))
+                scale_max = float(getattr(config, "CAR_AVOIDANCE_AREA_SCALE_MAX", 1.0))
+                if scale_max_area > scale_min_area:
+                    area_t = (area - scale_min_area) / (scale_max_area - scale_min_area)
+                    area_t = float(np.clip(area_t, 0.0, 1.0))
+                    offset_scale = scale_min + (scale_max - scale_min) * area_t
+
+            left_offset = float(getattr(config, "CAR_AVOIDANCE_TARGET_LEFT_OFFSET", 40.0)) * offset_scale
+            top_offset = float(getattr(config, "CAR_AVOIDANCE_TOP_LEFT_OFFSET", left_offset)) * offset_scale
+            candidates.append((
+                float(np.clip(anchor_top_x - top_offset, 0.0, float(w_seg - 1))),
+                top_y,
+            ))
+            skip_bottom_anchor = False
+            if bool(getattr(config, "CAR_AVOIDANCE_EDGE_SKIP_BOTTOM_ANCHOR", False)):
+                edge_margin = max(0.0, float(getattr(config, "CAR_AVOIDANCE_EDGE_MARGIN", 0.0)))
+                x_min = float(np.min(box[:, 0]))
+                x_max = float(np.max(box[:, 0]))
+                skip_bottom_anchor = x_min <= edge_margin or x_max >= float(w_seg - 1) - edge_margin
+            if not skip_bottom_anchor:
+                lead_rows = max(0.0, float(getattr(config, "CAR_AVOIDANCE_BOTTOM_LEAD_ROWS", 0.0)))
+                bottom_y = float(np.clip(raw_bottom_y + lead_rows, path_y_min, path_y_max))
+                candidates.append((
+                    float(np.clip(bottom_left_x - left_offset, 0.0, float(w_seg - 1))),
+                    bottom_y,
+                ))
+
+        if not candidates:
+            return base, debug
+
+        candidates = sorted(candidates, key=lambda pt: (float(pt[1]), float(pt[0])))
+        anchor_points = [candidates[0]]
+        if len(candidates) > 1:
+            anchor_points.append(candidates[-1])
+
+        planned, changed = self._build_segmented_coin_path(base, anchor_points, w_seg, min_anchors=2)
+        if not changed:
+            return base, debug
+
+        debug["car_points"] = anchor_points
+        ys = [float(pt[1]) for pt in anchor_points]
+        debug["blocked_y_range"] = (min(ys), max(ys))
         debug["active"] = True
         return planned, debug
 
@@ -2338,6 +2530,7 @@ class RoadSegmentor:
         best_nodes = None
         stone_branch_side = 0
         coin_path_debug = None
+        car_path_debug = None
         centerline_only_mode = bool(getattr(config, "SEG_CENTERLINE_ONLY_MODE", False))
 
         if y_fork_info.get("active"):
@@ -2478,7 +2671,8 @@ class RoadSegmentor:
             dense_y = np.clip(dense_y, 0, h_seg - 1)
 
             path_points_orig = np.vstack((dense_x, dense_y)).astype(np.float32).T
-            path_points_orig, coin_path_debug = self._apply_coin_path_planning(
+            base_path_points = path_points_orig.copy()
+            _, car_path_debug = self._apply_car_avoidance_path_planning(
                 path_points_orig,
                 planning_items,
                 w_seg,
@@ -2487,18 +2681,52 @@ class RoadSegmentor:
                 left_boundary=left_boundary_pts,
                 right_boundary=right_boundary_pts,
             )
+            car_active = car_path_debug is not None and car_path_debug.get("active")
+            blocked_y_ranges = []
+            if car_active and car_path_debug.get("blocked_y_range") is not None:
+                blocked_y_ranges.append(car_path_debug["blocked_y_range"])
+            _, coin_path_debug = self._apply_coin_path_planning(
+                path_points_orig,
+                planning_items,
+                w_seg,
+                h_seg,
+                mask=search_mask,
+                left_boundary=left_boundary_pts,
+                right_boundary=right_boundary_pts,
+                blocked_y_ranges=blocked_y_ranges,
+            )
+            merged_anchor_points = []
+            if car_active:
+                merged_anchor_points.extend(car_path_debug.get("car_points", []))
+            if coin_path_debug is not None and coin_path_debug.get("active"):
+                merged_anchor_points.extend(coin_path_debug.get("coin_points", []))
+
+            if merged_anchor_points:
+                merged_path, merged_changed = self._build_segmented_coin_path(
+                    base_path_points,
+                    merged_anchor_points,
+                    w_seg,
+                    min_anchors=2 if car_active and not (coin_path_debug and coin_path_debug.get("active")) else 3,
+                )
+                if merged_changed:
+                    path_points_orig = merged_path
+                    if coin_path_debug is not None:
+                        coin_path_debug["control_points"] = merged_path.astype(np.float32)
+                        coin_path_debug["control_coin"] = tuple(map(float, merged_path[0]))
+
+            if car_active and coin_path_debug is not None:
+                coin_path_debug.setdefault("coin_points", [])
+                coin_path_debug["coin_points"].extend(car_path_debug.get("car_points", []))
+            coin_active = coin_path_debug is not None and coin_path_debug.get("active")
             bypass_frame_jump = (
-                coin_path_debug is not None and
-                coin_path_debug.get("active") and
+                (coin_active or car_active) and
                 bool(getattr(config, "COIN_PATH_BYPASS_FRAME_JUMP", True))
             )
             if bypass_frame_jump:
                 path_jump_limited = False
             else:
                 path_points_orig, path_jump_limited = self._limit_path_frame_jump(path_points_orig)
-            if path_jump_limited or (
-                coin_path_debug is not None and coin_path_debug.get("active")
-            ):
+            if path_jump_limited or coin_active or car_active:
                 poly_coeffs = self._fit_path_poly_coeffs(
                     path_points_orig[:, 1],
                     path_points_orig[:, 0],
@@ -2512,12 +2740,14 @@ class RoadSegmentor:
                 if coin_path_debug.get("control_points") is not None:
                     control_path_points = coin_path_debug["control_points"]
             else:
-                bottom_band_points = self._select_bottom_band_control_points(path_points_orig, h_seg, band_height=96.0)
-                if bottom_band_points is not None:
-                    control_path_points = bottom_band_points
+                no_target_points = self._select_no_target_control_points(path_points_orig, h_seg)
+                if no_target_points is not None:
+                    control_path_points = no_target_points
             steer_signal = self._compute_weighted_steer_signal(control_path_points, w_seg, h_seg)
             if coin_path_debug is not None and coin_path_debug.get("active"):
                 steer_signal *= float(coin_path_debug.get("control_gain", 1.0))
+            elif not car_active:
+                steer_signal *= float(getattr(config, "STEER_SIGNAL_NO_TARGET_GAIN", 1.0))
             pts_final_orig = path_points_orig.reshape((-1, 1, 2))
             pts_final_bird = cv2.perspectiveTransform(pts_final_orig, self.M_seg)
             boundary_left_bird = cv2.perspectiveTransform(boundary_left_orig, self.M_seg)
