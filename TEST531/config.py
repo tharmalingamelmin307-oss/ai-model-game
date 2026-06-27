@@ -518,8 +518,11 @@ SERVO_CENTER = 750
 SERVO_MIN, SERVO_MAX = 590, 910
 
 # 单一转向控制量换算到舵机 PWM 的增益。
-# 当前控制量定义为：
-# “路径上每个点到图像底部中点连线的斜率 * 该点行号”的总和。
+# 当前控制量先由路径点斜率做“带远近权重的归一化平均”得到：
+#   slope = (path_x - image_bottom_center_x) / max(image_bottom_y - path_y, STEER_SIGNAL_MIN_DY)
+#   weight = path_y ** STEER_SIGNAL_ROW_WEIGHT_GAMMA
+#   steer_signal = sum(slope * weight) / sum(weight)
+# 再按普通巡线 / 金币 / 避障模式乘对应模式增益，最后乘本参数换算为 PWM。
 # 调大:
 # - 舵机转向更积极
 # - 但更容易抖或打满
@@ -535,15 +538,29 @@ STEER_SIGNAL_SPEED_GAIN = 0.002
 # 计算“点到底部中点连线斜率”时使用的最小纵向间距。
 # 作用是防止路径底部附近的点因为 dy 过小，把控制量瞬间放得过大。
 STEER_SIGNAL_MIN_DY = 8.0
+# 远近权重指数。越大，越强调靠近图像底部/车身近处的路径点；
+# 越小，远处路径点占比越高。归一化不会抹掉远近信息，主要由这个指数保留远近差异。
+STEER_SIGNAL_ROW_WEIGHT_GAMMA = 1.3
+# 归一化控制量缩放。归一化后原始 steer_signal 常为个位数，
+# 这里把它放大到更接近旧版累计控制量的显示和 PWM 调参量级。
+STEER_SIGNAL_NORMALIZED_SCALE = 3000.0
 # 额外横向偏移控制项已停用，暂不参与控制量。
 STEER_SIGNAL_BOTTOM_OFFSET_GAIN = 0.0
 STEER_SIGNAL_OFFSET_ROW_MIN_FROM_BOTTOM = 15.0
 STEER_SIGNAL_OFFSET_ROW_MAX_FROM_BOTTOM = 30.0
 # 无金币/无车时，控制只看中下部这一段，底部最靠下 30 行不参与。
+# 这两个值是分割图坐标里的 y 行号；在 416x160 输入下，60~130 表示只取中下部路径。
 STEER_SIGNAL_NO_TARGET_ROW_MIN = 60.0
 STEER_SIGNAL_NO_TARGET_ROW_MAX = 130.0
-# 无目标控制增益：补偿去掉底部 30 行后整体控制量变小的问题。
+# 无目标控制增益：只在没有金币、没有避障车时乘到 steer_signal 上。
+# 可用于补偿无目标控制行段变短、归一化后转向偏软等情况。
 STEER_SIGNAL_NO_TARGET_GAIN = 1.0
+# 金币控制增益：只在 coin 路径规划 active 时生效。
+# 注意金币自身还可能有距离相关的 control_gain，这里是额外的全局模式增益。
+STEER_SIGNAL_COIN_GAIN = 1.0
+# 避障车控制增益：只在 car 避障 active 且没有 coin 控制接管时生效。
+# 如果避障路径已经画得够左但舵机反应偏小，优先调大这个值。
+STEER_SIGNAL_CAR_GAIN = 1.0
 
 
 # ---------------------------------------------------------------------------

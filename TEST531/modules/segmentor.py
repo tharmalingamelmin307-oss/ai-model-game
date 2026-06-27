@@ -1854,7 +1854,7 @@ class RoadSegmentor:
         return planning_items
 
     def _compute_weighted_steer_signal(self, path_points, img_w, img_h):
-        """按“路径点到底部中点连线斜率 * 行号”的方式聚合单一控制量."""
+        """按“路径点到底部中点连线斜率”的加权平均聚合单一控制量."""
         if path_points is None or len(path_points) == 0:
             return 0.0
 
@@ -1863,11 +1863,16 @@ class RoadSegmentor:
         bottom_mid_x = float(img_w) / 2.0
         bottom_y = float(img_h) - 1.0
         min_dy = float(config.STEER_SIGNAL_MIN_DY)
+        row_gamma = float(getattr(config, "STEER_SIGNAL_ROW_WEIGHT_GAMMA", 1.0))
 
         dy = np.maximum(bottom_y - pts[:, 1], min_dy)
         slopes = (pts[:, 0] - bottom_mid_x) / dy
-        row_weights = np.clip(pts[:, 1], 0.0, bottom_y)
-        slope_signal = float(np.sum(slopes * row_weights))
+        row_weights = np.power(np.clip(pts[:, 1], 0.0, bottom_y), row_gamma)
+        weight_sum = float(np.sum(row_weights))
+        if weight_sum <= 1e-6:
+            return 0.0
+        slope_signal = float(np.sum(slopes * row_weights) / weight_sum)
+        slope_signal *= float(getattr(config, "STEER_SIGNAL_NORMALIZED_SCALE", 1.0))
 
         # 底部额外偏移项先停用，仅保留主斜率累计控制量。
         return slope_signal
@@ -2746,6 +2751,9 @@ class RoadSegmentor:
             steer_signal = self._compute_weighted_steer_signal(control_path_points, w_seg, h_seg)
             if coin_path_debug is not None and coin_path_debug.get("active"):
                 steer_signal *= float(coin_path_debug.get("control_gain", 1.0))
+                steer_signal *= float(getattr(config, "STEER_SIGNAL_COIN_GAIN", 1.0))
+            elif car_active:
+                steer_signal *= float(getattr(config, "STEER_SIGNAL_CAR_GAIN", 1.0))
             elif not car_active:
                 steer_signal *= float(getattr(config, "STEER_SIGNAL_NO_TARGET_GAIN", 1.0))
             pts_final_orig = path_points_orig.reshape((-1, 1, 2))
