@@ -11,8 +11,6 @@
 
 from pathlib import Path
 
-import numpy as np
-
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
@@ -145,19 +143,21 @@ LIMIT_SIGN_ENABLED = False
 # - 更早开始识别
 # - 但远距离误判风险会上升
 # detv3 输入从 detv2 的 768x576 换到 512x384，面积类门槛按输入面积比例缩放。
-OCR_AREA_TRIGGER_SCALE = (512 * 384) / (768 * 576)
-OCR_MIN_SIGN_BOX_AREA = int(round(40 * 160 * OCR_AREA_TRIGGER_SCALE))
+# 50 * 100 * (512 * 384) / (768 * 576) = 2222。
+OCR_MIN_SIGN_BOX_AREA = 6000
 
 # 限速牌在进入 OCR 前，框的最小面积阈值。
 # 限速牌通常数字更集中，所以可以比普通语义牌略微放宽一点。
-OCR_MIN_LIMIT_SIGN_BOX_AREA = int(round(45 * 45 * OCR_AREA_TRIGGER_SCALE))
+# 45 * 45 * (512 * 384) / (768 * 576) = 900。
+OCR_MIN_LIMIT_SIGN_BOX_AREA = 900
 
 # 限速牌开始“正式生效判定”的面积阈值。
 # 当 limit_sign 框面积大于这个值时，系统认为牌子已经足够近：
 # - 不再继续对这个牌子做 OCR
 # - 转而从前面累计到的历史 OCR 结果里挑选最可靠的候选来生效
 # 这个值应明显大于 OCR_MIN_LIMIT_SIGN_BOX_AREA，给系统留出“远处多帧观察”的时间。
-LIMIT_SIGN_APPLY_MIN_AREA = int(round(80 * 80 * OCR_AREA_TRIGGER_SCALE))
+# 80 * 80 * (512 * 384) / (768 * 576) = 2844。
+LIMIT_SIGN_APPLY_MIN_AREA = 2844
 
 # sign / limit_sign 在进入 OCR 前，四周需要保留的最小边距比例。
 # 例如 0.03 表示检测框四边都要距离画面边界至少 3% 的宽/高。
@@ -302,30 +302,6 @@ SEG_PREVIEW_OVERLAY_DIFF_THRESH = 24
 
 
 # ---------------------------------------------------------------------------
-# 逆透视与物理尺度
-# ---------------------------------------------------------------------------
-# 逆透视输入四点，使用相对比例表达。
-# 程序初始化时会乘以 SEG_SIZE，换成真实像素坐标。
-# 这样做的好处是换分辨率时不需要重写一整套点位。
-# 这些点决定“前视图的哪块区域”会被拉成鸟瞰图，对最终路径形状和转向控制量影响很大。
-SRC_PTS = np.float32([
-    [0.432, 0.546],
-    [0.566, 0.547],
-    [0.856, 0.967],
-    [0.175, 0.960],
-])
-
-# 逆透视输出四点，仍然用相对比例表达。
-# 这组点定义了赛道在鸟瞰图里被拉到什么位置、什么宽度。
-# 如果这里不合适，路径看起来可能是歪的，控制量也会跟着偏。
-DST_PTS = np.float32([
-    [0.400, 0.600],
-    [0.600, 0.600],
-    [0.600, 1.000],
-    [0.400, 1.000],
-])
-
-# ---------------------------------------------------------------------------
 # 路径规划与避障相关参数
 # ---------------------------------------------------------------------------
 # 上方分支里，一段白色区域至少要有多少像素宽，才算一个有效分支。
@@ -466,8 +442,8 @@ SEG_FIXED_WIDTHS_320_SMOOTH = [
 # - 更容易把宽车道或轻微岔开也当成分叉
 PATH_LOCK_FORK_MIN_SEP = 36.0
 
-# 会被投影到分割/鸟瞰图平面里的“规划相关类别”。
-# 当前这些目标暂时主要用于调试显示，不直接改写主路径。
+# 会被映射到分割平面里的“规划相关类别”。
+# car 用于避车状态机，coin 用于金币路径规划，stone 用于分支选择，其它类别预留给场景逻辑。
 PLANNING_CLASS_NAMES = (
     "car",
     "coin",
@@ -475,27 +451,6 @@ PLANNING_CLASS_NAMES = (
     "stone",
     "door",
 )
-
-# 在鸟瞰图里额外画半径圈的类别。
-# 这些类别通常体积感更强，画圈更容易判断它们对路径的潜在影响范围。
-PLANNING_CIRCLE_CLASS_NAMES = (
-    "car",
-    "person",
-)
-
-# 鸟瞰图调试点的显示风格。
-# 格式:
-#   class_name: {"color": (B, G, R), "label": "text"}
-# 只影响可视化，不影响控制逻辑。
-PLANNING_MARKER_STYLES = {
-    "car": {"color": (0, 0, 255), "label": "car"},
-    "coin": {"color": (0, 255, 255), "label": "coin"},
-    "person": {"color": (255, 80, 80), "label": "person"},
-    "stone": {"color": (0, 165, 255), "label": "stone"},
-    "door": {"color": (255, 180, 0), "label": "door"},
-    "zebra_crossing": {"color": (255, 255, 255), "label": "zebra"},
-}
-
 
 # ---------------------------------------------------------------------------
 # 串口与控制参数
@@ -544,10 +499,6 @@ STEER_SIGNAL_ROW_WEIGHT_GAMMA = 1.3
 # 归一化控制量缩放。归一化后原始 steer_signal 常为个位数，
 # 这里把它放大到更接近旧版累计控制量的显示和 PWM 调参量级。
 STEER_SIGNAL_NORMALIZED_SCALE = 3000.0
-# 避障车额外横向偏移控制项。
-# car 避障路径会相对“当前选中道路原始基础循线路径”产生横向位移；
-# 这里把每个控制行的横向偏移量单独累加进控制量，弥补只看斜率时横移响应偏弱的问题。
-STEER_SIGNAL_CAR_LATERAL_OFFSET_GAIN = 1000.0
 # 无金币/无车时，控制只看中下部这一段，底部最靠下 30 行不参与。
 # 这两个值是分割图坐标里的 y 行号；在 416x160 输入下，60~130 表示只取中下部路径。
 STEER_SIGNAL_NO_TARGET_ROW_MIN = 60.0
@@ -559,7 +510,7 @@ STEER_SIGNAL_NO_TARGET_GAIN = 1.0
 # 注意金币自身还可能有距离相关的 control_gain，这里是额外的全局模式增益。
 STEER_SIGNAL_COIN_GAIN = 1.0
 # 避障车控制增益：只在 car 避障 active 且没有 coin 控制接管时生效。
-# 如果避障路径已经画得够左但舵机反应偏小，优先调大这个值。
+# 如果中心偏移已经足够但舵机反应偏小，优先调大这个值。
 STEER_SIGNAL_CAR_GAIN = 1.0
 
 
@@ -680,6 +631,10 @@ LOG_INTERVAL_SPEED_LIMIT_EFFECTIVE = 2.0
 
 # 路牌达到 OCR 识别条件、任务真正入队时的日志节流。
 LOG_INTERVAL_OCR_ENTER = 2.0
+
+# OCR 原始结果调试日志节流。
+# 现场排查“到底读到了什么 / 为什么没有读到文字”时可以调小到 0。
+LOG_INTERVAL_OCR_RAW = 0.5
 
 # LEFT / RIGHT 语义路牌生效时的日志节流。
 LOG_INTERVAL_TURN_INTENT = 2.0
@@ -876,6 +831,13 @@ OCR_DET_MIN_CONTOUR_AREA = 100.0
 OCR_DET_DILATE_KERNEL_SIZE = 3
 OCR_DET_DILATE_ITERATIONS = 2
 
+# OCR 调试图保存。只在排查 rec 空文本时打开。
+# 打开后会保存 OCR det 拉正后的 crop，不改变识别流程。
+OCR_DEBUG_SAVE_EMPTY_CROPS = True
+OCR_DEBUG_SAVE_DIR = str(PROJECT_ROOT / "debug_ocr")
+OCR_DEBUG_SAVE_MAX_IMAGES = 30
+
+
 
 # ---------------------------------------------------------------------------
 # YOLO 预处理与解析参数
@@ -903,7 +865,7 @@ YOLO_PRE_NMS_TOPK_PER_CLASS = 80
 SEG_EMA_ALPHA = 0.6
 
 # 相邻帧路径稳定约束。
-# 这组参数工作在 SEG_SIZE 的 320x320 路径平面里，用来防止分割噪声或分叉候选切换
+# 这组参数工作在 SEG_SIZE 路径平面里，用来防止分割噪声或分叉候选切换
 # 造成路径横向瞬间跳变。
 # - MAX_FRAME_X_JUMP: 最终输出路径每帧允许横向移动的最大像素量，设为 0 可关闭限幅
 # - TEMPORAL_SCORE_GAIN: 候选路径相对上一帧偏移越大，打分扣得越多
@@ -1023,47 +985,29 @@ COIN_PATH_CONTROL_REFERENCE_ROWS = 96.0
 TRACK_WIDTH_LOG_INTERVAL = 1.5
 
 # ---------------------------------------------------------------------------
-# 车辆避障路径参数
+# 车辆避障控制参数
 # 这组参数工作在分割输入 `SEG_SIZE = 416x160` 的坐标系里。
 # y 方向是 160 行高度，所有 `*_ROWS` 都是“离底部多少行”的意思。
-# 当前策略不是“看不见车就立刻回正”，而是先走 `AVOIDING`，再等 `CLEAR`
-# 条件满足后分两段回正，避免车尾擦到障碍物。
+# 当前策略不再把 car 作为锚点重画绕车路径，而是用状态机输出
+# `center_bias_x`，在控制计算时临时偏移车身对齐基准。
+# 看不见车后不立刻回正，而是先走 `CLEARING`，再逐步衰减偏置。
 # ---------------------------------------------------------------------------
-# 检测到 car 时，把车框左侧两个角点向左偏移后作为避障目标点。
-# 这些目标点会像金币锚点一样插入路径，使车优先从障碍车左侧绕过。
 CAR_AVOIDANCE_ENABLED = True
-CAR_AVOIDANCE_TARGET_LEFT_OFFSET = 50.0
-CAR_AVOIDANCE_TOP_LEFT_OFFSET = 50.0
-# 当障碍车位于当前基础循线路径右侧时，避障目标点至少压到基础线左侧这么多像素。
-CAR_AVOIDANCE_RIGHT_OBSTACLE_MIN_LEFT_OFFSET = 20.0
-CAR_AVOIDANCE_TOP_ANCHOR_HEIGHT_RATIO = 1.0 / 3.0
-CAR_AVOIDANCE_AREA_SCALE_ENABLED = False
-CAR_AVOIDANCE_AREA_SCALE_MIN_AREA = 0.0
-CAR_AVOIDANCE_AREA_SCALE_MAX_AREA = 14000.0
-CAR_AVOIDANCE_AREA_SCALE_MIN = 1.2
-CAR_AVOIDANCE_AREA_SCALE_MAX = 1.8
-CAR_AVOIDANCE_EDGE_SKIP_BOTTOM_ANCHOR = True
-CAR_AVOIDANCE_EDGE_MARGIN = 8.0
-CAR_AVOIDANCE_BOTTOM_LEAD_ROWS = 12.0
-CAR_AVOIDANCE_BOTTOM_NEAR_ROWS = 12.0
 # 固定分段偏移：检测框底部离画面底部 150 行内开始左偏 60，
 # 80 行内左偏 90。贴右下角且高度较矮时单独固定左偏 50。
-CAR_AVOIDANCE_DYNAMIC_OFFSET_ENABLED = False
 CAR_AVOIDANCE_START_OFFSET_ROWS = 150.0
 CAR_AVOIDANCE_START_LEFT_OFFSET = 60.0
 CAR_AVOIDANCE_NEAR_OFFSET_ROWS = 50.0
 CAR_AVOIDANCE_NEAR_LEFT_OFFSET = 90.0
 # car 跟踪锁定。锁定主要看车框底部中心点的连续性，面积只做异常框过滤。
-# 连续命中后进入避障；退出时要等 `car` 丢失且路径稳定并越过障碍范围，
-# 然后先轻微回正，再慢慢回到普通巡线。
+# 连续命中后进入避障；短暂漏检会继续沿用锁定目标，超过允许帧数后进入 CLEARING。
 CAR_AVOIDANCE_LOCK_HIT_FRAMES = 2
 CAR_AVOIDANCE_SEARCH_RADIUS = 48.0
 CAR_AVOIDANCE_SEARCH_RADIUS_MISS_GAIN = 16.0
 CAR_AVOIDANCE_TRACK_EMA_ALPHA = 0.65
-# car 框短暂变小、被遮挡或漏检时，继续沿用最近一次避障锚点的帧数。
+# car 框短暂变小、被遮挡或漏检时，继续沿用最近一次锁定目标的帧数。
 # 调大可避免太早回正；过大会让已经绕过车后继续偏左太久。
 CAR_AVOIDANCE_MISS_FRAMES = 5
-CAR_AVOIDANCE_MASK_RADIUS = 10
 CAR_AVOIDANCE_MIN_SCORE = 0.0
 CAR_AVOIDANCE_MAX_AREA = 0.0
 
@@ -1093,66 +1037,82 @@ CAR_AVOIDANCE_CLEARING_COIN_SAFE_ROWS = 16.0
 # - 只保留落在当前路径纵向范围内、附近有 mask、且离当前中线不超过赛道半宽的金币点
 # - 路径按“底部路径点 -> 金币点 -> 最远路径点”从近到远分段重采样
 COIN_PATH_ENABLED = True
+# 新锁定金币必须位于这个 y 行以下，防止太远的金币过早拉动路径。
 COIN_PATH_ROI_Y_MIN = 15
 # coin 底部边缘严格区。靠近分割输入底边时，用“当前路径中线 +/- 赛道半宽”
 # 再额外收窄，压掉车尾/路边被误识别成 coin 的情况。
 COIN_PATH_ROI_BOTTOM_STRICT_ROWS = 80
+# 底部严格区内的赛道半宽缩放，越小越严格。
 COIN_PATH_BOTTOM_HALF_WIDTH_SCALE = 0.42
+# 是否过滤底部严格区里贴近左右边缘的 coin 框。
 COIN_PATH_EDGE_REJECT_ENABLED = True
+# 判断 coin 框贴边的边距，单位是分割平面像素。
 COIN_PATH_EDGE_REJECT_MARGIN = 8.0
+# coin 底部点附近必须有 mask 的搜索半径，单位是分割平面像素。
 COIN_PATH_MASK_RADIUS = 10
+# 普通 coin 横向合法区域的赛道半宽缩放，1.0 表示使用完整半宽。
 COIN_PATH_HALF_WIDTH_SCALE = 1.0
+# coin 或 car 接管控制时是否跳过相邻帧路径横跳限幅，避免目标路径被限幅拖慢。
 COIN_PATH_BYPASS_FRAME_JUMP = True
 # 金币锁定/过滤参数。新目标不做连续帧确认，但锁定后允许短暂丢失沿用。
+# 锁定 coin 丢失后最多沿用多少帧。
 COIN_TRACK_MAX_MISS_FRAMES = 2
+# 锁定 coin 与新检测点匹配的最大 x/y 搜索半径。
 COIN_TRACK_SEARCH_RADIUS = 36.0
+# coin 检测框最大面积，超过则认为太近或异常，不参与锁定。
 COIN_TRACK_MAX_AREA = 2400.0
+# coin 底部点距离画面底部小于这个值时，认为已经吃到，释放锁定。
 COIN_TRACK_EAT_Y_MARGIN = 6.0
+# 新目标如果太贴近底部，优先跳过它改锁下一个金币，避免临场急打方向。
 COIN_TRACK_BOTTOM_TOO_CLOSE_ROWS = 8.0
 
-# 鸟瞰图上规划目标点的调试样式参数。
-SEG_DEBUG_PLANNING_DOT_RADIUS = 4
-SEG_DEBUG_PLANNING_MIN_RADIUS = 4
-SEG_DEBUG_PLANNING_TEXT_OFFSET_X = 6
-SEG_DEBUG_PLANNING_TEXT_OFFSET_Y = -6
-SEG_DEBUG_PLANNING_TEXT_MIN_Y = 12
-SEG_DEBUG_PLANNING_TEXT_FONT_SCALE = 0.4
-SEG_DEBUG_PLANNING_TEXT_THICKNESS = 1
-
-# 主分割调试图与鸟瞰图小窗的绘制风格。
+# 主分割调试图绘制风格。
+# 最终路径线颜色。
 SEG_DEBUG_PATH_COLOR = (255, 0, 255)
+# 最终路径线粗细。
 SEG_DEBUG_PATH_THICKNESS = 2
+# 是否绘制候选左右路径，用于排查分支选择。
 SEG_DEBUG_DRAW_CANDIDATE_PATHS = False
+# 是否绘制当前选中路径的左右边界。
 SEG_DEBUG_DRAW_BOUNDARIES = True
+# 是否绘制汇合补线引导线。
 SEG_DEBUG_DRAW_MERGE_GUIDE = False
+# 左候选路径颜色。
 SEG_DEBUG_LEFT_PATH_COLOR = (255, 255, 0)
+# 右候选路径颜色。
 SEG_DEBUG_RIGHT_PATH_COLOR = (0, 200, 255)
+# 候选路径线粗细。
 SEG_DEBUG_CANDIDATE_PATH_THICKNESS = 1
+# 左边界颜色。
 SEG_DEBUG_LEFT_BOUNDARY_COLOR = (255, 255, 0)
+# 右边界颜色。
 SEG_DEBUG_RIGHT_BOUNDARY_COLOR = (0, 165, 255)
+# 左右边界线粗细。
 SEG_DEBUG_BOUNDARY_THICKNESS = 2
-SEG_DEBUG_BIRD_PATH_COLOR = (0, 0, 255)
-SEG_DEBUG_BIRD_PATH_THICKNESS = 2
-SEG_DEBUG_BIRD_LEFT_BOUNDARY_COLOR = (255, 255, 0)
-SEG_DEBUG_BIRD_RIGHT_BOUNDARY_COLOR = (0, 165, 255)
-SEG_DEBUG_BIRD_BOUNDARY_THICKNESS = 2
+# 底部车身参考点颜色。
 SEG_DEBUG_BOTTOM_MID_COLOR = (255, 255, 0)
+# 底部车身参考点半径。
 SEG_DEBUG_BOTTOM_MID_RADIUS = 4
+# Y 岔路分界线颜色。
 SEG_DEBUG_FORK_DIVIDER_COLOR = (0, 255, 0)
+# Y 岔路分界线粗细。
 SEG_DEBUG_FORK_DIVIDER_THICKNESS = 1
+# 汇合引导线颜色。
 SEG_DEBUG_MERGE_GUIDE_COLOR = (255, 255, 255)
+# 汇合引导线粗细。
 SEG_DEBUG_MERGE_GUIDE_THICKNESS = 2
+# 是否绘制 coin 规划路径与 coin 点。
 SEG_DEBUG_COIN_PATH_ENABLED = True
+# coin 规划线和点颜色。
 SEG_DEBUG_COIN_PATH_COLOR = (0, 255, 255)
+# coin 锚点圆点半径。
 SEG_DEBUG_COIN_PATH_DOT_RADIUS = 4
+# 是否绘制 coin 底部严格区分界线。
 SEG_DEBUG_COIN_BOTTOM_STRICT_LINE_ENABLED = True
+# coin 底部严格区分界线颜色。
 SEG_DEBUG_COIN_BOTTOM_STRICT_LINE_COLOR = (0, 0, 255)
+# coin 底部严格区分界线粗细。
 SEG_DEBUG_COIN_BOTTOM_STRICT_LINE_THICKNESS = 1
-SEG_DEBUG_PIP_DIVISOR = 3
-SEG_DEBUG_PIP_BORDER_COLOR = (255, 255, 255)
-SEG_DEBUG_PIP_BORDER_THICKNESS = 1
-SEG_DEBUG_DRAW_BIRD_VIEW = False
-SEG_DEBUG_DRAW_PLANNING_POINTS = True
 
 # 分割调试图左上角文字的字号、位置与颜色。
 # 这些信息主要用于现场快速确认：
@@ -1165,7 +1125,9 @@ SEG_DEBUG_TEXT_POS_FPS = (5, 18)
 SEG_DEBUG_TEXT_POS_CTRL = (5, 36)
 SEG_DEBUG_TEXT_POS_STONE = (5, 54)
 SEG_DEBUG_TEXT_POS_BRANCH = (5, 72)
+SEG_DEBUG_TEXT_POS_COIN = (5, 90)
 SEG_DEBUG_TEXT_COLOR_FPS = (0, 255, 0)
 SEG_DEBUG_TEXT_COLOR_CTRL = (0, 255, 255)
 SEG_DEBUG_TEXT_COLOR_STONE = (0, 200, 255)
 SEG_DEBUG_TEXT_COLOR_BRANCH = (255, 200, 0)
+SEG_DEBUG_TEXT_COLOR_COIN = (0, 255, 255)

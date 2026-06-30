@@ -18,6 +18,7 @@ YOLO 的 `sign / limit_sign` 现在只负责触发 OCR 和做结果关联，
 
 import cv2
 import numpy as np
+from pathlib import Path
 from rknnlite.api import RKNNLite
 
 import config
@@ -51,6 +52,31 @@ class OCRRecognizer:
         self.det_binary_thresh = float(config.OCR_DET_BINARY_THRESH)
         self.det_min_contour_area = float(config.OCR_DET_MIN_CONTOUR_AREA)
         self.last_det_box_count = 0
+        self.last_rec_empty_count = 0
+        self.last_rec_exception_count = 0
+        self.last_rec_valid_count = 0
+        self.debug_saved_count = 0
+
+    def _save_debug_crop(self, crop, box, text_tag):
+        """保存 OCR det 裁出的文本图，用于排查 rec 空文本。"""
+        if not bool(getattr(config, "OCR_DEBUG_SAVE_EMPTY_CROPS", False)):
+            return
+        max_images = int(getattr(config, "OCR_DEBUG_SAVE_MAX_IMAGES", 30))
+        if self.debug_saved_count >= max_images:
+            return
+        if crop is None or crop.size == 0:
+            return
+
+        debug_dir = Path(getattr(config, "OCR_DEBUG_SAVE_DIR", "debug_ocr"))
+        debug_dir.mkdir(parents=True, exist_ok=True)
+
+        pts = np.array(box, dtype=np.float32)
+        x_min = int(np.min(pts[:, 0])) if pts.size else 0
+        y_min = int(np.min(pts[:, 1])) if pts.size else 0
+        h, w = crop.shape[:2]
+        filename = f"{self.debug_saved_count:03d}_{text_tag}_x{x_min}_y{y_min}_w{w}_h{h}.jpg"
+        cv2.imwrite(str(debug_dir / filename), crop)
+        self.debug_saved_count += 1
 
     def _decode(self, preds):
         """把识别模型输出按 CTC 规则解码成字符串和平均置信度。"""
@@ -159,6 +185,9 @@ class OCRRecognizer:
         """
         boxes = self.run_text_detection(image_bgr)
         self.last_det_box_count = len(boxes)
+        self.last_rec_empty_count = 0
+        self.last_rec_exception_count = 0
+        self.last_rec_valid_count = 0
         results = []
 
         for box in boxes:
@@ -167,14 +196,18 @@ class OCRRecognizer:
                 text, score = self.run_single_crop(crop)
                 text = text.strip().upper()
                 if not text:
+                    self.last_rec_empty_count += 1
+                    self._save_debug_crop(crop, box, "empty")
                     continue
 
+                self.last_rec_valid_count += 1
                 results.append({
                     "points": np.array(box, dtype=np.float32),
                     "text": text,
                     "score": float(score),
                 })
             except Exception:
+                self.last_rec_exception_count += 1
                 continue
 
         return results

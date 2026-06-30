@@ -172,6 +172,21 @@ def print_preview_url():
     print(f"AI推流网页: http://{host}:{config.STREAM_PORT}/", flush=True)
 
 
+def print_runtime_config_summary():
+    """启动时打印关键运行路径和 OCR 参数，避免现场跑到旧目录还没发现."""
+    print(
+        "运行配置: "
+        f"main={__file__} "
+        f"config={getattr(config, '__file__', 'unknown')} "
+        f"OCR_MIN_SIGN_BOX_AREA={config.OCR_MIN_SIGN_BOX_AREA} "
+        f"OCR_DET_INPUT_SIZE={config.OCR_DET_INPUT_SIZE} "
+        f"OCR_DET_BINARY_THRESH={config.OCR_DET_BINARY_THRESH} "
+        f"OCR_DET_MIN_CONTOUR_AREA={config.OCR_DET_MIN_CONTOUR_AREA} "
+        f"OCR_MIN_SCORE={config.OCR_MIN_SCORE}",
+        flush=True,
+    )
+
+
 def make_seg_input(frame_rgb):
     """按当前分割模型约定生成 RGB 输入图."""
     crop_ratio = float(getattr(config, "SEG_INPUT_CROP_TOP_RATIO", 0.0))
@@ -734,6 +749,13 @@ def yolo_worker():
                     limit_sign_seen = True
                 should_enqueue, skip_reason = should_enqueue_ocr_job(cls_id, rect)
                 if not should_enqueue:
+                    if cls_id == config.SIGN_CLASS_ID:
+                        throttled_log(
+                            "ocr_sign_skip",
+                            f"语义路牌未进OCR: 原因={skip_reason} rect={rect}",
+                            state=skip_reason,
+                            min_interval=config.LOG_INTERVAL_OCR_ENTER
+                        )
                     if (
                         cls_id == config.LIMIT_SIGN_CLASS_ID and
                         skip_reason.startswith("ready_to_apply_history")
@@ -858,7 +880,38 @@ def ocr_worker():
             # 这里跑的是整图 OCR，再把结果按中心点回匹配给 sign_jobs。
             ocr_results = ocr.run_full_frame(frame_data)
             if not ocr_results:
+                throttled_log(
+                    "ocr_no_results",
+                    "OCR无有效文本: "
+                    f"det_boxes={getattr(ocr, 'last_det_box_count', 0)} "
+                    f"rec_empty={getattr(ocr, 'last_rec_empty_count', 0)} "
+                    f"rec_ex={getattr(ocr, 'last_rec_exception_count', 0)} "
+                    f"rec_valid={getattr(ocr, 'last_rec_valid_count', 0)} "
+                    f"jobs={len(sign_jobs)}",
+                    state=(
+                        getattr(ocr, "last_det_box_count", 0),
+                        getattr(ocr, "last_rec_empty_count", 0),
+                        getattr(ocr, "last_rec_exception_count", 0),
+                        getattr(ocr, "last_rec_valid_count", 0),
+                        len(sign_jobs),
+                    ),
+                    min_interval=config.LOG_INTERVAL_OCR_RAW
+                )
                 continue
+
+            min_ocr_score = float(config.OCR_MIN_SCORE)
+            raw_texts = [
+                f"{str(result.get('text', '')).strip()}:{float(result.get('score', 0.0)):.3f}"
+                for result in ocr_results
+                if float(result.get("score", 0.0)) >= min_ocr_score
+            ]
+            if raw_texts:
+                throttled_log(
+                    "ocr_raw_results",
+                    f"OCR整图原始结果: {raw_texts}",
+                    state=tuple(raw_texts),
+                    min_interval=config.LOG_INTERVAL_OCR_RAW
+                )
 
             used_result_ids = set()
             for idx, cls_id, rect in sign_jobs:
@@ -877,6 +930,12 @@ def ocr_worker():
                             best_match = (result_id, result)
 
                     if best_match is None:
+                        throttled_log(
+                            "ocr_match_missing",
+                            f"OCR无可匹配文本: sign_rect={rect} 文本框={len(ocr_results)}",
+                            state=(idx, len(ocr_results)),
+                            min_interval=config.LOG_INTERVAL_OCR_RAW
+                        )
                         continue
 
                     result_id, result = best_match
@@ -884,10 +943,23 @@ def ocr_worker():
                     text = str(result.get("text", "")).strip().upper()
                     score = float(result.get("score", 0.0))
 
-                    if not text:
+                    if score < min_ocr_score:
                         continue
 
-                    if score < float(config.OCR_MIN_SCORE):
+                    throttled_log(
+                        "ocr_sign_match_raw",
+                        f"OCR匹配到sign: 文本={text or '<空>'} 置信度={score:.3f} 距离平方={best_dist:.1f} rect={rect}",
+                        state=(idx, text, round(score, 3)),
+                        min_interval=config.LOG_INTERVAL_OCR_RAW
+                    )
+
+                    if not text:
+                        throttled_log(
+                            "ocr_empty_text",
+                            f"OCR匹配结果为空文本: 置信度={score:.3f} rect={rect}",
+                            state=idx,
+                            min_interval=config.LOG_INTERVAL_OCR_RAW
+                        )
                         continue
 
                     updates.append((idx, cls_id, text, score))
@@ -895,6 +967,12 @@ def ocr_worker():
                     log_once("ocr_single_box_error", f"OCR单框处理异常: {e}")
 
             if not updates:
+                throttled_log(
+                    "ocr_no_updates",
+                    f"OCR未形成有效更新: 文本框={len(ocr_results)} jobs={len(sign_jobs)}",
+                    state=(len(ocr_results), len(sign_jobs)),
+                    min_interval=config.LOG_INTERVAL_OCR_RAW
+                )
                 continue
 
             # 回写时再做一次 class_id 检查，避免队列延迟导致“框已经换帧”的情况。
@@ -916,10 +994,11 @@ def ocr_worker():
                     if job_cls_id == sign_class_id:
                         last_turn_fid = int(global_control_data.get("turn_intent_fid", -1))
                         if int(frame_id) >= last_turn_fid:
+                            matched_class = class_name_from_id(job_cls_id)
                             throttled_log(
-                                f"ocr_sign_result_{text}",
-                                f"路牌识别结果: 文本={text} 置信度={score:.3f}",
-                                state=text,
+                                "ocr_sign_result",
+                                f"路牌识别结果: 类型={matched_class} 文本={text} 置信度={score:.3f}",
+                                state=(matched_class, text),
                                 min_interval=config.LOG_INTERVAL_OCR_ENTER
                             )
                             if text == "LEFT":
@@ -946,10 +1025,11 @@ def ocr_worker():
                             if not digit_text:
                                 continue
 
+                            matched_class = class_name_from_id(job_cls_id)
                             throttled_log(
-                                f"ocr_limit_result_{digit_text}",
-                                f"限速牌识别结果: 文本={digit_text} 置信度={score:.3f}",
-                                state=digit_text,
+                                "ocr_limit_result",
+                                f"限速牌识别结果: 类型={matched_class} 文本={digit_text} 置信度={score:.3f}",
+                                state=(matched_class, digit_text),
                                 min_interval=config.LOG_INTERVAL_OCR_ENTER
                             )
 
@@ -1664,6 +1744,7 @@ if __name__ == "__main__":
     """按模块顺序启动所有线程和 Flask 服务."""
     install_rknn_warning_filter()
     print_preview_url()
+    print_runtime_config_summary()
 
     threading.Thread(target=ai_producer_thread, daemon=True).start()
     threading.Thread(target=serial_control_thread, daemon=True).start()

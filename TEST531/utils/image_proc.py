@@ -8,6 +8,22 @@
 import cv2
 import numpy as np
 
+
+def order_points_clockwise(points):
+    """把四点框整理为左上、右上、右下、左下顺序。"""
+    points = np.array(points, dtype=np.float32)
+    rect = np.zeros((4, 2), dtype=np.float32)
+
+    s = points.sum(axis=1)
+    rect[0] = points[np.argmin(s)]
+    rect[2] = points[np.argmax(s)]
+
+    diff = np.diff(points, axis=1).reshape(-1)
+    rect[1] = points[np.argmin(diff)]
+    rect[3] = points[np.argmax(diff)]
+    return rect
+
+
 def get_rotate_crop_image(img, points):
     """把四点文字框透视拉正成规则文本图。
 
@@ -16,7 +32,7 @@ def get_rotate_crop_image(img, points):
     2. 用透视变换把倾斜文本拉正
     3. 如果结果明显是“竖着的长条”，再旋转成更适合 rec 的横向文本
     """
-    points = np.array(points, dtype=np.float32)
+    points = order_points_clockwise(points)
     # 计算目标矩形的宽高
     width = int(max(np.linalg.norm(points[0] - points[1]), 
                     np.linalg.norm(points[2] - points[3])))

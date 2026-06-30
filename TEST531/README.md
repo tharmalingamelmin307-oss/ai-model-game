@@ -22,7 +22,7 @@
 ├── modules/
 │   ├── detector.py        # PP-YOLOE 检测封装与后处理
 │   ├── ocr_system.py      # OCR det + rec 封装
-│   └── segmentor.py       # 分割、路径搜索、逆透视与控制量计算
+│   └── segmentor.py       # 分割、路径搜索、金币规划、避车状态机与控制量计算
 └── utils/
     └── image_proc.py      # OCR 文字框透视拉正工具
 ```
@@ -40,7 +40,7 @@
 3. `ocr_worker()`
    对整张 `TARGET_RES` 图执行 OCR `det + rec`，再把结果匹配回检测框
 4. `seg_worker()`
-   默认拆成 Seg 推理流水线和后处理流水线：当前线程做 NPU 推理，内部后处理线程做路径搜索、逆透视和控制量估计
+   默认拆成 Seg 推理流水线和后处理流水线：当前线程做 NPU 推理，内部后处理线程做路径搜索、目标规划和控制量估计
 5. `serial_control_thread()`
    把视觉结果转成速度与舵机命令发给下位机
 6. Flask 推流线程
@@ -110,7 +110,7 @@
 
 - `modules/detector.py` 输出的检测框统一映射到 `TARGET_RES`
 - `ocr_worker()` 跑 OCR 时使用的是同帧 `TARGET_RES` 大图
-- `modules/segmentor.py` 内部会把检测框从 `TARGET_RES` 投影到 `SEG_SIZE` 与鸟瞰图空间
+- `modules/segmentor.py` 内部会把检测框从 `TARGET_RES` 映射到 `SEG_SIZE`，供 `coin / car / stone` 等规划逻辑使用
 
 ## 模块与链路说明
 
@@ -277,7 +277,8 @@
 14. 如果没有明确石头干预，则默认偏向左支；如果 OCR 给出 `turn_intent`，再用 `LEFT / RIGHT` 覆盖默认偏向
 15. 对最终路径做多项式拟合
 16. 对拟合系数做 EMA 平滑
-17. 将拟合路径转换成单一 `steer_signal`，并渲染调试图
+17. 结合金币规划和避车状态机选择控制路径或控制中心偏移
+18. 将路径转换成单一 `steer_signal`，并渲染调试图
 
 当前输出：
 
@@ -297,7 +298,23 @@
 - 当前代码里 `stone` 已经会参与左右分支选择，但还没有进一步写成更复杂的代价场避障
 - 真正直接参与主分支选择的，当前是“候选路径打分 + `stone` 左右关系 + `turn_intent` 左右偏向覆盖”
 
-### 8. 红绿灯与斑马线逻辑
+### 8. 车辆避障逻辑
+
+当前避障不是“检测到车就一路加大左偏，丢车就立刻回正”，而是一个轻量状态机：
+
+1. 先锁定同一辆车，锁定依据主要看车框底部中心点连续性
+2. 进入避障后，不重画绕车路径，而是输出 `center_bias_x`
+3. 控制计算时临时偏移车身对齐基准，让车辆绕开障碍车
+4. 如果绕行途中车框短暂丢失，不立即回正，而是先进入 `CLEARING`
+5. `CLEARING` 会保留一段残余偏置，再按帧数逐渐回到普通巡线中心
+
+这套做法的目的很直接：
+
+- 避免“看不见车就立刻回正”导致车尾擦碰
+- 避免收尾时一下回正过头
+- 避免车框短暂漏检导致避障状态抖动
+
+### 9. 红绿灯与斑马线逻辑
 
 当前交通灯停车链路是：
 
@@ -310,7 +327,7 @@
 7. 如果灯色变成 `green`
    就解除这个停车状态
 
-### 9. 行人停车逻辑
+### 10. 行人停车逻辑
 
 当前行人停车不走路径 ROI 过滤，触发方式和斑马线接近：
 
@@ -319,7 +336,7 @@
 3. 如果行人框底边到画面底部距离小于 `PERSON_STOP_TRIGGER_DIST`
 4. 先进入 `person_stop_active`，串口速度强制置零
 5. 停车期间持续观察行人框底部中心点
-6. 当行人底部中心连续向左移动 `PERSON_CLEAR_MOVE_FRAMES` 帧，并且行人框底边最右点已经在当前选中路的左边界外侧 `PERSON_CLEAR_LEFT_MARGIN` 以上，解除行人停车
+6. 当行人底部中心连续向左移动 `PERSON_CLEAR_MOVE_FRAMES` 帧，并且越过由 `PERSON_CLEAR_LANE_RATIO` 定义的当前车道放行线，解除行人停车
 7. 如果行人连续丢失 `PERSON_STOP_MISS_RELEASE_FRAMES` 帧，也解除行人停车
 
 关键点：
@@ -329,7 +346,7 @@
 - 同一帧 YOLO 结果不会被流水线重复计入“连续左移帧”
 - 页面上会显示 `STOP_BY_PERSON`，终端会打印行人底边距离、底边右端、左边界和连续左移放行帧数
 
-### 10. 串口控速逻辑
+### 11. 串口控速逻辑
 
 `serial_control_thread()` 当前的速度逻辑分三层：
 
@@ -350,7 +367,7 @@ target_speed = 0                                # 若红/黄灯停车或行人�
 - 限速牌只是速度上限，不会破坏弯道自动减速
 - 红黄灯停车和行人停车优先级高于限速和弯道速度
 
-### 11. 结果回写与旧帧保护
+### 12. 结果回写与旧帧保护
 
 当前系统对 OCR 结果做了两层保护，避免旧结果污染新状态：
 
@@ -362,7 +379,7 @@ target_speed = 0                                # 若红/黄灯停车或行人�
 - 旧 OCR 结果即使晚到，也不容易把新状态覆盖回去
 - 页面上显示的 OCR 文本与当前检测框更一致
 
-### 11. 终端日志
+### 13. 终端日志
 
 当前终端默认只保留低频、条件触发型日志：
 
@@ -380,7 +397,6 @@ target_speed = 0                                # 若红/黄灯停车或行人�
 
 - 分割结果
 - 规划线
-- 鸟瞰图小窗
 - YOLO 检测框
 - OCR 文本
 - 斑马线停止线
@@ -415,6 +431,305 @@ target_speed = 0                                # 若红/黄灯停车或行人�
 3. `CLASS_NAMES`
 4. `modules/detector.py` 的输出解析逻辑
 5. `DICT_PATH`
+
+## 参数调试索引
+
+`config.py` 是唯一集中调参入口。下面按功能分区列出当前参数用途；实际运行值以 `config.py` 为准。
+
+### 基础运行与模型
+
+| 参数 | 用途 |
+|---|---|
+| `PROJECT_ROOT` | 项目根目录，所有模型路径都基于它拼接 |
+| `SHM_NAME` | 上游共享内存名称，必须和采集端一致 |
+| `SHM_HEADER_SIZE` | 共享内存头部协议长度，当前固定 16 字节 |
+| `STREAM_PORT` | Flask 网页预览端口 |
+| `JPEG_QUALITY` | MJPEG 预览 JPEG 质量，影响清晰度、CPU 和带宽 |
+| `SEG_MODEL` | 分割 RKNN 模型路径 |
+| `YOLO_MODEL` | YOLO/PP-YOLOE 检测 RKNN 模型路径 |
+| `OCR_DET_MODEL_PATH` | OCR 检测模型路径 |
+| `REC_MODEL_PATH` | OCR 识别模型路径 |
+| `DICT_PATH` | OCR 字典路径 |
+| `SEG_CORES` | Seg 推理绑定的 NPU 核列表 |
+| `YOLO_CORE` | YOLO 推理绑定的 NPU 核 |
+| `REC_CORE` | OCR 推理绑定的 NPU 核 |
+
+### 类别、检测与 OCR 触发
+
+| 参数 | 用途 |
+|---|---|
+| `CLASS_NAMES` | 检测模型类别顺序，必须和模型导出顺序一致 |
+| `SIGN_CLASS_ID` | 普通语义路牌类别 id |
+| `LIMIT_SIGN_CLASS_ID` | 限速牌类别 id |
+| `LIMIT_SIGN_ENABLED` | 是否启用限速牌 OCR 与限速生效链路 |
+| `OCR_MIN_SIGN_BOX_AREA` | sign 进入 OCR 的最小框面积 |
+| `OCR_MIN_LIMIT_SIGN_BOX_AREA` | limit_sign 进入 OCR 的最小框面积 |
+| `LIMIT_SIGN_APPLY_MIN_AREA` | 限速牌从历史观察切到正式生效的面积门槛 |
+| `OCR_SIGN_EDGE_MARGIN_RATIO` | 路牌框距离画面边缘的安全边距比例 |
+| `OCR_MIN_SCORE` | OCR 文本进入主逻辑的最低平均置信度 |
+| `LIMIT_SIGN_CONFIRM_FRAMES` | 限速候选至少累计多少次才优先生效 |
+| `LIMIT_SIGN_HISTORY_MAX_MISS_FRAMES` | 限速历史在连续丢失后保留的最大帧数 |
+| `ZEBRA_STOPLINE_EXTEND_RATIO` | 斑马线停止线左右延长比例 |
+| `ZEBRA_STOPLINE_TRIGGER_DIST` | 停止线距离底部多近时触发红黄灯停车 |
+| `YOLO_CONF_THRES` | YOLO 全局默认置信度阈值 |
+| `YOLO_NMS_THRES` | YOLO NMS 阈值 |
+| `CLASS_MIN_SCORES` | 各类别单独置信度阈值 |
+| `YOLO_MAX_AREA_RATIO_BY_CLASS` | 各类别异常大框面积比例上限 |
+| `YOLO_EDGE_MARGIN_RATIO` | 判断检测框贴边的边距比例 |
+| `YOLO_EDGE_TOUCH_MAX_AREA_RATIO` | 同时贴边且面积过大时的过滤阈值 |
+| `YOLO_BOX_MIN_SIZE` | 检测框最小宽高 |
+| `YOLO_MAX_DETS` | 单帧最多保留检测框数量 |
+| `YOLO_PRE_NMS_TOPK_PER_CLASS` | NMS 前每类最多保留候选数 |
+
+### 输入尺寸与预处理
+
+| 参数 | 用途 |
+|---|---|
+| `TARGET_RES` | 系统统一显示/检测坐标系尺寸 |
+| `YOLO_SIZE` | YOLO 模型输入尺寸 |
+| `SEG_SIZE` | Seg 模型输入与路径规划坐标系尺寸 |
+| `SEG_INPUT_CROP_TOP_RATIO` | 分割输入裁掉原图上半部分的比例 |
+| `REC_HEIGHT` | OCR rec 输入高度 |
+| `REC_WIDTH` | OCR rec 输入最大宽度 |
+| `MASK_ALPHA` | 分割 mask 叠加透明度 |
+| `SEG_DEBUG_DRAW_MASK` | 是否在预览上绘制整块 mask |
+| `SEG_PREVIEW_OVERLAY_DIFF_THRESH` | Seg 渲染图叠回主预览时的差异阈值 |
+
+### 分叉、汇合与固定宽度
+
+| 参数 | 用途 |
+|---|---|
+| `FORK_MASK_MIN_BRANCH_PIXELS` | 单个分支最少白像素宽度 |
+| `FORK_MASK_GAP_THRESH` | 白区断开多宽才认为分成两支 |
+| `FORK_MIN_BRANCH_SEP` | 左右分支最小横向距离 |
+| `FORK_BOTTOM_BAND_HEIGHT` | 底部宽度判定使用的行带高度 |
+| `FORK_SCAN_Y_TOP` / `FORK_SCAN_Y_BOTTOM` | Y 岔路扫描 y 范围 |
+| `FORK_INNER_OPEN_MIN_ROWS` | 分叉缺口张开需要持续的最少行数 |
+| `FORK_INNER_OPEN_MIN_GAP_GROWTH` | 中间缺口整体增长门槛 |
+| `FORK_INNER_OPEN_MIN_SIDE_GROWTH` | 单侧内边界张开门槛 |
+| `FORK_INNER_OPEN_MIN_STEP_GAIN` | 单步张开的最小有效增量 |
+| `FORK_INNER_OPEN_MIN_POSITIVE_GAP_ROWS` | 缺口正增长的最少行数 |
+| `FORK_INNER_OPEN_MIN_POSITIVE_SIDE_ROWS` | 单侧正增长的最少行数 |
+| `FORK_INNER_OPEN_MAX_STEP_REGRESSION` | 允许的单步回退上限 |
+| `FORK_INNER_OPEN_MAX_MISS_ROWS` | 张开过程中允许缺失的最大行数 |
+| `SEG_SCENE_SCAN_BOTTOM_HEIGHT` | 汇合/场景扫描只看底部多少行 |
+| `MERGE_GUIDE_SCAN_Y_TOP` / `MERGE_GUIDE_SCAN_Y_BOTTOM` | 汇合宽带前置扫描范围 |
+| `MERGE_GUIDE_FREE_SCAN_Y_TOP` / `MERGE_GUIDE_FREE_SCAN_Y_BOTTOM` | 底部自由汇合扫描范围 |
+| `MERGE_GUIDE_MIN_ROW_WIDTH` | 认为场景足够宽的最小行宽 |
+| `MERGE_GUIDE_MIN_WIDE_ROWS` | 宽行连续命中的最少行数 |
+| `MERGE_GUIDE_MIN_SIDE_DELTA` | 汇合尖角侧边界变化门槛 |
+| `MERGE_GUIDE_MIN_INNER_ANGLE_DEG` | 汇合内边界最小角度 |
+| `MERGE_GUIDE_MIN_INNER_SHARPNESS` | 汇合内边界锐度门槛 |
+| `MERGE_GUIDE_REQUIRE_EDGE_ABOVE_INNER` | 是否要求尖角上方仍有边缘支持 |
+| `MERGE_GUIDE_MIN_EDGE_ABOVE_ROWS` | 上方边缘支持最少行数 |
+| `MERGE_GUIDE_OPPOSITE_MAX_DRIFT` | 可信对侧边界最大漂移 |
+| `MERGE_GUIDE_OPPOSITE_MAX_STEP_JUMP` | 可信对侧边界逐行最大跳变 |
+| `MERGE_GUIDE_MAX_MISS_ROWS` | 汇合特征允许缺失的最大行数 |
+| `MERGE_GUIDE_EXTEND_TOP_ROWS` / `MERGE_GUIDE_EXTEND_BOTTOM_ROWS` | 汇合补线向上/向下覆盖行数 |
+| `MERGE_GUIDE_LINE_Y_MIN` / `MERGE_GUIDE_LINE_Y_MAX` | 汇合补线允许的 y 范围 |
+| `MERGE_GUIDE_LINE_MIN_GAP` | 补线与对侧边界的最小保护间距 |
+| `MERGE_GUIDE_LINE_THICKNESS` | 汇合补线绘制粗细 |
+| `MERGE_STATE_CONFIRM_FRAMES` | 汇合连续命中多少帧才进入状态 |
+| `MERGE_STATE_EXIT_BOTTOM_ROWS` | 汇合退出时检查底部多少行 |
+| `MERGE_STATE_EXIT_WIDTH_THRESH` | 底部宽度恢复到多少才允许退出 |
+| `MERGE_STATE_EXIT_CONFIRM_FRAMES` | 汇合退出条件连续满足帧数 |
+| `MERGE_STATE_EXIT_NO_EDGE_Y_TOP` / `MERGE_STATE_EXIT_NO_EDGE_Y_BOTTOM` | 无边缘退出检查范围 |
+| `SEG_FIXED_WIDTH_SOURCE_SIZE` | 固定宽度表来源坐标系 |
+| `SEG_FIXED_WIDTH_SOURCE_CROP_TOP_RATIO` | 固定宽度表来源裁剪比例 |
+| `SEG_FIXED_WIDTHS_320` | 原始固定赛道宽度表 |
+| `SEG_FIXED_WIDTHS_320_SMOOTH` | 平滑后的固定赛道宽度表，优先用于补线 |
+| `PATH_LOCK_FORK_MIN_SEP` | 判断左右候选已经明显分叉的最小横距 |
+| `PLANNING_CLASS_NAMES` | 会映射进分割平面参与规划/场景判断的类别 |
+
+### 控制、串口与速度
+
+| 参数 | 用途 |
+|---|---|
+| `SERIAL_PORT` | 下位机串口设备名 |
+| `BAUD_RATE` | 串口波特率 |
+| `SERVO_CENTER` | 舵机中位 PWM |
+| `SERVO_MIN` / `SERVO_MAX` | 舵机 PWM 安全上下限 |
+| `STEER_SIGNAL_PWM_GAIN` | steer_signal 转舵机 PWM 的增益 |
+| `STEER_SIGNAL_SPEED_GAIN` | 根据转向幅度动态降速的增益 |
+| `STEER_SIGNAL_MIN_DY` | 斜率计算最小纵向距离 |
+| `STEER_SIGNAL_ROW_WEIGHT_GAMMA` | 路径点远近权重指数 |
+| `STEER_SIGNAL_NORMALIZED_SCALE` | 归一化 steer_signal 的整体放大系数 |
+| `STEER_SIGNAL_NO_TARGET_ROW_MIN` / `STEER_SIGNAL_NO_TARGET_ROW_MAX` | 无 coin/无 car 时控制只看这段 y 范围 |
+| `STEER_SIGNAL_NO_TARGET_GAIN` | 普通巡线模式控制增益 |
+| `STEER_SIGNAL_COIN_GAIN` | coin 路径 active 时控制增益 |
+| `STEER_SIGNAL_CAR_GAIN` | car 避障 active 时控制增益 |
+| `SERIAL_TIMEOUT` | 串口读写超时 |
+| `CONTROL_MIN_SPEED` / `CONTROL_MAX_SPEED` | 串口线程目标速度范围 |
+| `CONTROL_SPEED_SMOOTH_ENABLED` | 是否启用目标速度平滑 |
+| `CONTROL_SPEED_MAX_STEP_UP` / `CONTROL_SPEED_MAX_STEP_DOWN` | 速度单帧最大上升/下降步长 |
+| `SERIAL_PACKET_HEADER` / `SERIAL_PACKET_TAIL` | 串口协议包头包尾 |
+| `CONTROL_LOOP_SLEEP` | 串口控制循环 sleep |
+| `SHM_FRAME_POLL_SLEEP` | 共享内存轮询 sleep |
+| `SHM_RETRY_SLEEP` | 共享内存重连 sleep |
+| `VIDEO_FEED_IDLE_SLEEP` / `VIDEO_FEED_FRAME_SLEEP` | 网页推流空闲/帧间 sleep |
+| `STARTUP_SHARED_THREAD_SLEEP` / `STARTUP_SEG_THREAD_SLEEP` | 启动时线程错峰 sleep |
+| `FLASK_HOST` | Flask 监听地址 |
+| `SUPPRESS_RKNN_INIT_OUTPUT` | 是否静默 RKNN 初始化日志 |
+
+### 运行态、队列与日志
+
+| 参数 | 用途 |
+|---|---|
+| `DEFAULT_CONTROL_DATA` | 主流程控制状态默认结构 |
+| `DEFAULT_FPS_STATS` | FPS 统计默认结构 |
+| `SEG_QUEUE_MAXSIZE` | Seg 输入队列容量 |
+| `YOLO_QUEUE_MAXSIZE` | YOLO 输入队列容量 |
+| `OCR_QUEUE_MAXSIZE` | OCR 任务队列容量 |
+| `SEG_PIPELINE_ENABLED` | 是否启用 Seg 推理/后处理流水线 |
+| `SEG_PIPELINE_QUEUE_MAXSIZE` | Seg 流水线 mask 队列容量 |
+| `FPS_STATS_UPDATE_INTERVAL` | FPS 统计刷新周期 |
+| `SEG_PROFILE_LOG_ENABLED` / `SEG_PROFILE_LOG_INTERVAL` | Seg 耗时诊断日志开关和间隔 |
+| `MAIN_PROFILE_LOG_ENABLED` / `MAIN_PROFILE_LOG_INTERVAL` | 主流程耗时诊断日志开关和间隔 |
+| `LOG_INTERVAL_DEFAULT` | 默认日志节流间隔 |
+| `LOG_INTERVAL_SPEED_LIMIT_EFFECTIVE` | 限速生效日志间隔 |
+| `LOG_INTERVAL_OCR_ENTER` | OCR 入队日志间隔 |
+| `LOG_INTERVAL_TURN_INTENT` | LEFT/RIGHT 生效日志间隔 |
+| `LOG_INTERVAL_TRAFFIC_STOP_DETAIL` | 红黄灯停车日志间隔 |
+| `LOG_INTERVAL_PERSON_STOP_DETAIL` | 行人停车日志间隔 |
+| `LOG_INTERVAL_PERSON_DETECT_DETAIL` | 行人检测状态日志间隔 |
+| `LOG_INTERVAL_SERIAL_ERROR` | 串口异常日志间隔 |
+
+### 场景停车与 OCR 后处理
+
+| 参数 | 用途 |
+|---|---|
+| `ZEBRA_CROSSING_CLASS_NAME` / `PERSON_CLASS_NAME` | 斑马线/行人类别名 |
+| `TRAFFIC_LIGHT_RED_CLASS_NAME` / `TRAFFIC_LIGHT_GREEN_CLASS_NAME` / `TRAFFIC_LIGHT_YELLOW_CLASS_NAME` | 交通灯类别名 |
+| `ZEBRA_CROSSING_CLASS_ID_FALLBACK` / `PERSON_CLASS_ID_FALLBACK` | 类别名查找失败时的回退 id |
+| `TRAFFIC_LIGHT_RED_CLASS_ID_FALLBACK` / `TRAFFIC_LIGHT_GREEN_CLASS_ID_FALLBACK` / `TRAFFIC_LIGHT_YELLOW_CLASS_ID_FALLBACK` | 交通灯回退 id |
+| `PERSON_STOP_TRIGGER_DIST` | 行人底边距画面底部多近时触发停车 |
+| `PERSON_CLEAR_MOVE_FRAMES` | 行人连续左移多少帧才允许放行 |
+| `PERSON_CLEAR_MIN_LEFT_DX` | 单帧左移最小像素量 |
+| `PERSON_CLEAR_LANE_RATIO` | 行人放行线在当前车道左右边界间的位置 |
+| `PERSON_STOP_MISS_RELEASE_FRAMES` | 行人连续丢失多少帧后解除停车 |
+| `LIMIT_SIGN_EFFECTIVE_SPEED_OFFSET` | 限速牌识别值生效前扣掉的保守余量 |
+| `OCR_MATCH_INIT_DIST` | OCR 文本框匹配检测框时的初始最大距离 |
+| `OCR_DET_INPUT_SIZE` | OCR det 输入尺寸 |
+| `OCR_DET_BINARY_THRESH` | OCR det 概率图二值化阈值 |
+| `OCR_DET_MIN_CONTOUR_AREA` | OCR det 最小轮廓面积 |
+| `OCR_DET_DILATE_KERNEL_SIZE` / `OCR_DET_DILATE_ITERATIONS` | OCR det 膨胀核大小和次数 |
+
+### 路径搜索、稳定与调试
+
+| 参数 | 用途 |
+|---|---|
+| `SEG_EMA_ALPHA` | 路径拟合系数 EMA 历史权重 |
+| `SEG_PATH_STABILITY_ENABLED` | 是否启用相邻帧路径稳定约束 |
+| `SEG_PATH_MAX_FRAME_X_JUMP` | 最终路径每帧最大横向移动 |
+| `SEG_PATH_TEMPORAL_SCORE_GAIN` | 候选路径相对上一帧偏移扣分权重 |
+| `SEG_PATH_TEMPORAL_SOFT_MAX_JUMP` | 软跳变阈值 |
+| `SEG_PATH_TEMPORAL_EXCESS_SCORE_GAIN` | 超出软阈值部分的额外扣分 |
+| `SEG_PATH_TEMPORAL_MIN_OVERLAP_POINTS` | 时域打分要求的最少重叠点数 |
+| `SEG_PATH_HOLD_MISSING_FRAMES` | 当前帧无路径时沿用旧路径的最大帧数 |
+| `STONE_BRANCH_MIN_SEP` | 石头左右分支判断要求的最小分支间距 |
+| `SEG_PATH_SEARCH_STEP_Y` | 自底向上路径搜索 y 步长 |
+| `SEG_CENTERLINE_ONLY_MODE` | 是否启用快速中心线模式 |
+| `SEG_CENTERLINE_LARGEST_COMPONENT_ONLY` | 中心线模式是否只取最大连通白区 |
+| `SEG_CENTERLINE_ROW_STEP` | 中心线逐行采样步长 |
+| `SEG_PATH_GAP_THRESH` | 单行白区断开阈值 |
+| `SEG_PATH_DILATE_KERNEL` / `SEG_PATH_DILATE_ITER` | 搜索 mask 底部膨胀核和次数 |
+| `SEG_PATH_DILATE_BOTTOM_HEIGHT` | 底部膨胀影响高度 |
+| `SEG_PATH_ACTIVE_HEIGHT` | 搜索只保留底部多少行 |
+| `SEG_KEEP_BOTTOM_COMPONENTS` | 是否只保留触底连通白区 |
+| `SEG_PATH_BOTTOM_MARGIN` / `SEG_PATH_BOTTOM_TOUCH_HEIGHT` | 路径底部起点预留和触底判定高度 |
+| `SEG_PATH_SCAN_TOP_RATIO` | 搜索最高比例兜底值 |
+| `SEG_PATH_MIN_SLICE_PIXELS` | 单层最少白像素数 |
+| `SEG_PATH_MIN_BRANCH_POINTS` | 单个分支最少点数 |
+| `SEG_PATH_MIN_PAIR_WIDTH` | 有效左右边界最小宽度 |
+| `SEG_PATH_MAX_ROW_SEGMENTS` | 单行最多白区片段数 |
+| `SEG_PATH_CONNECT_X_THRESH` | 相邻层中心点连接横向阈值 |
+| `SEG_PATH_CONNECT_OVERLAP_MARGIN` | 相邻层边界重叠容忍距离 |
+| `SEG_PATH_MAX_ACTIVE_PATHS` | 普通搜索保留候选路径上限 |
+| `SEG_PATH_MAX_FORK_SIDE_ACTIVE_PATHS` | Y 岔路每侧候选路径上限 |
+| `SEG_PATH_MIN_LENGTH` | 候选路径最少节点数 |
+| `SEG_PATH_LENGTH_SCORE_GAIN` | 路径长度加分权重 |
+| `SEG_PATH_SMOOTH_SCORE_GAIN` | 横向不平滑扣分权重 |
+| `SEG_PATH_CENTER_PENALTY_GAIN` | 偏离局部中心扣分权重 |
+| `SEG_PATH_TOP_TIER_SCORE_GAP` | 最终候选池分数差范围 |
+| `SEG_PATH_DENSE_SAMPLES` | 最终路径重采样点数 |
+| `COIN_PATH_CONTROL_FIRST_SEGMENT_ONLY` | coin active 时控制是否只看底部到首个 coin 的段 |
+| `COIN_PATH_CONTROL_BAND_HEIGHT` | coin 控制接管窗口高度 |
+| `COIN_PATH_CONTROL_REFERENCE_ROWS` | coin 距离相关增益参考距离 |
+| `TRACK_WIDTH_LOG_INTERVAL` | 赛道宽度日志节流间隔 |
+
+### 车辆避障、金币规划与分割画面
+
+| 参数 | 用途 |
+|---|---|
+| `CAR_AVOIDANCE_ENABLED` | 是否启用 car 避障状态机 |
+| `CAR_AVOIDANCE_START_OFFSET_ROWS` / `CAR_AVOIDANCE_START_LEFT_OFFSET` | car 进入远距离避障窗口和对应中心偏移 |
+| `CAR_AVOIDANCE_NEAR_OFFSET_ROWS` / `CAR_AVOIDANCE_NEAR_LEFT_OFFSET` | car 进入近距离窗口和对应中心偏移 |
+| `CAR_AVOIDANCE_LOCK_HIT_FRAMES` | car 连续命中多少帧才确认锁定 |
+| `CAR_AVOIDANCE_SEARCH_RADIUS` | car 跟踪匹配搜索半径 |
+| `CAR_AVOIDANCE_SEARCH_RADIUS_MISS_GAIN` | car 漏检时搜索半径扩大增益 |
+| `CAR_AVOIDANCE_TRACK_EMA_ALPHA` | car 底部中心跟踪 EMA 权重 |
+| `CAR_AVOIDANCE_MISS_FRAMES` | car 锁定后允许连续漏检帧数 |
+| `CAR_AVOIDANCE_MIN_SCORE` | car 避障最低置信度 |
+| `CAR_AVOIDANCE_MAX_AREA` | car 最大面积过滤，0 表示关闭 |
+| `CAR_AVOIDANCE_CLEARING_MISS_FRAMES` | CLEARING 起步时保持残余偏置的帧数 |
+| `CAR_AVOIDANCE_CLEARING_DECAY_FRAMES` | CLEARING 偏置衰减帧数 |
+| `CAR_AVOIDANCE_CLEARING_RESIDUAL_KEEP` | CLEARING 初期残余偏置比例 |
+| `CAR_AVOIDANCE_CLEARING_DONE_RESIDUAL` | CLEARING 结束残余比例门槛 |
+| `CAR_AVOIDANCE_CLEARING_LEFT_BIAS_MAX` | car 丢失后最大残余中心偏移 |
+| `CAR_AVOIDANCE_FIXED_LEFT_BIAS_HEIGHT_THRESH` | 触发贴右下固定左偏的车框高度阈值 |
+| `CAR_AVOIDANCE_FIXED_LEFT_BIAS_RIGHT_MARGIN` / `CAR_AVOIDANCE_FIXED_LEFT_BIAS_BOTTOM_MARGIN` | 贴右/贴底判定边距 |
+| `CAR_AVOIDANCE_FIXED_LEFT_BIAS_VALUE` | 贴右下特殊情况固定中心偏移 |
+| `CAR_AVOIDANCE_COIN_ALLOW_BOTTOM_ROWS` | AVOIDING 时允许 coin 位于车辆阻挡区底部附近的行数 |
+| `CAR_AVOIDANCE_CLEARING_COIN_SAFE_ROWS` | CLEARING 时 coin 必须靠底的安全行数 |
+| `COIN_PATH_ENABLED` | 是否启用 coin 分段路径规划 |
+| `COIN_PATH_ROI_Y_MIN` | 新 coin 锁定的最小 y 行 |
+| `COIN_PATH_ROI_BOTTOM_STRICT_ROWS` | coin 底部严格区高度 |
+| `COIN_PATH_BOTTOM_HALF_WIDTH_SCALE` | 底部严格区半宽缩放 |
+| `COIN_PATH_EDGE_REJECT_ENABLED` / `COIN_PATH_EDGE_REJECT_MARGIN` | 是否过滤贴边 coin 以及贴边边距 |
+| `COIN_PATH_MASK_RADIUS` | coin 点附近必须存在 mask 的半径 |
+| `COIN_PATH_HALF_WIDTH_SCALE` | coin 横向合法区域半宽缩放 |
+| `COIN_PATH_BYPASS_FRAME_JUMP` | coin/car active 时是否跳过路径横跳限幅 |
+| `COIN_TRACK_MAX_MISS_FRAMES` | coin 锁定后允许漏检帧数 |
+| `COIN_TRACK_SEARCH_RADIUS` | coin 锁定匹配搜索半径 |
+| `COIN_TRACK_MAX_AREA` | coin 最大面积过滤 |
+| `COIN_TRACK_EAT_Y_MARGIN` | coin 靠近底部多少认为已吃到 |
+| `COIN_TRACK_BOTTOM_TOO_CLOSE_ROWS` | 新 coin 太贴底时跳过的行数 |
+| `SEG_DEBUG_PATH_COLOR` / `SEG_DEBUG_PATH_THICKNESS` | 最终路径颜色和粗细 |
+| `SEG_DEBUG_DRAW_CANDIDATE_PATHS` | 是否绘制候选路径 |
+| `SEG_DEBUG_DRAW_BOUNDARIES` | 是否绘制左右边界 |
+| `SEG_DEBUG_DRAW_MERGE_GUIDE` | 是否绘制汇合引导线 |
+| `SEG_DEBUG_LEFT_PATH_COLOR` / `SEG_DEBUG_RIGHT_PATH_COLOR` | 左右候选路径颜色 |
+| `SEG_DEBUG_CANDIDATE_PATH_THICKNESS` | 候选路径粗细 |
+| `SEG_DEBUG_LEFT_BOUNDARY_COLOR` / `SEG_DEBUG_RIGHT_BOUNDARY_COLOR` | 左右边界颜色 |
+| `SEG_DEBUG_BOUNDARY_THICKNESS` | 边界线粗细 |
+| `SEG_DEBUG_BOTTOM_MID_COLOR` / `SEG_DEBUG_BOTTOM_MID_RADIUS` | 底部参考点颜色和半径 |
+| `SEG_DEBUG_FORK_DIVIDER_COLOR` / `SEG_DEBUG_FORK_DIVIDER_THICKNESS` | Y 岔路分界线颜色和粗细 |
+| `SEG_DEBUG_MERGE_GUIDE_COLOR` / `SEG_DEBUG_MERGE_GUIDE_THICKNESS` | 汇合引导线颜色和粗细 |
+| `SEG_DEBUG_COIN_PATH_ENABLED` | 是否绘制 coin 规划路径 |
+| `SEG_DEBUG_COIN_PATH_COLOR` / `SEG_DEBUG_COIN_PATH_DOT_RADIUS` | coin 路径颜色和锚点半径 |
+| `SEG_DEBUG_COIN_BOTTOM_STRICT_LINE_ENABLED` | 是否绘制 coin 底部严格区线 |
+| `SEG_DEBUG_COIN_BOTTOM_STRICT_LINE_COLOR` / `SEG_DEBUG_COIN_BOTTOM_STRICT_LINE_THICKNESS` | coin 严格区线颜色和粗细 |
+| `SEG_DEBUG_TEXT_FONT_SCALE` / `SEG_DEBUG_TEXT_THICKNESS` | Seg 调试文字字号和粗细 |
+| `SEG_DEBUG_TEXT_POS_FPS` / `SEG_DEBUG_TEXT_POS_CTRL` / `SEG_DEBUG_TEXT_POS_STONE` / `SEG_DEBUG_TEXT_POS_BRANCH` / `SEG_DEBUG_TEXT_POS_COIN` | Seg 调试文字位置 |
+| `SEG_DEBUG_TEXT_COLOR_FPS` / `SEG_DEBUG_TEXT_COLOR_CTRL` / `SEG_DEBUG_TEXT_COLOR_STONE` / `SEG_DEBUG_TEXT_COLOR_BRANCH` / `SEG_DEBUG_TEXT_COLOR_COIN` | Seg 调试文字颜色 |
+
+### 主预览图绘制
+
+| 参数 | 用途 |
+|---|---|
+| `YOLO_DEFAULT_BOX_COLOR` / `YOLO_SIGN_BOX_COLOR` / `YOLO_LIMIT_SIGN_BOX_COLOR` | YOLO 默认/sign/limit_sign 框颜色 |
+| `YOLO_BOX_THICKNESS` | YOLO 框线粗细 |
+| `YOLO_LABEL_FONT_SCALE` / `YOLO_LABEL_THICKNESS` | YOLO 标签字号和粗细 |
+| `YOLO_LABEL_TOP_MARGIN` / `YOLO_LABEL_TOP_OFFSET` / `YOLO_LABEL_BOTTOM_OFFSET` | YOLO 标签避让和偏移 |
+| `YOLO_SUMMARY_MAX_ITEMS` | YOLO 摘要栏最多显示目标数 |
+| `ZEBRA_STOPLINE_COLOR` / `ZEBRA_STOPLINE_THICKNESS` | 斑马线停止线颜色和粗细 |
+| `PREVIEW_PANEL_BG_COLOR` / `PREVIEW_PANEL_BORDER_COLOR` | 预览信息面板背景和边框颜色 |
+| `PREVIEW_TEXT_COLOR` / `PREVIEW_TEXT_ACCENT_COLOR` / `PREVIEW_TEXT_LIMIT_COLOR` / `PREVIEW_TEXT_STOP_COLOR` | 预览文字常规/强调/限速/停车颜色 |
+| `PREVIEW_LIGHT_RED_COLOR` / `PREVIEW_LIGHT_GREEN_COLOR` / `PREVIEW_LIGHT_YELLOW_COLOR` | 红绿灯状态颜色 |
+| `PREVIEW_TEXT_FONT_SCALE` / `PREVIEW_TEXT_THICKNESS` | 预览文字字号和粗细 |
+| `PREVIEW_STATUS_PANEL_TOP_LEFT` / `PREVIEW_STATUS_PANEL_BOTTOM_RIGHT` | 状态面板矩形位置 |
+| `PREVIEW_YOLO_PANEL_TOP_LEFT` / `PREVIEW_YOLO_PANEL_BOTTOM_RIGHT` | YOLO 摘要面板矩形位置 |
+| `PREVIEW_TEXT_POS_FPS` / `PREVIEW_TEXT_POS_CTRL` / `PREVIEW_TEXT_POS_SPEED` / `PREVIEW_TEXT_POS_LIMIT` / `PREVIEW_TEXT_POS_LIGHT` / `PREVIEW_TEXT_POS_STOP` / `PREVIEW_TEXT_POS_YOLO_SUMMARY` | 主预览各行文字坐标 |
 
 ## 常用调参入口
 
@@ -467,20 +782,21 @@ target_speed = 0                                # 若红/黄灯停车或行人�
 
 优先看这些参数：
 
-- `SRC_PTS`
-- `DST_PTS`
 - `SEG_EMA_ALPHA`
+- `SEG_CENTERLINE_ONLY_MODE`
+- `SEG_CENTERLINE_ROW_STEP`
 - `SEG_PATH_SEARCH_STEP_Y`
 - `SEG_PATH_GAP_THRESH`
 - `SEG_PATH_CONNECT_X_THRESH`
 - `SEG_PATH_TOP_TIER_SCORE_GAP`
 - `PLANNING_CLASS_NAMES`
-- `PLANNING_MARKER_STYLES`
+- `MERGE_GUIDE_*`
+- `FORK_INNER_OPEN_*`
 
 调参建议：
 
 - 线看着没问题，但控制量明显不对
-  优先检查逆透视点、路径搜索步长和 `STEER_SIGNAL_PWM_GAIN`
+  优先检查 `SEG_INPUT_CROP_TOP_RATIO`、路径搜索步长和 `STEER_SIGNAL_PWM_GAIN`
 - 分叉处容易来回横跳
   先看 OCR 的 `turn_intent` 是否稳定，再看 `SEG_EMA_ALPHA` 和候选路径筛选参数
 

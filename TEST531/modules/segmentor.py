@@ -28,7 +28,7 @@ except ImportError:
 
 class RoadSegmentor:
     def __init__(self, core_id):
-        """初始化分割模型与分割空间的逆透视矩阵."""
+        """初始化分割模型与分割空间坐标映射."""
         with suppress_rknn_init_output():
             self.rknn = RKNNLite()
 
@@ -36,10 +36,6 @@ class RoadSegmentor:
                 raise RuntimeError("Seg 模型加载或初始化失败")
             
         w_seg, h_seg = config.SEG_SIZE
-        src_seg = np.float32([[x * w_seg, y * h_seg] for x, y in config.SRC_PTS])
-        dst_seg = np.float32([[x * w_seg, y * h_seg] for x, y in config.DST_PTS])
-        # 透视矩阵直接建立在分割输入尺寸上，避免每次运行都重复计算。
-        self.M_seg = cv2.getPerspectiveTransform(src_seg, dst_seg)
         target_w, target_h = config.TARGET_RES
         self.seg_crop_top_ratio = float(getattr(config, "SEG_INPUT_CROP_TOP_RATIO", 0.0))
         self.seg_crop_top_ratio = max(0.0, min(0.95, self.seg_crop_top_ratio))
@@ -49,12 +45,6 @@ class RoadSegmentor:
         self.scale_y_to_seg = h_seg / self.seg_crop_target_h
         self.planning_class_names = set(
             getattr(config, "PLANNING_CLASS_NAMES", ())
-        )
-        self.planning_marker_styles = dict(
-            getattr(config, "PLANNING_MARKER_STYLES", {})
-        )
-        self.planning_circle_class_names = set(
-            getattr(config, "PLANNING_CIRCLE_CLASS_NAMES", ())
         )
         self.fixed_track_widths = np.array(
             getattr(config, "SEG_FIXED_WIDTHS_320_SMOOTH", getattr(config, "SEG_FIXED_WIDTHS_320", ())),
@@ -1822,7 +1812,7 @@ class RoadSegmentor:
         return corners
 
     def _project_planning_objects(self, current_yolo_boxes, w_seg, h_seg):
-        """将原图中的规划相关检测框映射到分割平面和俯视图平面.
+        """将原图中的规划相关检测框映射到分割平面.
 
         这些目标当前主要用于:
         - 调试显示
@@ -1830,7 +1820,6 @@ class RoadSegmentor:
         暂时不会像 cost map 那样直接侵蚀主路径。
         """
         planning_items = []
-        seg_boxes = []
 
         for obj in current_yolo_boxes:
             seg_box = self._get_planning_box_points(obj, w_seg, h_seg)
@@ -1843,28 +1832,6 @@ class RoadSegmentor:
                 "score": float(obj.get("score", 0.0)),
                 "seg_box": seg_box,
             })
-            seg_boxes.append(seg_box)
-
-        if not seg_boxes:
-            return planning_items
-
-        bird_boxes = cv2.perspectiveTransform(
-            np.array(seg_boxes, dtype=np.float32).reshape((-1, 1, 2)),
-            self.M_seg
-        ).reshape((-1, 4, 2))
-
-        for item, bird_box in zip(planning_items, bird_boxes):
-            bird_box = bird_box.astype(np.float32)
-            bird_box[:, 0] = np.clip(bird_box[:, 0], 0, w_seg - 1)
-            bird_box[:, 1] = np.clip(bird_box[:, 1], 0, h_seg - 1)
-
-            bird_center = np.mean(bird_box, axis=0)
-            distances = np.linalg.norm(bird_box - bird_center, axis=1)
-            bird_radius = float(np.max(distances)) if len(distances) > 0 else 0.0
-
-            item["bird_box"] = bird_box
-            item["bird_center"] = bird_center.astype(np.float32)
-            item["bird_radius"] = bird_radius
 
         return planning_items
 
@@ -1890,27 +1857,6 @@ class RoadSegmentor:
         slope_signal *= float(getattr(config, "STEER_SIGNAL_NORMALIZED_SCALE", 1.0))
 
         return slope_signal
-
-    def _compute_lateral_offset_signal(self, path_points, base_path_points, img_h):
-        """计算规划路径相对基础路径底部起点的加权横向偏移控制量."""
-        gain = float(getattr(config, "STEER_SIGNAL_CAR_LATERAL_OFFSET_GAIN", 0.0))
-        if gain == 0.0 or path_points is None or base_path_points is None:
-            return 0.0
-
-        pts = np.array(path_points, dtype=np.float32).reshape((-1, 2))
-        base = np.array(base_path_points, dtype=np.float32).reshape((-1, 2))
-        if len(pts) == 0 or len(base) == 0:
-            return 0.0
-
-        bottom_y = float(img_h) - 1.0
-        row_gamma = float(getattr(config, "STEER_SIGNAL_ROW_WEIGHT_GAMMA", 1.0))
-        base_start_x = float(base[int(np.argmax(base[:, 1])), 0])
-        offsets = pts[:, 0] - base_start_x
-        row_weights = np.power(np.clip(pts[:, 1], 0.0, bottom_y), row_gamma)
-        weight_sum = float(np.sum(row_weights))
-        if weight_sum <= 1e-6:
-            return 0.0
-        return float(np.sum(offsets * row_weights) / weight_sum) * gain
 
     def _build_single_row_control_points(self, path_points, img_h, y_ratio=None):
         """把整条路径压成单行控制点，降低无金币时的抖动."""
@@ -2305,7 +2251,16 @@ class RoadSegmentor:
             "control_coin": None,
             "control_points": None,
             "control_gain": 1.0,
+            "raw_coin_items": 0,
+            "coin_measurements": 0,
+            "coin_points_count": 0,
+            "path_changed": False,
             "active": False,
+            "car_state": car_state,
+            "car_gate_active": False,
+            "measurement_none": 0,
+            "reject_blocked": 0,
+            "reject_car_state": 0,
         }
         base = np.array(base_path, dtype=np.float32).reshape((-1, 2))
         if (
@@ -2316,8 +2271,10 @@ class RoadSegmentor:
 
         coin_measurements = []
         base_bottom_y = float(np.max(base[:, 1]))
+        blocked_ranges = list(blocked_y_ranges or [])
+        debug["car_gate_active"] = bool(blocked_ranges)
         blocked_y_max = None
-        for y1, y2 in (blocked_y_ranges or []):
+        for y1, y2 in blocked_ranges:
             blocked_y_max = max(float(y1), float(y2)) if blocked_y_max is None else max(
                 blocked_y_max,
                 float(y1),
@@ -2327,29 +2284,40 @@ class RoadSegmentor:
         for item in planning_items:
             if item.get("class_name", "") != "coin":
                 continue
+            debug["raw_coin_items"] += 1
             measurement = self._coin_measurement_from_item(item, w_seg, h_seg)
-            if measurement is not None:
-                cy = float(measurement["point"][1])
-                blocked = False
-                for y1, y2 in (blocked_y_ranges or []):
-                    lo = min(float(y1), float(y2))
-                    hi = max(float(y1), float(y2))
-                    if lo <= cy <= hi:
-                        blocked = True
-                        break
-                if blocked:
+            if measurement is None:
+                debug["measurement_none"] += 1
+                continue
+
+            cy = float(measurement["point"][1])
+            blocked = False
+            for y1, y2 in blocked_ranges:
+                lo = min(float(y1), float(y2))
+                hi = max(float(y1), float(y2))
+                if lo <= cy <= hi:
+                    blocked = True
+                    break
+            if blocked:
+                debug["reject_blocked"] += 1
+                continue
+
+            if blocked_ranges and car_state == "AVOIDING":
+                allow_rows = float(getattr(config, "CAR_AVOIDANCE_COIN_ALLOW_BOTTOM_ROWS", 28.0))
+                if blocked_y_max is not None and cy < float(blocked_y_max) - allow_rows:
+                    debug["reject_car_state"] += 1
                     continue
-                if car_state == "AVOIDING":
-                    allow_rows = float(getattr(config, "CAR_AVOIDANCE_COIN_ALLOW_BOTTOM_ROWS", 28.0))
-                    if blocked_y_max is None or cy < float(blocked_y_max) - allow_rows:
-                        continue
-                elif car_state == "CLEARING":
-                    safe_rows = float(getattr(config, "CAR_AVOIDANCE_CLEARING_COIN_SAFE_ROWS", 16.0))
-                    if cy < base_bottom_y - safe_rows:
-                        continue
-                    if not self._coin_bottom_strict_point_usable(measurement["point"][0], cy, base):
-                        continue
-                coin_measurements.append(measurement)
+            elif blocked_ranges and car_state == "CLEARING":
+                safe_rows = float(getattr(config, "CAR_AVOIDANCE_CLEARING_COIN_SAFE_ROWS", 16.0))
+                if cy < base_bottom_y - safe_rows:
+                    debug["reject_car_state"] += 1
+                    continue
+                if not self._coin_bottom_strict_point_usable(measurement["point"][0], cy, base):
+                    debug["reject_car_state"] += 1
+                    continue
+
+            coin_measurements.append(measurement)
+        debug["coin_measurements"] = len(coin_measurements)
 
         coin_points = self._update_locked_coin(
             coin_measurements,
@@ -2359,11 +2327,13 @@ class RoadSegmentor:
             left_boundary,
             right_boundary,
         )
+        debug["coin_points_count"] = len(coin_points)
 
         if not coin_points:
             return base, debug
 
         planned, changed = self._build_segmented_coin_path(base, coin_points, w_seg)
+        debug["path_changed"] = bool(changed)
         if not changed:
             return base, debug
 
@@ -2644,58 +2614,6 @@ class RoadSegmentor:
         debug["active"] = True
         return float(bias), debug
 
-    def _draw_planning_points(self, canvas, planning_items):
-        """在俯视图上绘制规划相关目标的质心点，必要时附加半径圈."""
-        for item in planning_items:
-            bird_center = item.get("bird_center")
-            bird_radius = item.get("bird_radius")
-            if bird_center is None or bird_radius is None:
-                continue
-
-            class_name = item.get("class_name", "")
-            style = self.planning_marker_styles.get(
-                class_name,
-                {"color": (0, 255, 255), "label": class_name},
-            )
-            color = tuple(int(v) for v in style.get("color", (0, 255, 255)))
-            label = style.get("label", class_name)
-
-            cx = int(round(float(bird_center[0])))
-            cy = int(round(float(bird_center[1])))
-            radius = max(config.SEG_DEBUG_PLANNING_MIN_RADIUS, int(round(float(bird_radius))))
-
-            cv2.circle(canvas, (cx, cy), config.SEG_DEBUG_PLANNING_DOT_RADIUS, color, -1)
-
-            text = label
-            if class_name in self.planning_circle_class_names:
-                cv2.circle(canvas, (cx, cy), radius, color, 1)
-                text = f"{label} r={radius}"
-
-            text_x = int(
-                np.clip(
-                    cx + config.SEG_DEBUG_PLANNING_TEXT_OFFSET_X,
-                    0,
-                    max(0, canvas.shape[1] - 1),
-                )
-            )
-            text_y = int(
-                np.clip(
-                    cy + config.SEG_DEBUG_PLANNING_TEXT_OFFSET_Y,
-                    config.SEG_DEBUG_PLANNING_TEXT_MIN_Y,
-                    max(config.SEG_DEBUG_PLANNING_TEXT_MIN_Y, canvas.shape[0] - 4),
-                )
-            )
-            cv2.putText(
-                canvas,
-                text,
-                (text_x, text_y),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                config.SEG_DEBUG_PLANNING_TEXT_FONT_SCALE,
-                color,
-                config.SEG_DEBUG_PLANNING_TEXT_THICKNESS,
-                cv2.LINE_AA
-            )
-
     def infer_mask(self, blob_rgb_320):
         """只执行分割模型推理，返回二值 mask 和推理耗时."""
         t_infer_start = time.perf_counter()
@@ -2724,17 +2642,17 @@ class RoadSegmentor:
         """对已推理出的 mask 做路径规划、控制量计算和调试渲染.
 
         输入:
-        - blob_rgb_320: 分割线程当前拿到的最新 320x320 RGB 图
+        - blob_rgb_320: 分割线程当前拿到的最新 SEG_SIZE RGB 图
         - mask: infer_mask 输出的二值赛道 mask
         - current_yolo_boxes: 当前最新一帧检测框，坐标在 TARGET_RES
         - turn_intent: OCR 给出的 LEFT / RIGHT 分叉意图，当前暂不参与分支选择
 
         输出:
         - steer_signal: 单一转向控制量，来自路径点加权斜率和
-        - ai_view: 320 空间调试图，主线程会再放大回 TARGET_RES
+        - ai_view: SEG_SIZE 空间调试图，主线程会再放大回 TARGET_RES
         """
         t_total_start = time.perf_counter() if total_start is None else float(total_start)
-        w_seg, h_seg = config.SEG_SIZE   # 320, 320
+        w_seg, h_seg = config.SEG_SIZE
         
         # ai_view 是最终调试图的底板，默认保持在分割空间，后续再由主线程放大。
         # 如果主线程传入完整预览图，则后面直接在完整图下半 ROI 上叠加 mask/路径，
@@ -2754,7 +2672,6 @@ class RoadSegmentor:
         t_search_start = time.perf_counter()
         steer_signal = 0.0
         pts_final_orig = None
-        pts_final_bird = None
         search_mask = self._prepare_search_mask(mask)
         search_edge_mask = self._extract_edge_mask(search_mask)
         merge_detect_info = self._detect_merge_guide(search_mask, search_edge_mask)
@@ -2796,8 +2713,6 @@ class RoadSegmentor:
         t_fit_start = time.perf_counter()
         boundary_left_orig = None
         boundary_right_orig = None
-        boundary_left_bird = None
-        boundary_right_bird = None
         candidate_left_orig = None
         candidate_right_orig = None
         y_fork_active = False
@@ -3030,16 +2945,12 @@ class RoadSegmentor:
             elif not car_active:
                 steer_signal *= float(getattr(config, "STEER_SIGNAL_NO_TARGET_GAIN", 1.0))
             pts_final_orig = path_points_orig.reshape((-1, 1, 2))
-            pts_final_bird = cv2.perspectiveTransform(pts_final_orig, self.M_seg)
-            boundary_left_bird = cv2.perspectiveTransform(boundary_left_orig, self.M_seg)
-            boundary_right_bird = cv2.perspectiveTransform(boundary_right_orig, self.M_seg)
         else:
             held_path = self._hold_last_path()
             if held_path is not None:
                 path_points_orig = held_path
                 steer_signal = self._compute_weighted_steer_signal(path_points_orig, w_seg, h_seg)
                 pts_final_orig = path_points_orig.reshape((-1, 1, 2))
-                pts_final_bird = cv2.perspectiveTransform(pts_final_orig, self.M_seg)
             else:
                 self.last_poly_coeffs = None
         self.last_branch_stats = {
@@ -3105,48 +3016,6 @@ class RoadSegmentor:
             # 路径直接画在分割调试平面里，主线程只负责整体缩放和其它信息叠加。
             ai_view = self.draw_path_overlay(ai_view)
 
-        if bool(getattr(config, "SEG_DEBUG_DRAW_BIRD_VIEW", True)):
-            bird_eye_mask = cv2.warpPerspective(mask, self.M_seg, (w_seg, h_seg), flags=cv2.INTER_NEAREST)
-            pip_img = cv2.cvtColor(np.where(bird_eye_mask == 1, 255, 0).astype(np.uint8), cv2.COLOR_GRAY2BGR)
-
-            if pts_final_bird is not None:
-                cv2.polylines(
-                    pip_img,
-                    [pts_final_bird.astype(np.int32)],
-                    False,
-                    config.SEG_DEBUG_BIRD_PATH_COLOR,
-                    config.SEG_DEBUG_BIRD_PATH_THICKNESS,
-                )
-            if boundary_left_bird is not None:
-                cv2.polylines(
-                    pip_img,
-                    [boundary_left_bird.astype(np.int32)],
-                    False,
-                    config.SEG_DEBUG_BIRD_LEFT_BOUNDARY_COLOR,
-                    config.SEG_DEBUG_BIRD_BOUNDARY_THICKNESS,
-                )
-            if boundary_right_bird is not None:
-                cv2.polylines(
-                    pip_img,
-                    [boundary_right_bird.astype(np.int32)],
-                    False,
-                    config.SEG_DEBUG_BIRD_RIGHT_BOUNDARY_COLOR,
-                    config.SEG_DEBUG_BIRD_BOUNDARY_THICKNESS,
-                )
-
-            if bool(getattr(config, "SEG_DEBUG_DRAW_PLANNING_POINTS", True)):
-                self._draw_planning_points(pip_img, planning_items)
-
-            pip_h, pip_w = h_seg // config.SEG_DEBUG_PIP_DIVISOR, w_seg // config.SEG_DEBUG_PIP_DIVISOR
-            ai_view[0:pip_h, w_seg - pip_w:w_seg] = cv2.resize(pip_img, (pip_w, pip_h))
-            cv2.rectangle(
-                ai_view,
-                (w_seg - pip_w, 0),
-                (w_seg, pip_h),
-                config.SEG_DEBUG_PIP_BORDER_COLOR,
-                config.SEG_DEBUG_PIP_BORDER_THICKNESS,
-            )
-
         servo_pwm = int(
             config.SERVO_CENTER
             - steer_signal * config.STEER_SIGNAL_PWM_GAIN
@@ -3201,6 +3070,25 @@ class RoadSegmentor:
             config.SEG_DEBUG_TEXT_COLOR_BRANCH,
             config.SEG_DEBUG_TEXT_THICKNESS,
         )
+        if coin_path_debug is not None:
+            cv2.putText(
+                ai_view,
+                (
+                    f"Coin raw:{coin_path_debug.get('raw_coin_items', 0)} "
+                    f"meas:{coin_path_debug.get('coin_measurements', 0)} "
+                    f"pts:{coin_path_debug.get('coin_points_count', 0)} "
+                    f"chg:{int(bool(coin_path_debug.get('path_changed', False)))} "
+                    f"rej:{coin_path_debug.get('reject_car_state', 0)}/"
+                    f"{coin_path_debug.get('reject_blocked', 0)} "
+                    f"st:{str(coin_path_debug.get('car_state', ''))[:3]} "
+                    f"gate:{int(bool(coin_path_debug.get('car_gate_active', False)))}"
+                ),
+                config.SEG_DEBUG_TEXT_POS_COIN,
+                1,
+                config.SEG_DEBUG_TEXT_FONT_SCALE,
+                config.SEG_DEBUG_TEXT_COLOR_COIN,
+                config.SEG_DEBUG_TEXT_THICKNESS,
+            )
         t_render_end = time.perf_counter()
         preprocess_s = t_preprocess_end - t_preprocess_start
         search_s = t_search_end - t_search_start
