@@ -89,6 +89,11 @@ class RoadSegmentor:
         self.merge_state_side = None
         self.locked_car = None
         self.locked_car_miss_frames = 0
+        self.car_avoidance_state = "FOLLOW_LANE"
+        self.car_clearing_frames = 0
+        self.car_last_avoid_path = None
+        self.car_last_blocked_y_range = None
+        self.car_last_center_bias_sign = 1.0
         self.locked_coin = None
         self.locked_coin_miss_frames = 0
         self.last_main_overlay = {
@@ -277,6 +282,16 @@ class RoadSegmentor:
 
         coin_path_debug = overlay.get("coin_path")
         if bool(getattr(config, "SEG_DEBUG_COIN_PATH_ENABLED", True)) and coin_path_debug:
+            coin_planned_poly = _scaled_polyline(coin_path_debug.get("planned_path"))
+            if coin_planned_poly is not None:
+                cv2.polylines(
+                    image,
+                    [coin_planned_poly],
+                    False,
+                    config.SEG_DEBUG_COIN_PATH_COLOR,
+                    max(1, path_thickness),
+                    cv2.LINE_AA,
+                )
             for pt in coin_path_debug.get("coin_points", []):
                 cv2.circle(
                     image,
@@ -1853,14 +1868,14 @@ class RoadSegmentor:
 
         return planning_items
 
-    def _compute_weighted_steer_signal(self, path_points, img_w, img_h):
+    def _compute_weighted_steer_signal(self, path_points, img_w, img_h, center_bias_x=0.0):
         """按“路径点到底部中点连线斜率”的加权平均聚合单一控制量."""
         if path_points is None or len(path_points) == 0:
             return 0.0
 
         pts = np.array(path_points, dtype=np.float32).reshape((-1, 2))
-        # 以图像几何中线为 0，保证垂直中线上的路径控制量严格为 0。
-        bottom_mid_x = float(img_w) / 2.0
+        # 以图像几何中线为 0；绕车时只临时偏移控制基准，不改普通循线路径点。
+        bottom_mid_x = float(img_w) / 2.0 + float(center_bias_x)
         bottom_y = float(img_h) - 1.0
         min_dy = float(config.STEER_SIGNAL_MIN_DY)
         row_gamma = float(getattr(config, "STEER_SIGNAL_ROW_WEIGHT_GAMMA", 1.0))
@@ -1874,8 +1889,28 @@ class RoadSegmentor:
         slope_signal = float(np.sum(slopes * row_weights) / weight_sum)
         slope_signal *= float(getattr(config, "STEER_SIGNAL_NORMALIZED_SCALE", 1.0))
 
-        # 底部额外偏移项先停用，仅保留主斜率累计控制量。
         return slope_signal
+
+    def _compute_lateral_offset_signal(self, path_points, base_path_points, img_h):
+        """计算规划路径相对基础路径底部起点的加权横向偏移控制量."""
+        gain = float(getattr(config, "STEER_SIGNAL_CAR_LATERAL_OFFSET_GAIN", 0.0))
+        if gain == 0.0 or path_points is None or base_path_points is None:
+            return 0.0
+
+        pts = np.array(path_points, dtype=np.float32).reshape((-1, 2))
+        base = np.array(base_path_points, dtype=np.float32).reshape((-1, 2))
+        if len(pts) == 0 or len(base) == 0:
+            return 0.0
+
+        bottom_y = float(img_h) - 1.0
+        row_gamma = float(getattr(config, "STEER_SIGNAL_ROW_WEIGHT_GAMMA", 1.0))
+        base_start_x = float(base[int(np.argmax(base[:, 1])), 0])
+        offsets = pts[:, 0] - base_start_x
+        row_weights = np.power(np.clip(pts[:, 1], 0.0, bottom_y), row_gamma)
+        weight_sum = float(np.sum(row_weights))
+        if weight_sum <= 1e-6:
+            return 0.0
+        return float(np.sum(offsets * row_weights) / weight_sum) * gain
 
     def _build_single_row_control_points(self, path_points, img_h, y_ratio=None):
         """把整条路径压成单行控制点，降低无金币时的抖动."""
@@ -1993,6 +2028,63 @@ class RoadSegmentor:
         planned[:, 0] = np.interp(planned[:, 1], anchor_arr[:, 1], anchor_arr[:, 0])
         planned[:, 0] = np.clip(planned[:, 0], 0.0, float(w_seg - 1))
         return planned, True
+
+    def _blend_paths(self, base_path, target_path, blend):
+        """按 blend 把 target_path 混回 base_path."""
+        base = np.array(base_path, dtype=np.float32).reshape((-1, 2))
+        target = np.array(target_path, dtype=np.float32).reshape((-1, 2))
+        if len(base) == 0:
+            return target
+        if len(base) != len(target):
+            return target
+        blend = float(np.clip(blend, 0.0, 1.0))
+        return (base * (1.0 - blend) + target * blend).astype(np.float32)
+
+    def _build_car_clearing_path(self, base_path, avoid_path, clear_frames, fixed_bias_ready=False):
+        """CLEARING: 特定贴边小车框固定左偏；车消失后再缓慢回正。"""
+        base = np.array(base_path, dtype=np.float32).reshape((-1, 2))
+        if len(base) < 2:
+            return base, 0.0
+
+        miss_frames = max(1, int(getattr(config, "CAR_AVOIDANCE_CLEARING_MISS_FRAMES", 2)))
+        decay_frames = max(1, int(getattr(config, "CAR_AVOIDANCE_CLEARING_DECAY_FRAMES", 8)))
+        residual_keep = float(getattr(config, "CAR_AVOIDANCE_CLEARING_RESIDUAL_KEEP", 0.35))
+        residual_done = float(getattr(config, "CAR_AVOIDANCE_CLEARING_DONE_RESIDUAL", 0.06))
+        max_left_bias = float(getattr(config, "CAR_AVOIDANCE_CLEARING_LEFT_BIAS_MAX", 10.0))
+
+        # 只有车框贴右、贴底且高度较小时，才直接固定左偏。
+        if fixed_bias_ready:
+            left_bias = float(getattr(config, "CAR_AVOIDANCE_FIXED_LEFT_BIAS_VALUE", 70.0))
+            bias_ratio = 1.0
+        else:
+            left_bias = max(0.0, max_left_bias)
+            if clear_frames <= miss_frames:
+                bias_ratio = 1.0
+            else:
+                t = float(np.clip((clear_frames - miss_frames) / float(decay_frames), 0.0, 1.0))
+                bias_ratio = residual_keep + (residual_done - residual_keep) * t
+            bias_ratio = float(np.clip(bias_ratio, 0.0, 1.0))
+
+        mixed = base.copy()
+        mixed[:, 0] = np.clip(mixed[:, 0] - left_bias * bias_ratio, 0.0, float(config.SEG_SIZE[0] - 1))
+        return mixed, bias_ratio
+
+    def _car_fixed_left_bias_ready(self, locked_car, w_seg, h_seg):
+        """车框贴右下且高度较小时，使用基础巡线固定左偏。"""
+        if locked_car is None:
+            return False
+        measurement = locked_car.get("measurement") or {}
+        x_max = float(measurement.get("x_max", 0.0))
+        y_min = float(measurement.get("y_min", 0.0))
+        y_max = float(measurement.get("y_max", 0.0))
+        box_h = max(0.0, y_max - y_min)
+        height_thresh = float(getattr(config, "CAR_AVOIDANCE_FIXED_LEFT_BIAS_HEIGHT_THRESH", 90.0))
+        right_margin = float(getattr(config, "CAR_AVOIDANCE_FIXED_LEFT_BIAS_RIGHT_MARGIN", 20.0))
+        bottom_margin = float(getattr(config, "CAR_AVOIDANCE_FIXED_LEFT_BIAS_BOTTOM_MARGIN", 20.0))
+        touch_right = x_max >= float(w_seg - 1) - max(0.0, right_margin)
+        touch_bottom = y_max >= float(h_seg - 1) - max(0.0, bottom_margin)
+        small_height = box_h <= max(0.0, height_thresh)
+        return bool(touch_right and touch_bottom and small_height)
 
     def _boundary_x_at_y(self, boundary_points, y):
         """按 y 在左右边界点上插值得到边界 x."""
@@ -2205,7 +2297,8 @@ class RoadSegmentor:
         return _append_future_coins(best["point"])
 
     def _apply_coin_path_planning(self, base_path, planning_items, w_seg, h_seg, mask=None,
-                                  left_boundary=None, right_boundary=None, blocked_y_ranges=None):
+                                  left_boundary=None, right_boundary=None, blocked_y_ranges=None,
+                                  car_state="FOLLOW_LANE"):
         """只使用 coin 底部中点画点，并按这些点从底部依次分段拟合路径."""
         debug = {
             "coin_points": [],
@@ -2222,6 +2315,14 @@ class RoadSegmentor:
             return base, debug
 
         coin_measurements = []
+        base_bottom_y = float(np.max(base[:, 1]))
+        blocked_y_max = None
+        for y1, y2 in (blocked_y_ranges or []):
+            blocked_y_max = max(float(y1), float(y2)) if blocked_y_max is None else max(
+                blocked_y_max,
+                float(y1),
+                float(y2),
+            )
 
         for item in planning_items:
             if item.get("class_name", "") != "coin":
@@ -2238,6 +2339,16 @@ class RoadSegmentor:
                         break
                 if blocked:
                     continue
+                if car_state == "AVOIDING":
+                    allow_rows = float(getattr(config, "CAR_AVOIDANCE_COIN_ALLOW_BOTTOM_ROWS", 28.0))
+                    if blocked_y_max is None or cy < float(blocked_y_max) - allow_rows:
+                        continue
+                elif car_state == "CLEARING":
+                    safe_rows = float(getattr(config, "CAR_AVOIDANCE_CLEARING_COIN_SAFE_ROWS", 16.0))
+                    if cy < base_bottom_y - safe_rows:
+                        continue
+                    if not self._coin_bottom_strict_point_usable(measurement["point"][0], cy, base):
+                        continue
                 coin_measurements.append(measurement)
 
         coin_points = self._update_locked_coin(
@@ -2258,6 +2369,7 @@ class RoadSegmentor:
 
         debug["coin_points"] = coin_points
         debug["control_coin"] = coin_points[0]
+        debug["planned_path"] = planned.astype(np.float32)
         if bool(getattr(config, "COIN_PATH_CONTROL_FIRST_SEGMENT_ONLY", True)):
             nearest_coin = debug["control_coin"]
             bottom_y = float(np.max(planned[:, 1]))
@@ -2278,100 +2390,259 @@ class RoadSegmentor:
         debug["active"] = True
         return planned, debug
 
-    def _apply_car_avoidance_path_planning(self, base_path, planning_items, w_seg, h_seg, mask=None,
-                                           left_boundary=None, right_boundary=None):
-        """检测到 car 时，取车框左侧两角向左偏移作为绕障锚点."""
+    def _car_measurement_from_item(self, item, w_seg, h_seg, base):
+        """从 car 检测框提取用于跟踪和避障的稳定几何量."""
+        if item.get("class_name", "") != "car":
+            return None
+        if float(item.get("score", 0.0)) < float(getattr(config, "CAR_AVOIDANCE_MIN_SCORE", 0.0)):
+            return None
+        seg_box = item.get("seg_box")
+        if seg_box is None:
+            return None
+        box = np.array(seg_box, dtype=np.float32).reshape((-1, 2))
+        if len(box) < 4:
+            return None
+
+        x_min = float(np.min(box[:, 0]))
+        x_max = float(np.max(box[:, 0]))
+        y_min = float(np.min(box[:, 1]))
+        y_max = float(np.max(box[:, 1]))
+        area = float(max(0.0, x_max - x_min) * max(0.0, y_max - y_min))
+        max_area = float(getattr(config, "CAR_AVOIDANCE_MAX_AREA", 0.0))
+        if max_area > 0.0 and area > max_area:
+            return None
+
+        y_sorted = np.argsort(box[:, 1])
+        bottom_pts = box[y_sorted[-2:]]
+        top_pts = box[y_sorted[:2]]
+        raw_bottom_y = float(np.max(bottom_pts[:, 1]))
+        raw_top_y = float(np.min(top_pts[:, 1]))
+        bottom_center_x = float(np.mean(bottom_pts[:, 0]))
+        bottom_center_y = raw_bottom_y
+        path_y_min = float(np.min(base[:, 1]))
+        path_y_max = float(np.max(base[:, 1]))
+        bottom_center_y = float(np.clip(bottom_center_y, path_y_min, path_y_max))
+
+        return {
+            "box": box,
+            "score": float(item.get("score", 0.0)),
+            "area": area,
+            "x_min": x_min,
+            "x_max": x_max,
+            "y_min": y_min,
+            "y_max": y_max,
+            "bottom_pts": bottom_pts,
+            "top_pts": top_pts,
+            "bottom_center": (bottom_center_x, bottom_center_y),
+            "raw_bottom_y": raw_bottom_y,
+            "raw_top_y": raw_top_y,
+        }
+
+    def _update_locked_car(self, measurements, base):
+        """按底部中心点连续性锁定同一辆车，允许短暂遮挡/漏检."""
+        max_miss = max(0, int(getattr(config, "CAR_AVOIDANCE_MISS_FRAMES", 0)))
+        hit_required = max(1, int(getattr(config, "CAR_AVOIDANCE_LOCK_HIT_FRAMES", 1)))
+        search_radius = max(1.0, float(getattr(config, "CAR_AVOIDANCE_SEARCH_RADIUS", 48.0)))
+        miss_gain = max(0.0, float(getattr(config, "CAR_AVOIDANCE_SEARCH_RADIUS_MISS_GAIN", 0.0)))
+        ema_alpha = float(getattr(config, "CAR_AVOIDANCE_TRACK_EMA_ALPHA", 0.65))
+        ema_alpha = float(np.clip(ema_alpha, 0.0, 0.98))
+
+        if self.locked_car is not None:
+            last_center = self.locked_car.get("bottom_center")
+            velocity = self.locked_car.get("velocity", (0.0, 0.0))
+            miss_frames = int(self.locked_car_miss_frames)
+            predicted = (
+                float(last_center[0]) + float(velocity[0]),
+                float(last_center[1]) + float(velocity[1]),
+            )
+            radius = search_radius + miss_gain * float(miss_frames)
+
+            local_matches = []
+            for m in measurements:
+                mx, my = m["bottom_center"]
+                dist = float(np.hypot(float(mx) - predicted[0], float(my) - predicted[1]))
+                if dist <= radius:
+                    local_matches.append((dist, m))
+
+            if local_matches:
+                _dist, best = min(
+                    local_matches,
+                    key=lambda pair: (pair[0], -float(pair[1].get("score", 0.0))),
+                )
+                old_center = self.locked_car["bottom_center"]
+                new_center = best["bottom_center"]
+                smooth_center = (
+                    ema_alpha * float(old_center[0]) + (1.0 - ema_alpha) * float(new_center[0]),
+                    ema_alpha * float(old_center[1]) + (1.0 - ema_alpha) * float(new_center[1]),
+                )
+                smooth_velocity = (
+                    smooth_center[0] - float(old_center[0]),
+                    smooth_center[1] - float(old_center[1]),
+                )
+                self.locked_car = {
+                    "measurement": best,
+                    "bottom_center": smooth_center,
+                    "velocity": smooth_velocity,
+                    "hit_frames": int(self.locked_car.get("hit_frames", 0)) + 1,
+                    "confirmed": int(self.locked_car.get("hit_frames", 0)) + 1 >= hit_required,
+                }
+                self.locked_car_miss_frames = 0
+                if not self.locked_car["confirmed"]:
+                    return None
+                return self.locked_car
+
+            self.locked_car_miss_frames += 1
+            if self.locked_car_miss_frames <= max_miss:
+                if not bool(self.locked_car.get("confirmed", False)):
+                    return None
+                return self.locked_car
+
+            self.locked_car = None
+            self.locked_car_miss_frames = 0
+
+        if not measurements:
+            return None
+
+        # 新目标优先选靠近车身底部、且离基础路径更近的 car。
+        def _new_target_key(m):
+            cx, cy = m["bottom_center"]
+            path_x = self._path_x_at_y_points(base, cy)
+            lateral = abs(float(cx) - float(path_x)) if path_x is not None else 0.0
+            return (float(cy), -lateral, float(m.get("score", 0.0)))
+
+        best = max(measurements, key=_new_target_key)
+        self.locked_car = {
+            "measurement": best,
+            "bottom_center": tuple(map(float, best["bottom_center"])),
+            "velocity": (0.0, 0.0),
+            "hit_frames": 1,
+            "confirmed": hit_required <= 1,
+        }
+        self.locked_car_miss_frames = 0
+        if not self.locked_car["confirmed"]:
+            return None
+        return self.locked_car
+
+    def _car_avoidance_center_bias(self, locked_car, base, w_seg, h_seg):
+        """基于锁定目标计算控制基准偏移量，不改普通循线路径点."""
+        if locked_car is None:
+            return 0.0, None
+        measurement = locked_car.get("measurement")
+        if measurement is None:
+            return 0.0, None
+
+        path_y_min = float(np.min(base[:, 1]))
+        path_y_max = float(np.max(base[:, 1]))
+        smooth_cx, smooth_cy = locked_car.get("bottom_center", measurement["bottom_center"])
+        center_y = float(np.clip(smooth_cy, path_y_min, path_y_max))
+        path_x_at_car = self._path_x_at_y_points(base, center_y)
+        if path_x_at_car is None:
+            bias_sign = float(getattr(self, "car_last_center_bias_sign", 1.0))
+        elif float(smooth_cx) < float(path_x_at_car):
+            bias_sign = -1.0
+        else:
+            bias_sign = 1.0
+        path_bottom_y = float(np.max(base[:, 1]))
+        rows_to_car = max(0.0, path_bottom_y - center_y)
+        start_rows = max(0.0, float(getattr(config, "CAR_AVOIDANCE_START_OFFSET_ROWS", 100.0)))
+        near_rows = max(0.0, float(getattr(config, "CAR_AVOIDANCE_NEAR_OFFSET_ROWS", 50.0)))
+        start_offset = max(0.0, float(getattr(config, "CAR_AVOIDANCE_START_LEFT_OFFSET", 50.0)))
+        near_offset = max(0.0, float(getattr(config, "CAR_AVOIDANCE_NEAR_LEFT_OFFSET", 70.0)))
+
+        if start_rows > 0.0 and rows_to_car > start_rows:
+            return 0.0, None
+        bias = near_offset if rows_to_car <= near_rows else start_offset
+        return float(bias) * float(bias_sign), (center_y, path_bottom_y)
+
+    def _update_car_avoidance_center_bias(self, base_path, planning_items, w_seg, h_seg):
+        """检测到 car 时，先锁定同一辆车，再输出控制基准偏移量."""
         debug = {
-            "car_points": [],
             "blocked_y_range": None,
+            "center_bias_x": 0.0,
+            "state": self.car_avoidance_state,
+            "clear_frames": int(self.car_clearing_frames),
             "active": False,
         }
         base = np.array(base_path, dtype=np.float32).reshape((-1, 2))
         if len(base) < 2 or not bool(getattr(config, "CAR_AVOIDANCE_ENABLED", True)):
-            return base, debug
+            return 0.0, debug
 
-        candidates = []
+        measurements = []
         for item in planning_items:
-            if item.get("class_name", "") != "car":
-                continue
-            if float(item.get("score", 0.0)) < float(getattr(config, "CAR_AVOIDANCE_MIN_SCORE", 0.0)):
-                continue
-            seg_box = item.get("seg_box")
-            if seg_box is None:
-                continue
-            box = np.array(seg_box, dtype=np.float32).reshape((-1, 2))
-            if len(box) < 4:
-                continue
+            measurement = self._car_measurement_from_item(item, w_seg, h_seg, base)
+            if measurement is not None:
+                measurements.append(measurement)
 
-            area = float(max(0.0, np.max(box[:, 0]) - np.min(box[:, 0])) * max(0.0, np.max(box[:, 1]) - np.min(box[:, 1])))
-            max_area = float(getattr(config, "CAR_AVOIDANCE_MAX_AREA", 0.0))
-            if max_area > 0.0 and area > max_area:
-                continue
+        locked_car = self._update_locked_car(measurements, base)
+        if locked_car is None:
+            if self.car_avoidance_state == "AVOIDING" and self.car_last_avoid_path is not None:
+                self.car_avoidance_state = "CLEARING"
+                self.car_clearing_frames = 0
+            if self.car_avoidance_state == "CLEARING" and self.car_last_avoid_path is not None:
+                self.car_clearing_frames += 1
+                _clearing_path, avoid_weight = self._build_car_clearing_path(
+                    base,
+                    self.car_last_avoid_path,
+                    self.car_clearing_frames,
+                    fixed_bias_ready=False,
+                )
+                done_residual = float(getattr(config, "CAR_AVOIDANCE_CLEARING_DONE_RESIDUAL", 0.06))
+                done_frames = max(
+                    1,
+                    int(getattr(config, "CAR_AVOIDANCE_CLEARING_DECAY_FRAMES", 8)),
+                )
+                if self.car_clearing_frames >= done_frames and avoid_weight <= done_residual:
+                    self.car_avoidance_state = "FOLLOW_LANE"
+                    self.car_clearing_frames = 0
+                    self.car_last_avoid_path = None
+                    self.car_last_blocked_y_range = None
+                    debug["state"] = self.car_avoidance_state
+                    debug["clear_frames"] = 0
+                    return 0.0, debug
+                miss_bias = (
+                    float(getattr(config, "CAR_AVOIDANCE_CLEARING_LEFT_BIAS_MAX", 30.0)) *
+                    float(avoid_weight) *
+                    float(getattr(self, "car_last_center_bias_sign", 1.0))
+                )
+                debug["state"] = self.car_avoidance_state
+                debug["clear_frames"] = int(self.car_clearing_frames)
+                debug["center_bias_x"] = float(miss_bias)
+                debug["active"] = True
+                return float(miss_bias), debug
+            return 0.0, debug
 
-            y_sorted = np.argsort(box[:, 1])
-            bottom_pts = box[y_sorted[-2:]]
-            top_pts = box[y_sorted[:2]]
-            bottom_left_x = float(np.min(bottom_pts[:, 0]))
-            top_left_x = float(np.min(top_pts[:, 0]))
-            raw_bottom_y = float(np.max(bottom_pts[:, 1]))
-            raw_top_y = float(np.min(top_pts[:, 1]))
-            anchor_ratio = float(getattr(config, "CAR_AVOIDANCE_TOP_ANCHOR_HEIGHT_RATIO", 2.0 / 3.0))
-            anchor_ratio = max(0.0, min(1.0, anchor_ratio))
-            anchor_top_y = raw_top_y + (raw_bottom_y - raw_top_y) * anchor_ratio
-            anchor_top_x = top_left_x + (bottom_left_x - top_left_x) * anchor_ratio
-            path_y_min = float(np.min(base[:, 1]))
-            path_y_max = float(np.max(base[:, 1]))
-            top_y = float(np.clip(anchor_top_y, path_y_min, path_y_max))
-            bottom_y = float(np.clip(raw_bottom_y, path_y_min, path_y_max))
+        if self._car_fixed_left_bias_ready(locked_car, w_seg, h_seg):
+            self.car_avoidance_state = "CLEARING"
+            self.car_clearing_frames = 0
+            bias = float(getattr(config, "CAR_AVOIDANCE_FIXED_LEFT_BIAS_VALUE", 50.0))
+            self.car_last_center_bias_sign = 1.0
+            self.car_last_avoid_path = base.copy()
+            debug["state"] = self.car_avoidance_state
+            debug["clear_frames"] = 0
+            debug["fixed_left_bias"] = True
+            debug["center_bias_x"] = float(bias)
+            debug["active"] = True
+            return float(bias), debug
 
-            offset_scale = 1.0
-            if bool(getattr(config, "CAR_AVOIDANCE_AREA_SCALE_ENABLED", False)):
-                scale_min_area = float(getattr(config, "CAR_AVOIDANCE_AREA_SCALE_MIN_AREA", 0.0))
-                scale_max_area = float(getattr(config, "CAR_AVOIDANCE_AREA_SCALE_MAX_AREA", scale_min_area))
-                scale_min = float(getattr(config, "CAR_AVOIDANCE_AREA_SCALE_MIN", 1.0))
-                scale_max = float(getattr(config, "CAR_AVOIDANCE_AREA_SCALE_MAX", 1.0))
-                if scale_max_area > scale_min_area:
-                    area_t = (area - scale_min_area) / (scale_max_area - scale_min_area)
-                    area_t = float(np.clip(area_t, 0.0, 1.0))
-                    offset_scale = scale_min + (scale_max - scale_min) * area_t
+        bias, y_range = self._car_avoidance_center_bias(locked_car, base, w_seg, h_seg)
 
-            left_offset = float(getattr(config, "CAR_AVOIDANCE_TARGET_LEFT_OFFSET", 40.0)) * offset_scale
-            top_offset = float(getattr(config, "CAR_AVOIDANCE_TOP_LEFT_OFFSET", left_offset)) * offset_scale
-            candidates.append((
-                float(np.clip(anchor_top_x - top_offset, 0.0, float(w_seg - 1))),
-                top_y,
-            ))
-            skip_bottom_anchor = False
-            if bool(getattr(config, "CAR_AVOIDANCE_EDGE_SKIP_BOTTOM_ANCHOR", False)):
-                edge_margin = max(0.0, float(getattr(config, "CAR_AVOIDANCE_EDGE_MARGIN", 0.0)))
-                x_min = float(np.min(box[:, 0]))
-                x_max = float(np.max(box[:, 0]))
-                skip_bottom_anchor = x_min <= edge_margin or x_max >= float(w_seg - 1) - edge_margin
-            if not skip_bottom_anchor:
-                lead_rows = max(0.0, float(getattr(config, "CAR_AVOIDANCE_BOTTOM_LEAD_ROWS", 0.0)))
-                bottom_y = float(np.clip(raw_bottom_y + lead_rows, path_y_min, path_y_max))
-                candidates.append((
-                    float(np.clip(bottom_left_x - left_offset, 0.0, float(w_seg - 1))),
-                    bottom_y,
-                ))
+        if abs(float(bias)) <= 0.0:
+            self.locked_car = None
+            self.locked_car_miss_frames = 0
+            return 0.0, debug
 
-        if not candidates:
-            return base, debug
-
-        candidates = sorted(candidates, key=lambda pt: (float(pt[1]), float(pt[0])))
-        anchor_points = [candidates[0]]
-        if len(candidates) > 1:
-            anchor_points.append(candidates[-1])
-
-        planned, changed = self._build_segmented_coin_path(base, anchor_points, w_seg, min_anchors=2)
-        if not changed:
-            return base, debug
-
-        debug["car_points"] = anchor_points
-        ys = [float(pt[1]) for pt in anchor_points]
-        debug["blocked_y_range"] = (min(ys), max(ys))
+        if y_range is not None:
+            debug["blocked_y_range"] = (float(y_range[0]), float(y_range[1]))
+        self.car_last_center_bias_sign = 1.0 if float(bias) >= 0.0 else -1.0
+        self.car_avoidance_state = "AVOIDING"
+        self.car_clearing_frames = 0
+        self.car_last_avoid_path = base.copy()
+        self.car_last_blocked_y_range = debug["blocked_y_range"]
+        debug["state"] = self.car_avoidance_state
+        debug["clear_frames"] = 0
+        debug["center_bias_x"] = float(bias)
         debug["active"] = True
-        return planned, debug
+        return float(bias), debug
 
     def _draw_planning_points(self, canvas, planning_items):
         """在俯视图上绘制规划相关目标的质心点，必要时附加半径圈."""
@@ -2677,16 +2948,16 @@ class RoadSegmentor:
 
             path_points_orig = np.vstack((dense_x, dense_y)).astype(np.float32).T
             base_path_points = path_points_orig.copy()
-            _, car_path_debug = self._apply_car_avoidance_path_planning(
+            car_center_bias_x, car_path_debug = self._update_car_avoidance_center_bias(
                 path_points_orig,
                 planning_items,
                 w_seg,
                 h_seg,
-                mask=search_mask,
-                left_boundary=left_boundary_pts,
-                right_boundary=right_boundary_pts,
             )
             car_active = car_path_debug is not None and car_path_debug.get("active")
+            car_state = "FOLLOW_LANE"
+            if car_path_debug is not None:
+                car_state = str(car_path_debug.get("state", "FOLLOW_LANE"))
             blocked_y_ranges = []
             if car_active and car_path_debug.get("blocked_y_range") is not None:
                 blocked_y_ranges.append(car_path_debug["blocked_y_range"])
@@ -2699,10 +2970,9 @@ class RoadSegmentor:
                 left_boundary=left_boundary_pts,
                 right_boundary=right_boundary_pts,
                 blocked_y_ranges=blocked_y_ranges,
+                car_state=car_state,
             )
             merged_anchor_points = []
-            if car_active:
-                merged_anchor_points.extend(car_path_debug.get("car_points", []))
             if coin_path_debug is not None and coin_path_debug.get("active"):
                 merged_anchor_points.extend(coin_path_debug.get("coin_points", []))
 
@@ -2711,17 +2981,15 @@ class RoadSegmentor:
                     base_path_points,
                     merged_anchor_points,
                     w_seg,
-                    min_anchors=2 if car_active and not (coin_path_debug and coin_path_debug.get("active")) else 3,
+                    min_anchors=3,
                 )
                 if merged_changed:
                     path_points_orig = merged_path
                     if coin_path_debug is not None:
+                        coin_path_debug["planned_path"] = merged_path.astype(np.float32)
                         coin_path_debug["control_points"] = merged_path.astype(np.float32)
                         coin_path_debug["control_coin"] = tuple(map(float, merged_path[0]))
 
-            if car_active and coin_path_debug is not None:
-                coin_path_debug.setdefault("coin_points", [])
-                coin_path_debug["coin_points"].extend(car_path_debug.get("car_points", []))
             coin_active = coin_path_debug is not None and coin_path_debug.get("active")
             bypass_frame_jump = (
                 (coin_active or car_active) and
@@ -2748,7 +3016,12 @@ class RoadSegmentor:
                 no_target_points = self._select_no_target_control_points(path_points_orig, h_seg)
                 if no_target_points is not None:
                     control_path_points = no_target_points
-            steer_signal = self._compute_weighted_steer_signal(control_path_points, w_seg, h_seg)
+            steer_signal = self._compute_weighted_steer_signal(
+                control_path_points,
+                w_seg,
+                h_seg,
+                center_bias_x=car_center_bias_x if car_active else 0.0,
+            )
             if coin_path_debug is not None and coin_path_debug.get("active"):
                 steer_signal *= float(coin_path_debug.get("control_gain", 1.0))
                 steer_signal *= float(getattr(config, "STEER_SIGNAL_COIN_GAIN", 1.0))

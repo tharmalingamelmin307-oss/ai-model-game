@@ -193,7 +193,7 @@ ZEBRA_STOPLINE_EXTEND_RATIO = 0.35
 # - 停止线足够接近画面底部
 # 才会触发强制停车。
 # 当前先放宽到 240，优先验证停车链路是否能触发。
-ZEBRA_STOPLINE_TRIGGER_DIST = 300
+ZEBRA_STOPLINE_TRIGGER_DIST = 400
 
 # YOLO 默认置信度阈值。
 # 当某个类别没有在 CLASS_MIN_SCORES 里单独指定时，就回退到这个值。
@@ -544,10 +544,10 @@ STEER_SIGNAL_ROW_WEIGHT_GAMMA = 1.3
 # 归一化控制量缩放。归一化后原始 steer_signal 常为个位数，
 # 这里把它放大到更接近旧版累计控制量的显示和 PWM 调参量级。
 STEER_SIGNAL_NORMALIZED_SCALE = 3000.0
-# 额外横向偏移控制项已停用，暂不参与控制量。
-STEER_SIGNAL_BOTTOM_OFFSET_GAIN = 0.0
-STEER_SIGNAL_OFFSET_ROW_MIN_FROM_BOTTOM = 15.0
-STEER_SIGNAL_OFFSET_ROW_MAX_FROM_BOTTOM = 30.0
+# 避障车额外横向偏移控制项。
+# car 避障路径会相对“当前选中道路原始基础循线路径”产生横向位移；
+# 这里把每个控制行的横向偏移量单独累加进控制量，弥补只看斜率时横移响应偏弱的问题。
+STEER_SIGNAL_CAR_LATERAL_OFFSET_GAIN = 1000.0
 # 无金币/无车时，控制只看中下部这一段，底部最靠下 30 行不参与。
 # 这两个值是分割图坐标里的 y 行号；在 416x160 输入下，60~130 表示只取中下部路径。
 STEER_SIGNAL_NO_TARGET_ROW_MIN = 60.0
@@ -720,7 +720,7 @@ TRAFFIC_LIGHT_YELLOW_CLASS_ID_FALLBACK = 8
 # 恢复前进需要同时满足:
 # - 行人底部中心连续向左移动若干帧
 # - person 框底部中心已经越过当前选中路的释放线
-PERSON_STOP_TRIGGER_DIST = 240    #貌似200也不是很多（720）
+PERSON_STOP_TRIGGER_DIST = 300    #貌似200也不是很多（720）
 PERSON_CLEAR_MOVE_FRAMES = 2
 PERSON_CLEAR_MIN_LEFT_DX = 3.0
 # 行人放行线位置。0.0 是当前道路左边界，0.5 是道路中线，1.0 是右边界。
@@ -1024,26 +1024,66 @@ TRACK_WIDTH_LOG_INTERVAL = 1.5
 
 # ---------------------------------------------------------------------------
 # 车辆避障路径参数
+# 这组参数工作在分割输入 `SEG_SIZE = 416x160` 的坐标系里。
+# y 方向是 160 行高度，所有 `*_ROWS` 都是“离底部多少行”的意思。
+# 当前策略不是“看不见车就立刻回正”，而是先走 `AVOIDING`，再等 `CLEAR`
+# 条件满足后分两段回正，避免车尾擦到障碍物。
 # ---------------------------------------------------------------------------
 # 检测到 car 时，把车框左侧两个角点向左偏移后作为避障目标点。
 # 这些目标点会像金币锚点一样插入路径，使车优先从障碍车左侧绕过。
 CAR_AVOIDANCE_ENABLED = True
-CAR_AVOIDANCE_TARGET_LEFT_OFFSET = 90.0
-CAR_AVOIDANCE_TOP_LEFT_OFFSET = 70.0
+CAR_AVOIDANCE_TARGET_LEFT_OFFSET = 50.0
+CAR_AVOIDANCE_TOP_LEFT_OFFSET = 50.0
+# 当障碍车位于当前基础循线路径右侧时，避障目标点至少压到基础线左侧这么多像素。
+CAR_AVOIDANCE_RIGHT_OBSTACLE_MIN_LEFT_OFFSET = 20.0
 CAR_AVOIDANCE_TOP_ANCHOR_HEIGHT_RATIO = 1.0 / 3.0
-CAR_AVOIDANCE_AREA_SCALE_ENABLED = True
-CAR_AVOIDANCE_AREA_SCALE_MIN_AREA = 1200.0
+CAR_AVOIDANCE_AREA_SCALE_ENABLED = False
+CAR_AVOIDANCE_AREA_SCALE_MIN_AREA = 0.0
 CAR_AVOIDANCE_AREA_SCALE_MAX_AREA = 14000.0
 CAR_AVOIDANCE_AREA_SCALE_MIN = 1.2
 CAR_AVOIDANCE_AREA_SCALE_MAX = 1.8
 CAR_AVOIDANCE_EDGE_SKIP_BOTTOM_ANCHOR = True
 CAR_AVOIDANCE_EDGE_MARGIN = 8.0
-CAR_AVOIDANCE_BOTTOM_LEAD_ROWS = 30.0
+CAR_AVOIDANCE_BOTTOM_LEAD_ROWS = 12.0
 CAR_AVOIDANCE_BOTTOM_NEAR_ROWS = 12.0
-CAR_AVOIDANCE_MISS_FRAMES = 2
+# 固定分段偏移：检测框底部离画面底部 150 行内开始左偏 60，
+# 80 行内左偏 90。贴右下角且高度较矮时单独固定左偏 50。
+CAR_AVOIDANCE_DYNAMIC_OFFSET_ENABLED = False
+CAR_AVOIDANCE_START_OFFSET_ROWS = 150.0
+CAR_AVOIDANCE_START_LEFT_OFFSET = 60.0
+CAR_AVOIDANCE_NEAR_OFFSET_ROWS = 50.0
+CAR_AVOIDANCE_NEAR_LEFT_OFFSET = 90.0
+# car 跟踪锁定。锁定主要看车框底部中心点的连续性，面积只做异常框过滤。
+# 连续命中后进入避障；退出时要等 `car` 丢失且路径稳定并越过障碍范围，
+# 然后先轻微回正，再慢慢回到普通巡线。
+CAR_AVOIDANCE_LOCK_HIT_FRAMES = 2
+CAR_AVOIDANCE_SEARCH_RADIUS = 48.0
+CAR_AVOIDANCE_SEARCH_RADIUS_MISS_GAIN = 16.0
+CAR_AVOIDANCE_TRACK_EMA_ALPHA = 0.65
+# car 框短暂变小、被遮挡或漏检时，继续沿用最近一次避障锚点的帧数。
+# 调大可避免太早回正；过大会让已经绕过车后继续偏左太久。
+CAR_AVOIDANCE_MISS_FRAMES = 5
 CAR_AVOIDANCE_MASK_RADIUS = 10
 CAR_AVOIDANCE_MIN_SCORE = 0.0
 CAR_AVOIDANCE_MAX_AREA = 0.0
+
+# 避障退出状态机。
+# 车丢失后不立刻回正，而是先进入 CLEARING。
+# CLEARING 里会先保留一段左偏，再慢慢回到正常巡线。
+CAR_AVOIDANCE_CLEARING_MISS_FRAMES = 3
+CAR_AVOIDANCE_CLEARING_DECAY_FRAMES = 12
+CAR_AVOIDANCE_CLEARING_RESIDUAL_KEEP = 1.0
+CAR_AVOIDANCE_CLEARING_DONE_RESIDUAL = 0.06
+CAR_AVOIDANCE_CLEARING_LEFT_BIAS_MAX = 30.0
+# 车框还在但已经很贴底、贴右且高度较小时，直接给固定左偏。
+CAR_AVOIDANCE_FIXED_LEFT_BIAS_HEIGHT_THRESH = 60.0
+CAR_AVOIDANCE_FIXED_LEFT_BIAS_RIGHT_MARGIN = 10.0
+CAR_AVOIDANCE_FIXED_LEFT_BIAS_BOTTOM_MARGIN = 10.0
+CAR_AVOIDANCE_FIXED_LEFT_BIAS_VALUE = 50.0
+# 避障时允许金币的窗口。
+# AVOIDING 期间只允许“底部第一段金币”；CLEARING 期间只允许更靠底且更安全的金币。
+CAR_AVOIDANCE_COIN_ALLOW_BOTTOM_ROWS = 28.0
+CAR_AVOIDANCE_CLEARING_COIN_SAFE_ROWS = 16.0
 
 # ---------------------------------------------------------------------------
 # 金币分段路径参数
@@ -1112,7 +1152,7 @@ SEG_DEBUG_PIP_DIVISOR = 3
 SEG_DEBUG_PIP_BORDER_COLOR = (255, 255, 255)
 SEG_DEBUG_PIP_BORDER_THICKNESS = 1
 SEG_DEBUG_DRAW_BIRD_VIEW = False
-SEG_DEBUG_DRAW_PLANNING_POINTS = False
+SEG_DEBUG_DRAW_PLANNING_POINTS = True
 
 # 分割调试图左上角文字的字号、位置与颜色。
 # 这些信息主要用于现场快速确认：
