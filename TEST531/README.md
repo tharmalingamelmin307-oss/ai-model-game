@@ -326,6 +326,8 @@
 6. 则触发强制停车
 7. 如果灯色变成 `green`
    就解除这个停车状态
+8. 如果已经停车后连续 5 帧检测不到灯色，则进入后退找灯
+9. 后退到停止线到底部距离达到 150 后停止后退，重新等待灯色
 
 ### 10. 行人停车逻辑
 
@@ -471,6 +473,10 @@ target_speed = 0                                # 若红/黄灯停车或行人�
 | `LIMIT_SIGN_HISTORY_MAX_MISS_FRAMES` | 限速历史在连续丢失后保留的最大帧数 |
 | `ZEBRA_STOPLINE_EXTEND_RATIO` | 斑马线停止线左右延长比例 |
 | `ZEBRA_STOPLINE_TRIGGER_DIST` | 停止线距离底部多近时触发红黄灯停车 |
+| `TRAFFIC_LIGHT_RECOVER_MISS_FRAMES` | 红绿灯停车后连续丢灯多少检测帧才后退找灯 |
+| `TRAFFIC_LIGHT_RECOVER_TARGET_DIST` | 后退找灯时停止线距离底部达到多少像素后停止后退 |
+| `TRAFFIC_LIGHT_RECOVER_RELEASE_TIMEOUT` | 进入恢复链路后仍检测不到灯时，等待多少秒后直接放行 |
+| `TRAFFIC_LIGHT_RECOVER_BACK_SPEED` | 后退找灯时下发的倒车速度档位 |
 | `YOLO_CONF_THRES` | YOLO 全局默认置信度阈值 |
 | `YOLO_NMS_THRES` | YOLO NMS 阈值 |
 | `CLASS_MIN_SCORES` | 各类别单独置信度阈值 |
@@ -512,6 +518,7 @@ target_speed = 0                                # 若红/黄灯停车或行人�
 | `FORK_INNER_OPEN_MIN_POSITIVE_SIDE_ROWS` | 单侧正增长的最少行数 |
 | `FORK_INNER_OPEN_MAX_STEP_REGRESSION` | 允许的单步回退上限 |
 | `FORK_INNER_OPEN_MAX_MISS_ROWS` | 张开过程中允许缺失的最大行数 |
+| `FORK_TRUNK_SUPPORT_*` | Y 岔路分叉点到底部主干线附近的 mask 支撑约束 |
 | `SEG_SCENE_SCAN_BOTTOM_HEIGHT` | 汇合/场景扫描只看底部多少行 |
 | `MERGE_GUIDE_SCAN_Y_TOP` / `MERGE_GUIDE_SCAN_Y_BOTTOM` | 汇合宽带前置扫描范围 |
 | `MERGE_GUIDE_FREE_SCAN_Y_TOP` / `MERGE_GUIDE_FREE_SCAN_Y_BOTTOM` | 底部自由汇合扫描范围 |

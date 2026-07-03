@@ -2,34 +2,58 @@
 """Quick Qianfan chat-completions API smoke test.
 
 Usage:
-    export QIANFAN_API_KEY="your api key"
+    cp .env.example .env
+    # edit .env and fill QIANFAN_API_KEY
     python3 test_qianfan_api.py
-    python3 test_qianfan_api.py --model ernie-lite-8k --text "限速3O"
+    python3 test_qianfan_api.py --model ernie-4.5-turbo-32k --text "抄近道"
 """
 
 import argparse
 import json
 import os
+from pathlib import Path
 import sys
 import urllib.error
 import urllib.request
 
 
 API_URL = "https://qianfan.baidubce.com/v2/chat/completions"
+PROJECT_ROOT = Path(__file__).resolve().parent
+ENV_PATH = PROJECT_ROOT / ".env"
 
 
-try:
-    import qianfan_secret
-except ImportError:
-    qianfan_secret = None
+def load_project_env(env_path=ENV_PATH):
+    """Load project .env using python-dotenv when available, with a small fallback."""
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        load_dotenv = None
+
+    if load_dotenv is not None:
+        load_dotenv(dotenv_path=env_path, override=False)
+        return
+
+    if not env_path.exists():
+        return
+
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+load_project_env()
 
 
 def get_secret_value(name, default=""):
     env_value = os.getenv(name, "").strip()
     if env_value:
         return env_value
-    if qianfan_secret is not None:
-        return str(getattr(qianfan_secret, name, default)).strip()
     return default
 
 
@@ -42,7 +66,7 @@ def parse_args():
     )
     parser.add_argument(
         "--text",
-        default="左道封闭",
+        default="走大圈",
         help="Road choice text to classify. Default: 走大圈",
     )
     parser.add_argument(
@@ -58,7 +82,7 @@ def main():
     args = parse_args()
     api_key = get_secret_value("QIANFAN_API_KEY")
     if not api_key:
-        print("Missing QIANFAN_API_KEY. Run: export QIANFAN_API_KEY='your api key'", file=sys.stderr)
+        print("Missing QIANFAN_API_KEY. Put it in .env or export it in the shell.", file=sys.stderr)
         return 2
 
     prompt = (
