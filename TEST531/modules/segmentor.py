@@ -788,12 +788,69 @@ class RoadSegmentor:
             }
 
         lowest_split = opening_run[0]
+        fork_point = (float(lowest_split["fork_x"]), float(lowest_split["y"]))
+        if not self._fork_trunk_support_ok(search_mask, fork_point):
+            return {
+                "active": False,
+                "fork_point": None,
+                "split_rows": 0,
+            }
 
         return {
             "active": True,
-            "fork_point": (float(lowest_split["fork_x"]), float(lowest_split["y"])),
+            "fork_point": fork_point,
             "split_rows": max(1, int(len(opening_run))),
         }
+
+    def _fork_trunk_support_ok(self, search_mask, fork_point):
+        """分叉点以下的公共主干应有 mask 支撑，避免分界线长距离悬空."""
+        if not bool(getattr(config, "FORK_TRUNK_SUPPORT_CHECK_ENABLED", True)):
+            return True
+        if search_mask is None or search_mask.size == 0 or fork_point is None:
+            return False
+
+        h, w = search_mask.shape[:2]
+        fork_x = float(fork_point[0])
+        fork_y = float(fork_point[1])
+        bottom_y = float(h - 1)
+        bottom_mid_x = float(w) / 2.0
+        start_y = int(np.clip(np.floor(fork_y) + 1, 0, h - 1))
+        end_y = int(h - 1)
+        if end_y < start_y:
+            return False
+
+        radius = max(0, int(getattr(config, "FORK_TRUNK_SUPPORT_RADIUS", 5)))
+        min_ratio = float(getattr(config, "FORK_TRUNK_SUPPORT_MIN_RATIO", 0.55))
+        max_miss_rows = max(0, int(getattr(config, "FORK_TRUNK_SUPPORT_MAX_MISS_ROWS", 18)))
+        min_rows = max(1, int(getattr(config, "FORK_TRUNK_SUPPORT_MIN_ROWS", 18)))
+
+        checked_rows = 0
+        hit_rows = 0
+        miss_run = 0
+        max_miss_run = 0
+        divider_dy = max(1.0, bottom_y - fork_y)
+
+        for y in range(start_y, end_y + 1):
+            t = np.clip((float(y) - fork_y) / divider_dy, 0.0, 1.0)
+            split_x = fork_x + (bottom_mid_x - fork_x) * t
+            center_col = int(np.clip(round(split_x), 0, w - 1))
+            left = max(0, center_col - radius)
+            right = min(w - 1, center_col + radius)
+            has_support = bool(np.any(search_mask[y, left:right + 1] > 0))
+
+            checked_rows += 1
+            if has_support:
+                hit_rows += 1
+                miss_run = 0
+            else:
+                miss_run += 1
+                max_miss_run = max(max_miss_run, miss_run)
+
+        if checked_rows < min_rows:
+            return False
+        if max_miss_run > max_miss_rows:
+            return False
+        return (float(hit_rows) / float(checked_rows)) >= min_ratio
 
     def _collect_branch_rows(self, search_mask, edge_mask, top_y, bottom_y):
         """收集指定 y 范围内的双白区行，并统计是否满足汇合入口条件."""

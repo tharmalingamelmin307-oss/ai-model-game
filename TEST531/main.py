@@ -1091,6 +1091,7 @@ def seg_worker(core_id):
             global_control_data["steer_signal"] = steer_signal
             global_control_data["traffic_light_state"] = traffic_light_state
             global_control_data["zebra_stopline_y"] = None if zebra_stopline is None else int(zebra_stopline[1])
+            global_control_data["traffic_light_frame_id"] = int(current_yolo_frame_id)
             person_stop_active = update_person_stop_state(
                 global_control_data,
                 person_info,
@@ -1107,6 +1108,7 @@ def seg_worker(core_id):
                 else None
             )
             traffic_stop_active = global_control_data.get("traffic_stop_active", False)
+            traffic_backing_up = global_control_data.get("traffic_backing_up", False)
 
             fps_stats["seg_frames"] += 1
             now = time.time()
@@ -1194,7 +1196,9 @@ def seg_worker(core_id):
                     cv2.LINE_AA
                 )
             stop_text = ""
-            if traffic_stop_active:
+            if traffic_backing_up:
+                stop_text = "BACK_FOR_LIGHT"
+            elif traffic_stop_active:
                 stop_text = "STOP_BY_LIGHT"
             elif person_stop_active:
                 stop_text = "STOP_BY_PERSON"
@@ -1408,8 +1412,13 @@ def serial_control_thread():
                 else None
             )
             zebra_stopline_y = global_control_data.get("zebra_stopline_y")
+            traffic_light_frame_id = int(global_control_data.get("traffic_light_frame_id", -1))
             traffic_light_state = str(global_control_data.get("traffic_light_state", ""))
             traffic_stop_active = bool(global_control_data.get("traffic_stop_active", False))
+            traffic_backing_up = bool(global_control_data.get("traffic_backing_up", False))
+            traffic_light_miss_frames = int(global_control_data.get("traffic_light_miss_frames", 0))
+            traffic_recover_started_at = global_control_data.get("traffic_recover_started_at")
+            traffic_recover_last_frame_id = int(global_control_data.get("traffic_recover_last_frame_id", -1))
             person_stop_active = bool(global_control_data.get("person_stop_active", False))
             person_dist_to_bottom = global_control_data.get("person_dist_to_bottom")
             person_left_boundary_x = global_control_data.get("person_left_boundary_x")
@@ -1439,6 +1448,7 @@ def serial_control_thread():
                 target_speed = min(target_speed, int(speed_limit))
 
             stop_trigger_dist = int(config.ZEBRA_STOPLINE_TRIGGER_DIST)
+            recover_target_dist = int(getattr(config, "TRAFFIC_LIGHT_RECOVER_TARGET_DIST", 150))
             stopline_dist_to_bottom = None
             if zebra_stopline_y is not None:
                 stopline_dist_to_bottom = config.TARGET_RES[1] - int(zebra_stopline_y)
@@ -1463,17 +1473,67 @@ def serial_control_thread():
 
             if traffic_light_state == "green":
                 traffic_stop_active = False
+                traffic_backing_up = False
+                traffic_light_miss_frames = 0
+                traffic_recover_started_at = None
             elif traffic_light_state in ("red", "yellow") and stop_ready:
                 traffic_stop_active = True
+                traffic_backing_up = False
+                traffic_light_miss_frames = 0
+                traffic_recover_started_at = None
 
             if traffic_stop_active:
+                new_traffic_frame = (
+                    traffic_light_frame_id >= 0 and
+                    traffic_light_frame_id != traffic_recover_last_frame_id
+                )
+                if new_traffic_frame:
+                    traffic_recover_last_frame_id = traffic_light_frame_id
+                    if traffic_light_state:
+                        traffic_light_miss_frames = 0
+                    else:
+                        traffic_light_miss_frames += 1
+
+                if (
+                    not traffic_backing_up and
+                    not traffic_light_state and
+                    traffic_light_miss_frames >= int(getattr(config, "TRAFFIC_LIGHT_RECOVER_MISS_FRAMES", 5))
+                ):
+                    traffic_backing_up = True
+                    traffic_recover_started_at = time.monotonic()
+
+                if traffic_backing_up:
+                    if traffic_light_state in ("red", "yellow"):
+                        traffic_backing_up = False
+                    elif stopline_dist_to_bottom is not None and stopline_dist_to_bottom >= recover_target_dist:
+                        traffic_backing_up = False
+
+                if (
+                    traffic_recover_started_at is not None and
+                    not traffic_light_state and
+                    time.monotonic() - float(traffic_recover_started_at) >= float(getattr(config, "TRAFFIC_LIGHT_RECOVER_RELEASE_TIMEOUT", 10.0))
+                ):
+                    traffic_stop_active = False
+                    traffic_backing_up = False
+                    traffic_light_miss_frames = 0
+                    traffic_recover_started_at = None
+            else:
+                traffic_backing_up = False
+                traffic_light_miss_frames = 0
+                traffic_recover_started_at = None
+
+            if traffic_backing_up:
+                target_speed = int(getattr(config, "TRAFFIC_LIGHT_RECOVER_BACK_SPEED", -10))
+            elif traffic_stop_active:
                 target_speed = 0
             if person_stop_active:
                 target_speed = 0
 
             limit_applied = speed_limit is not None and dynamic_target_speed > int(speed_limit)
             if bool(getattr(config, "CONTROL_SPEED_SMOOTH_ENABLED", True)):
-                if target_speed <= 0:
+                if target_speed < 0:
+                    last_output_speed = int(target_speed)
+                elif target_speed == 0:
                     last_output_speed = 0
                 else:
                     if last_output_speed <= 0:
@@ -1511,9 +1571,16 @@ def serial_control_thread():
             person_stop_event = ""
             if traffic_stop_active or person_stop_active:
                 target_speed = 0
+            traffic_backing_up = False
+            traffic_light_miss_frames = 0
+            traffic_recover_started_at = None
 
         with data_lock:
             global_control_data["traffic_stop_active"] = traffic_stop_active
+            global_control_data["traffic_backing_up"] = traffic_backing_up
+            global_control_data["traffic_light_miss_frames"] = traffic_light_miss_frames
+            global_control_data["traffic_recover_started_at"] = traffic_recover_started_at
+            global_control_data["traffic_recover_last_frame_id"] = traffic_recover_last_frame_id
             global_control_data["person_stop_active"] = person_stop_active
             global_control_data["actual_servo_pwm"] = servo_pwm
             global_control_data["target_speed"] = target_speed
@@ -1523,12 +1590,14 @@ def serial_control_thread():
         if traffic_stop_active:
             light_text = traffic_light_state or "无"
             zebra_dist_text = "无" if stopline_dist_to_bottom is None else str(stopline_dist_to_bottom)
+            recover_text = "后退找灯" if traffic_backing_up else "等待"
             throttled_log(
                 "traffic_stop_detail",
                 "红绿灯停车条件触发: "
                 f"灯色={light_text} 停车线到底部距离={zebra_dist_text} "
-                f"阈值={stop_trigger_dist} 已停车=是",
-                state=(light_text, zebra_dist_text, int(stop_trigger_dist)),
+                f"阈值={stop_trigger_dist} 已停车=是 恢复状态={recover_text} "
+                f"丢灯帧={traffic_light_miss_frames}",
+                state=(light_text, zebra_dist_text, int(stop_trigger_dist), recover_text, int(traffic_light_miss_frames)),
                 min_interval=config.LOG_INTERVAL_TRAFFIC_STOP_DETAIL
             )
 

@@ -195,6 +195,15 @@ ZEBRA_STOPLINE_EXTEND_RATIO = 0.35
 # 当前先放宽到 240，优先验证停车链路是否能触发。
 ZEBRA_STOPLINE_TRIGGER_DIST = 400
 
+# 红绿灯停车后，如果灯太近丢失，进入“后退找灯”的保护状态机。
+# - 连续丢失 TRAFFIC_LIGHT_RECOVER_MISS_FRAMES 个检测帧后开始后退
+# - 后退到停止线距离画面底部至少 TRAFFIC_LIGHT_RECOVER_TARGET_DIST 后停止
+# - 如果进入恢复链路后 TRAFFIC_LIGHT_RECOVER_RELEASE_TIMEOUT 秒仍看不到灯，直接放行
+TRAFFIC_LIGHT_RECOVER_MISS_FRAMES = 5
+TRAFFIC_LIGHT_RECOVER_TARGET_DIST = 150
+TRAFFIC_LIGHT_RECOVER_RELEASE_TIMEOUT = 10.0
+TRAFFIC_LIGHT_RECOVER_BACK_SPEED = -10
+
 # YOLO 默认置信度阈值。
 # 当某个类别没有在 CLASS_MIN_SCORES 里单独指定时，就回退到这个值。
 YOLO_CONF_THRES = 0.50
@@ -337,6 +346,13 @@ FORK_INNER_OPEN_MIN_POSITIVE_GAP_ROWS = 3
 FORK_INNER_OPEN_MIN_POSITIVE_SIDE_ROWS = 2
 FORK_INNER_OPEN_MAX_STEP_REGRESSION = 3.0
 FORK_INNER_OPEN_MAX_MISS_ROWS = 2
+# Y 岔路分叉点以下必须有公共主干 mask 支撑。
+# 从分叉点到底部中点拉线，沿线附近多数行应能命中 mask，否则认为这条分叉线是悬空误判。
+FORK_TRUNK_SUPPORT_CHECK_ENABLED = True
+FORK_TRUNK_SUPPORT_RADIUS = 5
+FORK_TRUNK_SUPPORT_MIN_RATIO = 0.55
+FORK_TRUNK_SUPPORT_MAX_MISS_ROWS = 18
+FORK_TRUNK_SUPPORT_MIN_ROWS = 18
 
 # 汇合场景扫描只看底部多少行。
 # 当前 416x160 输入下设为 140 表示只扫描 y >= 20 的近处区域。
@@ -386,7 +402,7 @@ MERGE_STATE_EXIT_BOTTOM_ROWS = 5
 MERGE_STATE_EXIT_WIDTH_THRESH = 340.0
 MERGE_STATE_EXIT_CONFIRM_FRAMES = 2
 MERGE_STATE_EXIT_NO_EDGE_Y_TOP = 40
-MERGE_STATE_EXIT_NO_EDGE_Y_BOTTOM = 130
+MERGE_STATE_EXIT_NO_EDGE_Y_BOTTOM = 140
 
 # 固定赛道宽度表的来源坐标系。
 # 当前表仍然是旧 320x320 搜索平面里的样本；代码会按当前 SEG_SIZE 和裁剪比例映射到 416x160。
@@ -530,8 +546,13 @@ STEER_SIGNAL_CAR_GAIN = 1.0
 # - limit_sign_history: 限速牌历史累计池，按数字聚合 count / score_sum
 # - limit_sign_last_detect_fid: 最近一次检测到 limit_sign 的帧号
 # - zebra_stopline_y: 停止线在 TARGET_RES 坐标系中的 y 值
+# - traffic_light_frame_id: 当前交通灯/停止线检测结果对应的 YOLO 帧号
 # - traffic_light_state: 当前交通灯状态，允许值 red / yellow / green / ""
 # - traffic_stop_active: 当前是否已经进入“红黄灯强制停车”状态
+# - traffic_backing_up: 停车后灯丢失时，是否正在后退找灯
+# - traffic_light_miss_frames: 停车状态下连续丢失灯色的检测帧数
+# - traffic_recover_started_at: 后退找灯链路开始时间，None 表示未开始
+# - traffic_recover_last_frame_id: 恢复状态机上次处理过的 YOLO 帧号
 # - person_stop_active: 当前是否已经进入“行人强制停车”状态
 # - person_*: 行人停车/放行判定用的最近状态
 # - actual_servo_pwm: 当前串口线程真正准备下发的舵机 PWM
@@ -545,8 +566,13 @@ DEFAULT_CONTROL_DATA = {
     "limit_sign_history": {},
     "limit_sign_last_detect_fid": -1,
     "zebra_stopline_y": None,
+    "traffic_light_frame_id": -1,
     "traffic_light_state": "",
     "traffic_stop_active": False,
+    "traffic_backing_up": False,
+    "traffic_light_miss_frames": 0,
+    "traffic_recover_started_at": None,
+    "traffic_recover_last_frame_id": -1,
     "person_stop_active": False,
     "person_bottom_y": None,
     "person_bottom_center_x": None,
