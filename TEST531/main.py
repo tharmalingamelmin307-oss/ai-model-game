@@ -22,13 +22,14 @@ import cv2
 import threading
 import serial
 from queue import Queue
-from multiprocessing import shared_memory, resource_tracker
+from multiprocessing import Process, Queue as MPQueue, shared_memory, resource_tracker
 from flask import Flask, Response, render_template_string
 
 import config
 from modules.segmentor import RoadSegmentor
 from modules.detector import YOLODetector
 from modules.ocr_system import OCRRecognizer
+from modules.qianfan_client import request_road_choice
 try:
     from utils.rknn_quiet import install_rknn_warning_filter
 except ImportError:
@@ -36,6 +37,8 @@ except ImportError:
         return
 
 app = Flask(__name__)
+LOG_GREEN = "\033[92m"
+LOG_RESET = "\033[0m"
 
 # ==============================================================================
 # 全局状态与资源锁
@@ -64,6 +67,8 @@ log_lock = threading.Lock()
 seg_queue = Queue(maxsize=config.SEG_QUEUE_MAXSIZE)
 yolo_queue = Queue(maxsize=config.YOLO_QUEUE_MAXSIZE)
 ocr_queue = Queue(maxsize=config.OCR_QUEUE_MAXSIZE)
+llm_queue = MPQueue(maxsize=2)
+llm_result_queue = MPQueue(maxsize=2)
 
 # 当前最新一帧的检测结果。
 global_yolo_boxes = []
@@ -690,6 +695,189 @@ def select_best_limit_sign_candidate(state):
     return max(pool, key=lambda c: (c["count"], c["avg_score"], c["score_sum"]))
 
 
+def clear_sign_llm_state(state, keep_completed=False):
+    """清理语义路牌 LLM 状态；可选择保留本次路牌已处理标记."""
+    state["sign_llm_stop_active"] = False
+    state["sign_llm_collecting"] = False
+    state["sign_llm_waiting_result"] = False
+    state["sign_llm_samples"] = []
+    state["sign_llm_attempts"] = 0
+    state["sign_llm_started_at"] = None
+    state["sign_llm_frame_id"] = -1
+    state["sign_llm_error"] = ""
+    if not keep_completed:
+        state["sign_llm_completed_hold"] = False
+
+
+def enqueue_sign_llm_job(frame_id, samples):
+    """只保留最新一份语义路牌 LLM 任务，避免旧路牌请求排队积压."""
+    if not bool(getattr(config, "SIGN_LLM_ENABLED", True)):
+        return False
+    task = {
+        "frame_id": int(frame_id),
+        "samples": list(samples),
+        "created_at": time.time(),
+    }
+    if llm_queue.full():
+        try:
+            llm_queue.get_nowait()
+        except Exception:
+            pass
+    llm_queue.put(task)
+    return True
+
+
+def maybe_submit_sign_llm_job(state, frame_id, force=False):
+    """收够停车 OCR 样本后，把样本发给 LLM 进程."""
+    if state.get("sign_llm_waiting_result", False):
+        return False
+    samples = list(state.get("sign_llm_samples", []))
+    attempts = int(state.get("sign_llm_attempts", len(samples)))
+    valid_samples = [sample for sample in samples if str(sample.get("text", "")).strip()]
+    sample_need = max(1, int(getattr(config, "SIGN_LLM_OCR_SAMPLES", 10)))
+    min_valid = max(1, int(getattr(config, "SIGN_LLM_MIN_VALID_SAMPLES", 3)))
+    ready = len(valid_samples) >= sample_need
+    if not ready:
+        if attempts >= sample_need or force:
+            throttled_log(
+                "sign_llm_not_enough_valid",
+                f"语义路牌OCR有效样本不足，继续采集: valid={len(valid_samples)} need={sample_need} attempts={attempts}",
+                state=(len(valid_samples), attempts),
+                min_interval=0.5,
+            )
+        return False
+    if not enqueue_sign_llm_job(frame_id, valid_samples[:sample_need]):
+        return False
+    state["sign_llm_collecting"] = False
+    state["sign_llm_waiting_result"] = True
+    state["sign_llm_samples"] = valid_samples[:sample_need]
+    return True
+
+
+def record_sign_llm_sample(state, frame_id, text="", score=0.0, reason=""):
+    """记录一次停车 OCR 采样尝试；空文本也计入尝试次数，便于诊断进度."""
+    if not (
+        bool(getattr(config, "SIGN_LLM_ENABLED", True)) and
+        bool(state.get("sign_llm_stop_active", False)) and
+        bool(state.get("sign_llm_collecting", False))
+    ):
+        return False
+
+    sample_need = max(1, int(getattr(config, "SIGN_LLM_OCR_SAMPLES", 10)))
+    attempts = int(state.get("sign_llm_attempts", 0)) + 1
+    state["sign_llm_attempts"] = attempts
+
+    text = str(text or "").strip().upper()
+    if text:
+        samples = list(state.get("sign_llm_samples", []))
+        if len(samples) < sample_need:
+            samples.append({
+                "text": text,
+                "score": float(score),
+                "frame_id": int(frame_id),
+            })
+            state["sign_llm_samples"] = samples
+
+    valid_count = len([sample for sample in state.get("sign_llm_samples", []) if str(sample.get("text", "")).strip()])
+    throttled_log(
+        "sign_llm_sample",
+        f"语义路牌OCR采样: attempts={attempts}/{sample_need} valid={valid_count} "
+        f"文本={text or '<空>'} 置信度={float(score):.3f} 原因={reason or 'ok'}",
+        state=(attempts, valid_count, text, reason),
+        min_interval=0.0,
+    )
+    return maybe_submit_sign_llm_job(state, int(frame_id))
+
+
+def sign_llm_worker():
+    """千帆语义判定独立进程，避免网络请求阻塞视觉/串口线程."""
+    while True:
+        task = llm_queue.get()
+        if task is None:
+            break
+        frame_id = int(task.get("frame_id", -1))
+        samples = list(task.get("samples", []))
+        sample_text = [(s.get("text"), round(float(s.get("score", 0.0)), 3)) for s in samples]
+        print(f"千帆路牌任务开始: frame={frame_id} samples={sample_text}", flush=True)
+        try:
+            result, raw = request_road_choice(
+                samples,
+                timeout=float(getattr(config, "SIGN_LLM_API_TIMEOUT", 3.0)),
+            )
+            payload = {
+                "frame_id": frame_id,
+                "result": result,
+                "raw": raw,
+                "error": "",
+                "samples": samples,
+            }
+            print(f"{LOG_GREEN}千帆路牌任务返回: frame={frame_id} result={result} raw={raw}{LOG_RESET}", flush=True)
+        except Exception as e:
+            payload = {
+                "frame_id": frame_id,
+                "result": "",
+                "raw": "",
+                "error": str(e),
+                "samples": samples,
+            }
+            print(f"千帆路牌任务异常: frame={frame_id} error={e}", flush=True)
+        if llm_result_queue.full():
+            try:
+                llm_result_queue.get_nowait()
+            except Exception:
+                pass
+        llm_result_queue.put(payload)
+
+
+def drain_sign_llm_results():
+    """在主进程内消费 LLM 结果，写入 turn_intent 并释放停车状态."""
+    while True:
+        try:
+            item = llm_result_queue.get_nowait()
+        except Exception:
+            break
+        frame_id = int(item.get("frame_id", -1))
+        result = str(item.get("result", "")).strip().upper()
+        error = str(item.get("error", "")).strip()
+        samples = list(item.get("samples", []))
+
+        with data_lock:
+            waiting = bool(global_control_data.get("sign_llm_waiting_result", False))
+            active_fid = int(global_control_data.get("sign_llm_frame_id", -1))
+            current_fid = int(global_yolo_frame_id)
+            max_age = max(1, int(getattr(config, "SIGN_LLM_RESULT_MAX_AGE_FRAMES", 60)))
+            too_old = current_fid >= 0 and frame_id >= 0 and current_fid - frame_id > max_age
+            if not waiting:
+                print(
+                    "千帆路牌结果丢弃: "
+                    f"waiting={waiting} result_frame={frame_id} active_frame={active_fid} "
+                    f"current_frame={current_fid} max_age={max_age} too_old={too_old}",
+                    flush=True,
+                )
+                continue
+
+            if result in ("LEFT", "RIGHT"):
+                global_control_data["turn_intent"] = -1 if result == "LEFT" else 1
+                global_control_data["turn_intent_fid"] = max(frame_id, active_fid)
+                global_control_data["sign_llm_result"] = result
+                global_control_data["sign_llm_completed_hold"] = True
+                clear_sign_llm_state(global_control_data, keep_completed=True)
+            else:
+                fallback_error = error or "invalid_empty_result"
+                global_control_data["turn_intent"] = -1
+                global_control_data["turn_intent_fid"] = max(frame_id, active_fid)
+                global_control_data["sign_llm_result"] = ""
+                global_control_data["sign_llm_completed_hold"] = True
+                clear_sign_llm_state(global_control_data, keep_completed=True)
+                global_control_data["sign_llm_error"] = fallback_error
+
+        if result in ("LEFT", "RIGHT"):
+            sample_text = [(s.get("text"), round(float(s.get("score", 0.0)), 3)) for s in samples]
+            print(f"{LOG_GREEN}千帆路牌最终结果: {result} samples={sample_text}{LOG_RESET}", flush=True)
+        else:
+            print(f"千帆路牌识别失败，按石头优先/默认左路放行: {error}", flush=True)
+
+
 # ==============================================================================
 # 核心线程 1：YOLO 检测线程
 # ==============================================================================
@@ -735,8 +923,10 @@ def yolo_worker():
             # 其中 limit_sign 一旦面积达到“生效阈值”，就不再继续 OCR，
             # 而是直接从历史聚合统计里挑选最优数字。
             sign_jobs = []
+            pending_sign_jobs = []
             apply_limit_jobs = []
             limit_sign_seen = False
+            large_sign_seen = False
             for idx, obj in enumerate(objs):
                 cls_id = obj.get("class_id")
                 if cls_id not in (
@@ -745,17 +935,17 @@ def yolo_worker():
                 ):
                     continue
                 rect = obj.get("rect", [0, 0, 0, 0])
+                area = rect_area(rect)
+                if (
+                    bool(getattr(config, "SIGN_LLM_ENABLED", True)) and
+                    cls_id == config.SIGN_CLASS_ID and
+                    area >= float(getattr(config, "SIGN_LLM_TRIGGER_AREA", 7000))
+                ):
+                    large_sign_seen = True
                 if cls_id == config.LIMIT_SIGN_CLASS_ID:
                     limit_sign_seen = True
                 should_enqueue, skip_reason = should_enqueue_ocr_job(cls_id, rect)
                 if not should_enqueue:
-                    if cls_id == config.SIGN_CLASS_ID:
-                        throttled_log(
-                            "ocr_sign_skip",
-                            f"语义路牌未进OCR: 原因={skip_reason} rect={rect}",
-                            state=skip_reason,
-                            min_interval=config.LOG_INTERVAL_OCR_ENTER
-                        )
                     if (
                         cls_id == config.LIMIT_SIGN_CLASS_ID and
                         skip_reason.startswith("ready_to_apply_history")
@@ -763,11 +953,42 @@ def yolo_worker():
                         apply_limit_jobs.append((idx, rect))
                         continue
                     continue
-                sign_jobs.append((idx, cls_id, rect))
+                if cls_id == config.SIGN_CLASS_ID:
+                    pending_sign_jobs.append((idx, cls_id, rect))
+                else:
+                    sign_jobs.append((idx, cls_id, rect))
 
             limit_enabled = bool(getattr(config, "LIMIT_SIGN_ENABLED", True))
             limit_applied_from_history = None
+            sign_llm_collecting_now = False
             with data_lock:
+                if bool(getattr(config, "SIGN_LLM_ENABLED", True)):
+                    if large_sign_seen:
+                        global_control_data["sign_llm_frame_id"] = int(frame_id)
+                        if (
+                            not bool(global_control_data.get("sign_llm_stop_active", False)) and
+                            not bool(global_control_data.get("sign_llm_waiting_result", False)) and
+                            not bool(global_control_data.get("sign_llm_completed_hold", False))
+                        ):
+                            global_control_data["sign_llm_stop_active"] = True
+                            global_control_data["sign_llm_collecting"] = True
+                            global_control_data["sign_llm_waiting_result"] = False
+                            global_control_data["sign_llm_samples"] = []
+                            global_control_data["sign_llm_attempts"] = 0
+                            global_control_data["sign_llm_started_at"] = time.monotonic()
+                            global_control_data["sign_llm_result"] = ""
+                            global_control_data["sign_llm_error"] = ""
+                            throttled_log(
+                                "sign_llm_stop_start",
+                                f"语义路牌面积达标，停车采集OCR: area>={getattr(config, 'SIGN_LLM_TRIGGER_AREA', 7000)} frame={frame_id}",
+                                state=("start", int(frame_id)),
+                                min_interval=0.0,
+                            )
+                    else:
+                        if not bool(global_control_data.get("sign_llm_stop_active", False)):
+                            global_control_data["sign_llm_completed_hold"] = False
+                    sign_llm_collecting_now = bool(global_control_data.get("sign_llm_collecting", False))
+
                 if limit_enabled and limit_sign_seen:
                     global_control_data["limit_sign_last_detect_fid"] = int(frame_id)
                 elif limit_enabled:
@@ -806,6 +1027,9 @@ def yolo_worker():
                                 if global_yolo_boxes[best_apply_idx].get("class_id") == config.LIMIT_SIGN_CLASS_ID:
                                     global_yolo_boxes[best_apply_idx]["text"] = best_candidate["digit_text"]
                                     global_yolo_boxes[best_apply_idx]["ocr_score"] = float(best_candidate["avg_score"])
+
+            if sign_llm_collecting_now:
+                sign_jobs.extend(pending_sign_jobs)
 
             if limit_enabled and limit_applied_from_history is not None:
                 throttled_log(
@@ -876,10 +1100,37 @@ def ocr_worker():
                 break
 
             frame_data, sign_jobs, frame_id = job
+            with data_lock:
+                sign_collecting = (
+                    bool(getattr(config, "SIGN_LLM_ENABLED", True)) and
+                    bool(global_control_data.get("sign_llm_collecting", False))
+                )
+            sign_jobs = [
+                item for item in sign_jobs
+                if item[1] != config.SIGN_CLASS_ID or sign_collecting
+            ]
+            if not sign_jobs:
+                continue
+
             updates = []
             # 这里跑的是整图 OCR，再把结果按中心点回匹配给 sign_jobs。
             ocr_results = ocr.run_full_frame(frame_data)
             if not ocr_results:
+                with data_lock:
+                    submitted = record_sign_llm_sample(
+                        global_control_data,
+                        int(frame_id),
+                        "",
+                        0.0,
+                        "no_ocr_results",
+                    )
+                    if submitted:
+                        throttled_log(
+                            "sign_llm_submit",
+                            f"语义路牌OCR样本已提交千帆: samples={len(global_control_data.get('sign_llm_samples', []))}",
+                            state=("submit", int(frame_id)),
+                            min_interval=0.0,
+                        )
                 throttled_log(
                     "ocr_no_results",
                     "OCR无有效文本: "
@@ -967,6 +1218,21 @@ def ocr_worker():
                     log_once("ocr_single_box_error", f"OCR单框处理异常: {e}")
 
             if not updates:
+                with data_lock:
+                    submitted = record_sign_llm_sample(
+                        global_control_data,
+                        int(frame_id),
+                        "",
+                        0.0,
+                        "no_valid_update",
+                    )
+                    if submitted:
+                        throttled_log(
+                            "sign_llm_submit",
+                            f"语义路牌OCR样本已提交千帆: samples={len(global_control_data.get('sign_llm_samples', []))}",
+                            state=("submit", int(frame_id)),
+                            min_interval=0.0,
+                        )
                 throttled_log(
                     "ocr_no_updates",
                     f"OCR未形成有效更新: 文本框={len(ocr_results)} jobs={len(sign_jobs)}",
@@ -1001,7 +1267,20 @@ def ocr_worker():
                                 state=(matched_class, text),
                                 min_interval=config.LOG_INTERVAL_OCR_ENTER
                             )
-                            if text == "LEFT":
+                            sign_llm_active = (
+                                bool(getattr(config, "SIGN_LLM_ENABLED", True)) and
+                                bool(global_control_data.get("sign_llm_stop_active", False)) and
+                                bool(global_control_data.get("sign_llm_collecting", False))
+                            )
+                            if sign_llm_active:
+                                if record_sign_llm_sample(global_control_data, int(frame_id), text, score, "ok"):
+                                    throttled_log(
+                                        "sign_llm_submit",
+                                        f"语义路牌OCR样本已提交千帆: samples={len(global_control_data.get('sign_llm_samples', []))}",
+                                        state=("submit", int(frame_id)),
+                                        min_interval=0.0,
+                                    )
+                            elif not bool(getattr(config, "SIGN_LLM_ENABLED", True)) and text == "LEFT":
                                 global_control_data["turn_intent"] = -1
                                 global_control_data["turn_intent_fid"] = int(frame_id)
                                 throttled_log(
@@ -1010,7 +1289,7 @@ def ocr_worker():
                                     state="LEFT",
                                     min_interval=config.LOG_INTERVAL_TURN_INTENT
                                 )
-                            elif text == "RIGHT":
+                            elif not bool(getattr(config, "SIGN_LLM_ENABLED", True)) and text == "RIGHT":
                                 global_control_data["turn_intent"] = 1
                                 global_control_data["turn_intent_fid"] = int(frame_id)
                                 throttled_log(
@@ -1109,6 +1388,8 @@ def seg_worker(core_id):
             )
             traffic_stop_active = global_control_data.get("traffic_stop_active", False)
             traffic_backing_up = global_control_data.get("traffic_backing_up", False)
+            sign_llm_stop_active = global_control_data.get("sign_llm_stop_active", False)
+            sign_llm_waiting_result = global_control_data.get("sign_llm_waiting_result", False)
 
             fps_stats["seg_frames"] += 1
             now = time.time()
@@ -1198,6 +1479,10 @@ def seg_worker(core_id):
             stop_text = ""
             if traffic_backing_up:
                 stop_text = "BACK_FOR_LIGHT"
+            elif sign_llm_waiting_result:
+                stop_text = "SIGN_LLM_WAIT"
+            elif sign_llm_stop_active:
+                stop_text = "SIGN_LLM_OCR"
             elif traffic_stop_active:
                 stop_text = "STOP_BY_LIGHT"
             elif person_stop_active:
@@ -1404,6 +1689,7 @@ def serial_control_thread():
     last_output_speed = int(config.CONTROL_MIN_SPEED)
 
     while True:
+        drain_sign_llm_results()
         with data_lock:
             steer_signal = global_control_data.get("steer_signal", 0.0)
             speed_limit = (
@@ -1419,6 +1705,9 @@ def serial_control_thread():
             traffic_light_miss_frames = int(global_control_data.get("traffic_light_miss_frames", 0))
             traffic_recover_started_at = global_control_data.get("traffic_recover_started_at")
             traffic_recover_last_frame_id = int(global_control_data.get("traffic_recover_last_frame_id", -1))
+            sign_llm_stop_active = bool(global_control_data.get("sign_llm_stop_active", False))
+            sign_llm_collecting = bool(global_control_data.get("sign_llm_collecting", False))
+            sign_llm_frame_id = int(global_control_data.get("sign_llm_frame_id", -1))
             person_stop_active = bool(global_control_data.get("person_stop_active", False))
             person_dist_to_bottom = global_control_data.get("person_dist_to_bottom")
             person_left_boundary_x = global_control_data.get("person_left_boundary_x")
@@ -1430,6 +1719,18 @@ def serial_control_thread():
             person_stop_event = str(global_control_data.get("person_stop_event", ""))
 
         try:
+            if sign_llm_collecting:
+                with data_lock:
+                    if maybe_submit_sign_llm_job(global_control_data, sign_llm_frame_id):
+                        sign_llm_collecting = False
+                        sign_llm_stop_active = True
+                        throttled_log(
+                            "sign_llm_submit_timeout",
+                            f"语义路牌OCR采集超时，提交千帆: samples={len(global_control_data.get('sign_llm_samples', []))}",
+                            state=("timeout_submit", sign_llm_frame_id),
+                            min_interval=0.0,
+                        )
+
             if np.isnan(steer_signal) or np.isinf(steer_signal):
                 steer_signal = 0.0
 
@@ -1526,6 +1827,8 @@ def serial_control_thread():
                 target_speed = int(getattr(config, "TRAFFIC_LIGHT_RECOVER_BACK_SPEED", -10))
             elif traffic_stop_active:
                 target_speed = 0
+            if sign_llm_stop_active:
+                target_speed = 0
             if person_stop_active:
                 target_speed = 0
 
@@ -1569,7 +1872,7 @@ def serial_control_thread():
             person_bottom_right_x = None
             person_clear_frames = 0
             person_stop_event = ""
-            if traffic_stop_active or person_stop_active:
+            if traffic_stop_active or sign_llm_stop_active or person_stop_active:
                 target_speed = 0
             traffic_backing_up = False
             traffic_light_miss_frames = 0
@@ -1823,6 +2126,7 @@ if __name__ == "__main__":
         threading.Thread(target=seg_worker, args=(core_id,), daemon=True).start()
         time.sleep(config.STARTUP_SEG_THREAD_SLEEP)
 
+    Process(target=sign_llm_worker, daemon=True).start()
     threading.Thread(target=yolo_worker, daemon=True).start()
     threading.Thread(target=ocr_worker, daemon=True).start()
 

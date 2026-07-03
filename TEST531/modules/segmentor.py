@@ -1833,12 +1833,14 @@ class RoadSegmentor:
             return 1
         return 0
 
-    def _resolve_preferred_turn(self, stone_branch_side):
-        """得到最终偏左/偏右选择；当前只启用石头避让，暂不使用 OCR 语义."""
+    def _resolve_preferred_turn(self, stone_branch_side, turn_intent=-1):
+        """得到最终分支选择：石头避让优先；没有石头时使用 OCR/LLM 语义."""
         if stone_branch_side == -1:
             return 1
         if stone_branch_side == 1:
             return -1
+        if int(turn_intent) in (-1, 1):
+            return int(turn_intent)
         return -1
 
     def _get_planning_box_points(self, obj, w_seg, h_seg):
@@ -2702,7 +2704,7 @@ class RoadSegmentor:
         - blob_rgb_320: 分割线程当前拿到的最新 SEG_SIZE RGB 图
         - mask: infer_mask 输出的二值赛道 mask
         - current_yolo_boxes: 当前最新一帧检测框，坐标在 TARGET_RES
-        - turn_intent: OCR 给出的 LEFT / RIGHT 分叉意图，当前暂不参与分支选择
+        - turn_intent: OCR/LLM 给出的 LEFT / RIGHT 分叉意图；石头优先，无石头时参与分支选择
 
         输出:
         - steer_signal: 单一转向控制量，来自路径点加权斜率和
@@ -2831,7 +2833,7 @@ class RoadSegmentor:
                 )
                 if stone_branch_side == 0:
                     stone_branch_side = self._estimate_stone_branch_side(planning_items, candidate_pool)
-                preferred_turn = self._resolve_preferred_turn(stone_branch_side)
+                preferred_turn = self._resolve_preferred_turn(stone_branch_side, turn_intent)
                 best_candidate = right_best if preferred_turn == 1 else left_best
                 best_path = best_candidate["path"]
                 best_nodes = best_candidate["nodes"]

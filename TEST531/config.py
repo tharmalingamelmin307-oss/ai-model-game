@@ -169,6 +169,16 @@ OCR_SIGN_EDGE_MARGIN_RATIO = 0.03
 # sign / limit_sign 的匹配和后续状态更新。
 OCR_MIN_SCORE = 0.50
 
+# 语义路牌大模型判定。
+# sign 面积达到阈值后先停车，停车期间连续收集若干次 OCR 结果，再一次性发给千帆。
+SIGN_LLM_ENABLED = True
+SIGN_LLM_TRIGGER_AREA = 7000
+SIGN_LLM_OCR_SAMPLES = 10
+SIGN_LLM_MIN_VALID_SAMPLES = 3
+SIGN_LLM_COLLECT_TIMEOUT = 3.0
+SIGN_LLM_API_TIMEOUT = 10.0
+SIGN_LLM_RESULT_MAX_AGE_FRAMES = 60
+
 # 限速牌历史候选的“稳定次数”门槛。
 # 当前逻辑会先累计同一块牌子的历史 OCR 结果；
 # 当牌子面积达到 LIMIT_SIGN_APPLY_MIN_AREA 后，
@@ -545,6 +555,7 @@ STEER_SIGNAL_CAR_GAIN = 1.0
 # - speed_limit_fid: 上一次更新 speed_limit 时对应的帧号
 # - limit_sign_history: 限速牌历史累计池，按数字聚合 count / score_sum
 # - limit_sign_last_detect_fid: 最近一次检测到 limit_sign 的帧号
+# - sign_llm_*: 大面积语义路牌停车、多次 OCR、千帆判定状态
 # - zebra_stopline_y: 停止线在 TARGET_RES 坐标系中的 y 值
 # - traffic_light_frame_id: 当前交通灯/停止线检测结果对应的 YOLO 帧号
 # - traffic_light_state: 当前交通灯状态，允许值 red / yellow / green / ""
@@ -565,6 +576,15 @@ DEFAULT_CONTROL_DATA = {
     "speed_limit_fid": -1,
     "limit_sign_history": {},
     "limit_sign_last_detect_fid": -1,
+    "sign_llm_stop_active": False,
+    "sign_llm_collecting": False,
+    "sign_llm_waiting_result": False,
+    "sign_llm_completed_hold": False,
+    "sign_llm_samples": [],
+    "sign_llm_started_at": None,
+    "sign_llm_frame_id": -1,
+    "sign_llm_result": "",
+    "sign_llm_error": "",
     "zebra_stopline_y": None,
     "traffic_light_frame_id": -1,
     "traffic_light_state": "",

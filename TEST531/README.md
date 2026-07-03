@@ -6,7 +6,7 @@
 
 - `Seg` 负责主控闭环，持续输出循迹控制量
 - `YOLO` 负责环境目标检测和路牌框检测
-- `OCR` 负责整图 `det + rec`，再把结果回匹配到 `sign`；`limit_sign` 链路保留，但当前通过 `LIMIT_SIGN_ENABLED=False` 临时关闭
+- `OCR` 负责整图 `det + rec`；`sign` 只在停车采样状态下触发 OCR，`limit_sign` 链路保留但当前通过 `LIMIT_SIGN_ENABLED=False` 临时关闭
 - 各线程都优先保“最新帧”，必要时主动丢掉旧任务，避免累积延迟
 
 ## 项目结构
@@ -215,18 +215,21 @@
 
 ### 5. `sign` 语义路牌逻辑
 
-当 OCR 结果匹配回 `sign` 框后：
+启用 `SIGN_LLM_ENABLED` 后，`sign` 不再在行驶中直接 OCR 生效，而是走一次性停车状态机：
 
-- 如果识别到 `LEFT`
-  就把 `turn_intent` 写成 `-1`
-- 如果识别到 `RIGHT`
-  就把 `turn_intent` 写成 `1`
+1. 未停车前只看 YOLO 检测框，不对 `sign` 做 OCR。
+2. 当 `sign` 面积达到 `SIGN_LLM_TRIGGER_AREA`，车辆进入停车采样状态。
+3. 停车后才把 `sign` 投给 OCR，连续收集 `SIGN_LLM_OCR_SAMPLES` 条有效 OCR 文本。
+4. 收满样本后停止继续 `sign` OCR，把样本提交给千帆独立进程。
+5. 千帆返回 `LEFT / RIGHT` 时写入 `turn_intent` 并放行。
+6. 千帆超时、异常或返回无效内容时，不重试本次路牌流程，按石头优先 / 默认左路放行。
+7. 同一块路牌保持在画面内时不会再次触发；等路牌离开或面积不达标后，才允许下一次新事件。
 
-`turn_intent` 会被 `segmentor.py` 在分叉路径选择时使用。  
-当前策略是：
+`turn_intent` 会被 `segmentor.py` 在分叉路径选择时使用。分叉选择优先级是：
 
-- 没有特殊干预时，默认偏向左支
-- 如果 OCR 给出 `LEFT / RIGHT`，会覆盖默认偏向
+- 检测到 `stone` 时，优先绕开石头更接近的那一支。
+- 没有石头干预时，使用千帆返回的 `turn_intent`。
+- 千帆没有有效结果时，`turn_intent` 回到默认左支。
 
 ### 6. `limit_sign` 限速牌逻辑
 
@@ -274,7 +277,7 @@
 11. 路径必须从图像真实底部 `SEG_PATH_BOTTOM_TOUCH_HEIGHT` 行内起步，中途新冒出来但没接到底部的悬空候选会被丢弃
 12. 对候选路径按长度、平滑度、通道宽度、局部中心偏离做打分
 13. 如果检测到 `stone`，优先绕开石头更接近的那一支
-14. 如果没有明确石头干预，则默认偏向左支；如果 OCR 给出 `turn_intent`，再用 `LEFT / RIGHT` 覆盖默认偏向
+14. 如果没有明确石头干预，则使用语义路牌状态机写入的 `turn_intent`；没有有效结果时默认偏向左支
 15. 对最终路径做多项式拟合
 16. 对拟合系数做 EMA 平滑
 17. 结合金币规划和避车状态机选择控制路径或控制中心偏移
@@ -371,23 +374,27 @@ target_speed = 0                                # 若红/黄灯停车或行人�
 
 ### 12. 结果回写与旧帧保护
 
-当前系统对 OCR 结果做了两层保护，避免旧结果污染新状态：
+当前系统对 OCR / LLM 结果做了多层保护，避免旧结果污染新状态：
 
 - OCR 任务会带着对应的 `frame_id`
 - 回写 `global_yolo_boxes / turn_intent / speed_limit` 前会再次核对帧号
+- 语义路牌提交千帆后停止继续 `sign` OCR
+- 同一块语义路牌只跑一次停车采样和千帆判定流程
 
 作用是：
 
 - 旧 OCR 结果即使晚到，也不容易把新状态覆盖回去
+- 千帆失败不会反复停车重试，而是按石头优先 / 默认左路兜底放行
 - 页面上显示的 OCR 文本与当前检测框更一致
 
 ### 13. 终端日志
 
 当前终端默认只保留低频、条件触发型日志：
 
-- 路牌达到 OCR 识别条件并真正入队
+- 停车采样状态下，路牌达到 OCR 识别条件并真正入队
 - OCR 最终识别结果（语义路牌文本 / 限速牌数字）
-- `LEFT / RIGHT` 语义路牌正式生效
+- 千帆任务开始、返回、最终 `LEFT / RIGHT` 结果
+- 千帆失败后的石头优先 / 默认左路兜底
 - 限速牌正式生效
 - 红绿灯停车条件正式触发
 
@@ -469,6 +476,11 @@ target_speed = 0                                # 若红/黄灯停车或行人�
 | `LIMIT_SIGN_APPLY_MIN_AREA` | 限速牌从历史观察切到正式生效的面积门槛 |
 | `OCR_SIGN_EDGE_MARGIN_RATIO` | 路牌框距离画面边缘的安全边距比例 |
 | `OCR_MIN_SCORE` | OCR 文本进入主逻辑的最低平均置信度 |
+| `SIGN_LLM_ENABLED` | 是否启用语义路牌停车、多次 OCR、千帆综合判定 |
+| `SIGN_LLM_TRIGGER_AREA` | sign 面积达到多少后触发停车采样，当前默认 7000 |
+| `SIGN_LLM_OCR_SAMPLES` | 停车后收集多少条有效 OCR 结果再发给千帆 |
+| `SIGN_LLM_MIN_VALID_SAMPLES` | 保留参数；当前语义路牌流程要求收满 `SIGN_LLM_OCR_SAMPLES` 条有效样本 |
+| `SIGN_LLM_COLLECT_TIMEOUT` / `SIGN_LLM_API_TIMEOUT` | OCR 采集超时保留参数 / 千帆 API 超时 |
 | `LIMIT_SIGN_CONFIRM_FRAMES` | 限速候选至少累计多少次才优先生效 |
 | `LIMIT_SIGN_HISTORY_MAX_MISS_FRAMES` | 限速历史在连续丢失后保留的最大帧数 |
 | `ZEBRA_STOPLINE_EXTEND_RATIO` | 斑马线停止线左右延长比例 |
@@ -954,10 +966,12 @@ SegProfile infer=21.1ms prep=0.3ms search=13.7ms fit=5.2ms render=1.2ms queue_wa
 
 1. OCR 现在是整图 `det + rec`，不是直接裁 YOLO 框识别。
 2. 当前 `LIMIT_SIGN_ENABLED=False`，所以 `limit_sign` 不触发 OCR，也不写入 `speed_limit`。
-3. 如果重新开启限速，`limit_sign` 不是“等靠近牌子再降速”，而是确认通过后立即生效。
-4. 如果重新开启限速，限速不会自动超时恢复，只会被新的限速牌覆盖。
-5. 如果重新开启限速，实际写入的限速是 `识别数字 - 1`。
-6. 流水线模式下，页面 `Seg FPS` 和终端 `SegProfile est` 不相同是正常现象：前者是吞吐，后者是单帧端到端延迟换算。
+3. `sign` 语义路牌只有停车采样状态才触发 OCR，未停车前不会识别文字。
+4. 一个语义路牌事件只跑一次停车采样和千帆判定；失败后直接按石头优先 / 默认左路放行。
+5. 如果重新开启限速，`limit_sign` 不是“等靠近牌子再降速”，而是确认通过后立即生效。
+6. 如果重新开启限速，限速不会自动超时恢复，只会被新的限速牌覆盖。
+7. 如果重新开启限速，实际写入的限速是 `识别数字 - 1`。
+8. 流水线模式下，页面 `Seg FPS` 和终端 `SegProfile est` 不相同是正常现象：前者是吞吐，后者是单帧端到端延迟换算。
 
 ## 启动方式
 
