@@ -150,6 +150,9 @@ SIGN_LLM_MIN_VALID_SAMPLES = 3
 SIGN_LLM_COLLECT_TIMEOUT = 3.0
 SIGN_LLM_API_TIMEOUT = 10.0
 SIGN_LLM_RESULT_MAX_AGE_FRAMES = 60
+SIGN_ROUTE_SINGLE_ROAD_EXIT_FRAMES = 20
+SIGN_ROUTE_MIN_FORK_HOLD_SECONDS = 1.0
+SIGN_ROUTE_MAX_DRIVE_HOLD_SECONDS = 10.0
 
 # YOLO 默认置信度阈值。
 # 当某个类别没有在 CLASS_MIN_SCORES 里单独指定时，就回退到这个值。
@@ -493,8 +496,16 @@ DEFAULT_CONTROL_DATA = {
     "sign_llm_samples": [],
     "sign_llm_started_at": None,
     "sign_llm_frame_id": -1,
+    "sign_llm_ocr_inflight": False,
     "sign_llm_result": "",
     "sign_llm_error": "",
+    "sign_route_state": "IDLE",
+    "sign_route_choice": 0,
+    "sign_route_locked_rect": None,
+    "sign_route_drive_started_at": None,
+    "sign_route_fork_entered_at": None,
+    "sign_route_single_road_frames": 0,
+    "sign_route_api_submitted": False,
     "person_stop_active": False,
     "person_bottom_y": None,
     "person_bottom_center_x": None,
@@ -536,7 +547,7 @@ YOLO_QUEUE_MAXSIZE = 1
 # YOLO 投帧降频。Seg 是主控链路，每帧都跑；YOLO 只需要更新目标状态，
 # 不必和 Seg 抢每一帧的 NPU/CPU 时间。
 # 1 表示每帧都投；10 表示每 10 帧投 1 帧。
-YOLO_PRODUCER_FRAME_INTERVAL = 10
+YOLO_PRODUCER_FRAME_INTERVAL = 1
 OCR_QUEUE_MAXSIZE = 2
 
 # Seg 流水线模式。
