@@ -131,7 +131,7 @@
 
 ### 2. YOLO 检测逻辑
 
-`modules/detector.py` 当前只按 detv3 official split RKNN 模型解析：
+`modules/detector.py` 当前只按 dev4 split RKNN 模型解析：
 
 - `boxes`: `[N, 4]`，xyxy
 - `scores`: `[N, num_classes]`
@@ -428,7 +428,7 @@ target_speed = 0                                # 若红/黄灯停车或行人�
 默认配置见 `config.py`：
 
 - 分割模型：`models/seg/segv3/pipi416x160_argmax_rk3588_int8.rknn`
-- 检测模型：`models/det/detv3/ppyoloe_crn_m_80e_custom_official_split_rk3588_int8_512x384.rknn`
+- 检测模型：`models/det/dev4/ppyoloe_crn_m_100e_custom_7_5_512x384_split_rk3588_int8.rknn`
 - OCR det 模型：`models/ocr/ppocrv4_det_int8.rknn`
 - OCR rec 模型：`models/ocr/ppocrv4_rec_fp16.rknn`
 - OCR 字典：`models/ocr/keys.txt`

@@ -2697,6 +2697,7 @@ class RoadSegmentor:
         infer_s=0.0,
         total_start=None,
         preview_frame=None,
+        external_left_bias_x=0.0,
     ):
         """对已推理出的 mask 做路径规划、控制量计算和调试渲染.
 
@@ -2781,6 +2782,12 @@ class RoadSegmentor:
         stone_branch_side = 0
         coin_path_debug = None
         car_path_debug = None
+        car_active = False
+        car_center_bias_x = 0.0
+        external_left_bias_x = max(0.0, float(external_left_bias_x))
+        external_bias_active = external_left_bias_x > 0.0
+        avoid_center_bias_x = external_left_bias_x if external_bias_active else 0.0
+        avoid_bias_source = "external" if external_bias_active else "none"
         centerline_only_mode = bool(getattr(config, "SEG_CENTERLINE_ONLY_MODE", False))
 
         if y_fork_info.get("active"):
@@ -2929,6 +2936,13 @@ class RoadSegmentor:
                 h_seg,
             )
             car_active = car_path_debug is not None and car_path_debug.get("active")
+            external_left_bias_x = max(0.0, float(external_left_bias_x))
+            external_bias_active = external_left_bias_x > 0.0
+            avoid_center_bias_x = car_center_bias_x if car_active else 0.0
+            avoid_bias_source = "car" if car_active else "none"
+            if external_bias_active and external_left_bias_x > abs(float(avoid_center_bias_x)):
+                avoid_center_bias_x = external_left_bias_x
+                avoid_bias_source = "external"
             car_state = "FOLLOW_LANE"
             if car_path_debug is not None:
                 car_state = str(car_path_debug.get("state", "FOLLOW_LANE"))
@@ -2966,14 +2980,14 @@ class RoadSegmentor:
 
             coin_active = coin_path_debug is not None and coin_path_debug.get("active")
             bypass_frame_jump = (
-                (coin_active or car_active) and
+                (coin_active or car_active or external_bias_active) and
                 bool(getattr(config, "COIN_PATH_BYPASS_FRAME_JUMP", True))
             )
             if bypass_frame_jump:
                 path_jump_limited = False
             else:
                 path_points_orig, path_jump_limited = self._limit_path_frame_jump(path_points_orig)
-            if path_jump_limited or coin_active or car_active:
+            if path_jump_limited or coin_active or car_active or external_bias_active:
                 poly_coeffs = self._fit_path_poly_coeffs(
                     path_points_orig[:, 1],
                     path_points_orig[:, 0],
@@ -2994,7 +3008,7 @@ class RoadSegmentor:
                 control_path_points,
                 w_seg,
                 h_seg,
-                center_bias_x=car_center_bias_x if car_active else 0.0,
+                center_bias_x=avoid_center_bias_x if (car_active or external_bias_active) else 0.0,
             )
             if coin_path_debug is not None and coin_path_debug.get("active"):
                 steer_signal *= float(coin_path_debug.get("control_gain", 1.0))
@@ -3021,6 +3035,11 @@ class RoadSegmentor:
             "merge_state_active": bool(self.merge_state_active),
             "merge_state_hit_frames": int(self.merge_state_hit_frames),
             "merge_state_exit_frames": int(self.merge_state_exit_frames),
+            "car_active": bool(car_active),
+            "car_center_bias_x": float(car_center_bias_x if car_active else 0.0),
+            "external_left_bias_x": float(external_left_bias_x),
+            "avoid_center_bias_x": float(avoid_center_bias_x if (car_active or external_bias_active) else 0.0),
+            "avoid_bias_source": avoid_bias_source,
         }
         self._store_main_overlay(
             pts_final_orig,
@@ -3172,7 +3191,7 @@ class RoadSegmentor:
 
         return steer_signal, ai_view
 
-    def run(self, blob_rgb_320, current_yolo_boxes, turn_intent, fps_stats):
+    def run(self, blob_rgb_320, current_yolo_boxes, turn_intent, fps_stats, external_left_bias_x=0.0):
         """兼容旧串行调用：推理和后处理在同一个线程里连续执行."""
         t_total_start = time.perf_counter()
         mask, infer_s = self.infer_mask(blob_rgb_320)
@@ -3184,4 +3203,5 @@ class RoadSegmentor:
             fps_stats,
             infer_s=infer_s,
             total_start=t_total_start,
+            external_left_bias_x=external_left_bias_x,
         )

@@ -51,7 +51,7 @@ JPEG_QUALITY = 75
 # 分割模型路径。
 # 当前主控链路依赖这个模型输出赛道 mask，所以它直接影响路径规划和转向控制。
 # 这里的模型默认输入尺寸是 SEG_SIZE，对应下面的 416x160。
-SEG_MODEL = str(PROJECT_ROOT / "models/seg/segv3/pipi416x160_argmax_rk3588_int8.rknn")
+SEG_MODEL = str(PROJECT_ROOT / "models/seg/segv4/pipi416x160_77_1600_argmax_rk3588_int8.rknn")
 
 # 目标检测模型路径。
 # 当前使用的是 PP-YOLOE 的 RKNN 版本，输出后处理由 modules/detector.py 负责。
@@ -59,7 +59,7 @@ SEG_MODEL = str(PROJECT_ROOT / "models/seg/segv3/pipi416x160_argmax_rk3588_int8.
 # - YOLO_SIZE
 # - CLASS_NAMES
 # - detector.py 的输出解析逻辑
-YOLO_MODEL = str(PROJECT_ROOT / "models/det/detv3/ppyoloe_crn_m_80e_custom_official_split_rk3588_int8_512x384.rknn")
+YOLO_MODEL = str(PROJECT_ROOT / "models/det/dev4/ppyoloe_crn_m_100e_custom_7_5_512x384_split_rk3588_int8.rknn")
 
 # OCR 检测模型路径。
 # 当前改回 det + rec 全流程时使用。
@@ -515,11 +515,12 @@ DEFAULT_CONTROL_DATA = {
     "person_right_boundary_x": None,
     "person_clear_line_x": None,
     "person_stop_event": "",
+    "person_avoid_active": False,
+    "person_avoid_hold_frames": 0,
     "person_clear_frames": 0,
     "person_miss_frames": 0,
     "person_last_frame_id": -1,
     "person_last_bottom_center_x": None,
-    "person_released_outside_left": False,
     "actual_servo_pwm": SERVO_CENTER,
     "target_speed": 10,
 }
@@ -619,17 +620,15 @@ PERSON_CLASS_NAME = "person"
 # 正常情况下这些值不应该生效；它们更像是一层容错保护。
 PERSON_CLASS_ID_FALLBACK = 2
 
-# 行人停车逻辑。
+# 行人停车/绕行逻辑。
 # 触发不做路径 ROI 过滤，和斑马线类似，只看 person 框底边是否足够靠近画面底部。
-# 恢复前进需要同时满足:
-# - 行人底部中心连续向左移动若干帧
-# - person 框底部中心已经越过当前选中路的释放线
+# 当前策略: 先停车，确认行人持续向右移动后，解除停车并给控制量一个左偏。
 PERSON_STOP_TRIGGER_DIST = 300    #貌似200也不是很多（720）
 PERSON_CLEAR_MOVE_FRAMES = 2
-PERSON_CLEAR_MIN_LEFT_DX = 3.0
-# 行人放行线位置。0.0 是当前道路左边界，0.5 是道路中线，1.0 是右边界。
-# 当前行人从右往左穿行，越过中线后就允许恢复前进，避免等完全出界导致起步过晚。
-PERSON_CLEAR_LANE_RATIO = 0.50
+PERSON_CLEAR_MIN_RIGHT_DX = 3.0
+PERSON_LEFT_AVOID_STEER_BIAS = 45.0
+PERSON_AVOID_EXIT_MISSING_FRAMES = 3
+PERSON_AVOID_EXIT_HOLD_FRAMES = 10
 PERSON_STOP_MISS_RELEASE_FRAMES = 3
 
 # OCR 检测框与 OCR 文字框做“最近中心点匹配”时使用的初始最大距离。

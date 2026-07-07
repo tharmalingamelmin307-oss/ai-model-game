@@ -367,10 +367,11 @@ def extract_person_stop_candidate(boxes, frame_id):
 
 
 def update_person_stop_state(state, person_info, left_boundary_x, right_boundary_x, yolo_frame_id):
-    """行人靠近时停车；连续左移且越过道路释放线后放行."""
+    """行人靠近时先停车；确认向右移动后左偏绕行，消失并保持若干帧后退出."""
     active = bool(state.get("person_stop_active", False))
+    avoid_active = bool(state.get("person_avoid_active", False))
     prev_active = active
-    released_outside_left = bool(state.get("person_released_outside_left", False))
+    prev_avoid_active = avoid_active
     yolo_frame_id = int(yolo_frame_id)
     last_frame_id = int(state.get("person_last_frame_id", -1))
     if yolo_frame_id == last_frame_id:
@@ -381,15 +382,20 @@ def update_person_stop_state(state, person_info, left_boundary_x, right_boundary
 
     clear_frames = int(state.get("person_clear_frames", 0))
     miss_frames = int(state.get("person_miss_frames", 0))
+    avoid_hold_frames = int(state.get("person_avoid_hold_frames", 0))
 
     if person_info is None:
         miss_frames += 1
         clear_frames = 0
-        if active and miss_frames >= int(config.PERSON_STOP_MISS_RELEASE_FRAMES):
+        if avoid_active and miss_frames >= int(getattr(config, "PERSON_AVOID_EXIT_MISSING_FRAMES", 3)):
+            avoid_hold_frames += 1
+            if avoid_hold_frames >= int(getattr(config, "PERSON_AVOID_EXIT_HOLD_FRAMES", 20)):
+                avoid_active = False
+                avoid_hold_frames = 0
+        elif active and miss_frames >= int(config.PERSON_STOP_MISS_RELEASE_FRAMES):
             active = False
-        if miss_frames >= int(config.PERSON_STOP_MISS_RELEASE_FRAMES):
-            released_outside_left = False
         state["person_stop_active"] = active
+        state["person_avoid_active"] = avoid_active
         state["person_bottom_y"] = None
         state["person_bottom_center_x"] = None
         state["person_bottom_right_x"] = None
@@ -399,10 +405,15 @@ def update_person_stop_state(state, person_info, left_boundary_x, right_boundary
         state["person_clear_line_x"] = None
         state["person_miss_frames"] = miss_frames
         state["person_clear_frames"] = clear_frames
+        state["person_avoid_hold_frames"] = avoid_hold_frames
         state["person_last_frame_id"] = yolo_frame_id
         state["person_last_bottom_center_x"] = None
-        state["person_released_outside_left"] = released_outside_left
-        state["person_stop_event"] = "release_missing" if prev_active and not active else ""
+        if prev_active and not active:
+            state["person_stop_event"] = "release_missing"
+        elif prev_avoid_active and not avoid_active:
+            state["person_stop_event"] = "avoid_done"
+        else:
+            state["person_stop_event"] = ""
         return active
 
     bottom_center_x = float(person_info["bottom_center_x"])
@@ -410,29 +421,20 @@ def update_person_stop_state(state, person_info, left_boundary_x, right_boundary
     bottom_y = float(person_info["bottom_y"])
     dist_to_bottom = float(person_info["dist_to_bottom"])
     last_center = state.get("person_last_bottom_center_x")
-    moving_left = (
+    moving_right = (
         last_center is not None and
-        bottom_center_x <= float(last_center) - float(config.PERSON_CLEAR_MIN_LEFT_DX)
+        bottom_center_x >= float(last_center) + float(config.PERSON_CLEAR_MIN_RIGHT_DX)
     )
     clear_line_x = None
-    if left_boundary_x is not None and right_boundary_x is not None:
-        lane_ratio = float(getattr(config, "PERSON_CLEAR_LANE_RATIO", 0.50))
-        lane_ratio = max(0.0, min(1.0, lane_ratio))
-        clear_line_x = float(left_boundary_x) + (float(right_boundary_x) - float(left_boundary_x)) * lane_ratio
-    elif left_boundary_x is not None:
-        clear_line_x = float(left_boundary_x)
-    crossed_clear_line = clear_line_x is not None and bottom_center_x <= float(clear_line_x)
     trigger_dist = float(config.PERSON_STOP_TRIGGER_DIST)
     near_bottom = dist_to_bottom <= trigger_dist
 
-    if not crossed_clear_line:
-        released_outside_left = False
-
-    if near_bottom and not released_outside_left:
+    if near_bottom and not avoid_active:
         active = True
     miss_frames = 0
+    avoid_hold_frames = 0
 
-    if active and moving_left and crossed_clear_line:
+    if active and moving_right:
         clear_frames += 1
     else:
         clear_frames = 0
@@ -440,9 +442,11 @@ def update_person_stop_state(state, person_info, left_boundary_x, right_boundary
     if active and clear_frames >= int(config.PERSON_CLEAR_MOVE_FRAMES):
         active = False
         clear_frames = 0
-        released_outside_left = True
+        avoid_active = True
+        avoid_hold_frames = 0
 
     state["person_stop_active"] = active
+    state["person_avoid_active"] = avoid_active
     state["person_bottom_y"] = bottom_y
     state["person_bottom_center_x"] = bottom_center_x
     state["person_bottom_right_x"] = bottom_right_x
@@ -452,13 +456,15 @@ def update_person_stop_state(state, person_info, left_boundary_x, right_boundary
     state["person_clear_line_x"] = clear_line_x
     state["person_clear_frames"] = clear_frames
     state["person_miss_frames"] = miss_frames
+    state["person_avoid_hold_frames"] = avoid_hold_frames
     state["person_last_frame_id"] = yolo_frame_id
     state["person_last_bottom_center_x"] = bottom_center_x
-    state["person_released_outside_left"] = released_outside_left
     if not prev_active and active:
         state["person_stop_event"] = "stop"
     elif prev_active and not active:
-        state["person_stop_event"] = "release_clear_line"
+        state["person_stop_event"] = "avoid_left"
+    elif prev_avoid_active and not avoid_active:
+        state["person_stop_event"] = "avoid_done"
     else:
         state["person_stop_event"] = ""
     return active
@@ -1297,6 +1303,7 @@ def seg_worker(core_id):
             actual_speed = global_control_data.get("target_speed", config.CONTROL_MIN_SPEED)
             sign_llm_stop_active = global_control_data.get("sign_llm_stop_active", False)
             sign_llm_waiting_result = global_control_data.get("sign_llm_waiting_result", False)
+            person_avoid_active = bool(global_control_data.get("person_avoid_active", False))
             update_sign_route_after_seg(global_control_data, bool(y_fork_active))
             route_state = str(global_control_data.get("sign_route_state", "IDLE"))
             route_choice = int(global_control_data.get("sign_route_choice", 0))
@@ -1366,6 +1373,8 @@ def seg_worker(core_id):
                 stop_text = "SIGN_LLM_OCR"
             elif person_stop_active:
                 stop_text = "STOP_BY_PERSON"
+            elif person_avoid_active:
+                stop_text = "AVOID_PERSON_L"
             if stop_text:
                 cv2.putText(
                     rendered_img,
@@ -1423,13 +1432,19 @@ def seg_worker(core_id):
                 current_yolo_boxes = [obj.copy() for obj in global_yolo_boxes]
                 current_yolo_frame_id = int(global_yolo_frame_id)
                 turn_intent = global_control_data.get("turn_intent", -1)
+                external_left_bias_x = (
+                    float(getattr(config, "PERSON_LEFT_AVOID_STEER_BIAS", 45.0))
+                    if bool(global_control_data.get("person_avoid_active", False))
+                    else 0.0
+                )
 
             try:
                 steer_signal, rendered_img = seg.run(
                     blob_rgb_320,
                     current_yolo_boxes,
                     turn_intent,
-                    fps_stats
+                    fps_stats,
+                    external_left_bias_x=external_left_bias_x,
                 )
                 publish_seg_result(
                     steer_signal,
@@ -1459,7 +1474,7 @@ def seg_worker(core_id):
             if item is None:
                 break
 
-            blob_rgb_320, preview_frame, mask, infer_s, total_start, current_yolo_boxes, current_yolo_frame_id, turn_intent = item
+            blob_rgb_320, preview_frame, mask, infer_s, total_start, current_yolo_boxes, current_yolo_frame_id, turn_intent, external_left_bias_x = item
 
             try:
                 t_post_start = time.perf_counter()
@@ -1472,6 +1487,7 @@ def seg_worker(core_id):
                     infer_s=infer_s,
                     total_start=total_start,
                     preview_frame=preview_frame,
+                    external_left_bias_x=external_left_bias_x,
                 )
                 t_post_end = time.perf_counter()
                 publish_seg_result(
@@ -1518,6 +1534,11 @@ def seg_worker(core_id):
             current_yolo_boxes = [obj.copy() for obj in global_yolo_boxes]
             current_yolo_frame_id = int(global_yolo_frame_id)
             turn_intent = global_control_data.get("turn_intent", -1)
+            external_left_bias_x = (
+                float(getattr(config, "PERSON_LEFT_AVOID_STEER_BIAS", 45.0))
+                if bool(global_control_data.get("person_avoid_active", False))
+                else 0.0
+            )
         t_lock_end = time.perf_counter()
 
         try:
@@ -1540,7 +1561,7 @@ def seg_worker(core_id):
             except:
                 pass
         t_put_start = time.perf_counter()
-        mask_queue.put((blob_rgb_320, preview_frame, mask, infer_s, total_start, current_yolo_boxes, current_yolo_frame_id, turn_intent))
+        mask_queue.put((blob_rgb_320, preview_frame, mask, infer_s, total_start, current_yolo_boxes, current_yolo_frame_id, turn_intent, external_left_bias_x))
         t_put_end = time.perf_counter()
         profile_log(
             "seg_infer_loop",
@@ -1588,6 +1609,7 @@ def serial_control_thread():
             sign_llm_collecting = bool(global_control_data.get("sign_llm_collecting", False))
             sign_llm_frame_id = int(global_control_data.get("sign_llm_frame_id", -1))
             person_stop_active = bool(global_control_data.get("person_stop_active", False))
+            person_avoid_active = bool(global_control_data.get("person_avoid_active", False))
             person_dist_to_bottom = global_control_data.get("person_dist_to_bottom")
             person_left_boundary_x = global_control_data.get("person_left_boundary_x")
             person_right_boundary_x = global_control_data.get("person_right_boundary_x")
@@ -1676,11 +1698,13 @@ def serial_control_thread():
             person_bottom_right_x = None
             person_clear_frames = 0
             person_stop_event = ""
+            person_avoid_active = False
             if sign_llm_stop_active or person_stop_active:
                 target_speed = 0
 
         with data_lock:
             global_control_data["person_stop_active"] = person_stop_active
+            global_control_data["person_avoid_active"] = person_avoid_active
             global_control_data["actual_servo_pwm"] = servo_pwm
             global_control_data["target_speed"] = target_speed
             if person_stop_event:
@@ -1701,11 +1725,11 @@ def serial_control_thread():
                 state=("stop",),
                 min_interval=0.0,
             )
-        elif person_stop_event == "release_clear_line":
+        elif person_stop_event == "avoid_left":
             throttled_log(
                 "person_stop_event",
-                ">>> 行人: 走",
-                state=("release_clear_line",),
+                ">>> 行人: 左偏绕行",
+                state=("avoid_left",),
                 min_interval=0.0,
             )
         elif person_stop_event == "release_missing":
@@ -1713,6 +1737,13 @@ def serial_control_thread():
                 "person_stop_event",
                 ">>> 行人: 走",
                 state=("release_missing",),
+                min_interval=0.0,
+            )
+        elif person_stop_event == "avoid_done":
+            throttled_log(
+                "person_stop_event",
+                ">>> 行人: 绕行结束",
+                state=("avoid_done",),
                 min_interval=0.0,
             )
 
