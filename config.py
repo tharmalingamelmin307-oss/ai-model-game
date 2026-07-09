@@ -167,15 +167,33 @@ OCR_MIN_SCORE = 0.50
 
 # 语义路牌大模型判定。
 # sign 面积达到阈值且不贴边后先停车，停车期间连续收集若干次 OCR 结果，再一次性发给千帆。
+# 是否启用“停车采样 OCR + 千帆综合判定”的语义路牌流程。
+# False 时会回到更简单的 OCR 文本直接生效逻辑。
 SIGN_LLM_ENABLED = True
+# 触发语义路牌停车采样的 sign 框面积阈值，单位是 TARGET_RES 坐标系像素面积。
+# 它会和 SIGN_LLM_TRIGGER_EDGE_MARGIN_RATIO 同时满足后才停车。
 SIGN_LLM_TRIGGER_AREA = 5500
+# 停车后希望采集的有效 OCR 样本数量。
+# 收满后会提交给千帆；如果超时，也可能提前提交已有样本。
 SIGN_LLM_OCR_SAMPLES = 10
+# 最少有效样本数。当前主流程仍倾向收满 SIGN_LLM_OCR_SAMPLES；
+# 这个值保留给采集失败/策略调整时作为下限参考。
 SIGN_LLM_MIN_VALID_SAMPLES = 3
+# 停车采集 OCR 的最长等待时间，单位秒。
+# 到时后即使没收满样本，也会尝试 force 提交。
 SIGN_LLM_COLLECT_TIMEOUT = 3.0
+# 千帆 API 请求超时时间，单位秒。
+# 太小可能导致正常网络波动被判失败；太大会让车辆等待更久。
 SIGN_LLM_API_TIMEOUT = 10.0
+# 千帆结果允许回写的最大帧龄。
+# 如果结果返回时视觉帧已经过去太久，就丢弃，避免旧路牌影响新路口。
 SIGN_LLM_RESULT_MAX_AGE_FRAMES = 60
+# 语义路线完成后，连续看到多少帧单路特征才释放 WAIT_SIGN_GONE/路线锁定。
 SIGN_ROUTE_SINGLE_ROAD_EXIT_FRAMES = 20
+# 按语义路牌选定方向后，进入岔路区域至少保持方向的时间，单位秒。
 SIGN_ROUTE_MIN_FORK_HOLD_SECONDS = 3.0
+# 按语义路牌选定方向后，最长保持该路线选择的时间，单位秒。
+# 超过后即使单路释放条件没完全满足，也会避免永久锁住。
 SIGN_ROUTE_MAX_DRIVE_HOLD_SECONDS = 10.0
 
 # YOLO 默认置信度阈值。
@@ -213,8 +231,11 @@ YOLO_MAX_AREA_RATIO_BY_CLASS = {
     "stop": 0.16,
 }
 
-# 如果检测框同时贴近两条边，且面积占比超过这里，就认为更像异常大框。
+# 检测框贴边判定的边距比例。
+# 用于异常大框过滤：靠边太近的大框通常更像截断/误检。
 YOLO_EDGE_MARGIN_RATIO = 0.02
+# 贴边框面积占比阈值。
+# 如果检测框贴边且面积超过这个比例，就认为更像异常大框并过滤。
 YOLO_EDGE_TOUCH_MAX_AREA_RATIO = 0.30
 
 # ---------------------------------------------------------------------------
@@ -301,20 +322,32 @@ FORK_SCAN_Y_BOTTOM = 139
 #   其中局部允许短暂持平，甚至允许少量小回退
 # - 但不能只靠极少数几步突然跳大，而是需要一段有效张开过程
 # 这样比单看边界断裂更贴近真正的 Y 型岔路几何。
+# 中间缺口张开过程至少要持续多少行。
 FORK_INNER_OPEN_MIN_ROWS = 5
+# 张开段内左右内边界之间的 gap 总增长量下限。
 FORK_INNER_OPEN_MIN_GAP_GROWTH = 14.0
+# 张开段内每一侧内边界向外移动的最小总量。
 FORK_INNER_OPEN_MIN_SIDE_GROWTH = 5.0
+# 相邻采样行里被认为“有效张开”的最小单步增量。
 FORK_INNER_OPEN_MIN_STEP_GAIN = 1.0
+# gap 正向增长的行数下限，防止只靠一两次跳变误判。
 FORK_INNER_OPEN_MIN_POSITIVE_GAP_ROWS = 3
+# 左/右侧各自正向张开的行数下限。
 FORK_INNER_OPEN_MIN_POSITIVE_SIDE_ROWS = 2
+# 允许局部回退的最大单步量；超过则认为不是连续张开过程。
 FORK_INNER_OPEN_MAX_STEP_REGRESSION = 3.0
+# 张开段中允许跳过/缺失的最大行数。
 FORK_INNER_OPEN_MAX_MISS_ROWS = 2
 # Y 岔路分叉点以下必须有公共主干 mask 支撑。
 # 从分叉点到底部中点拉线，沿线附近多数行应能命中 mask，否则认为这条分叉线是悬空误判。
 FORK_TRUNK_SUPPORT_CHECK_ENABLED = True
+# 检查公共主干支撑时，沿分界线左右各看的半径。
 FORK_TRUNK_SUPPORT_RADIUS = 5
+# 从分叉点到底部的支撑命中比例下限。
 FORK_TRUNK_SUPPORT_MIN_RATIO = 0.55
+# 公共主干连续缺失超过多少行就判为悬空误判。
 FORK_TRUNK_SUPPORT_MAX_MISS_ROWS = 18
+# 公共主干至少检查多少行才认为这个验证有意义。
 FORK_TRUNK_SUPPORT_MIN_ROWS = 18
 
 # 汇合场景扫描只看底部多少行。
@@ -332,18 +365,26 @@ MERGE_GUIDE_SCAN_Y_BOTTOM = 130
 # 这段不需要满足“足够宽/贴边连续行”的前置触发条件，直接参与汇合角点特征搜索。
 MERGE_GUIDE_FREE_SCAN_Y_TOP = 130
 MERGE_GUIDE_FREE_SCAN_Y_BOTTOM = 160
+# 触发汇合检测的宽行阈值；一行最左白点到最右白点超过该宽度，认为可能有汇合/贴边宽带。
 MERGE_GUIDE_MIN_ROW_WIDTH = 286.0
+# 宽行/贴边行需要连续出现多少行，才允许进入汇合尖角搜索。
 MERGE_GUIDE_MIN_WIDE_ROWS = 4
+# 汇合塌陷侧内边界的最小横向收口量。
 MERGE_GUIDE_MIN_SIDE_DELTA = 13.0
 # 汇合塌陷侧内边界需要有足够斜率/锐度，避免门或远处贴边造成的平缓漂移误判。
 MERGE_GUIDE_MIN_INNER_ANGLE_DEG = 10.0
+# 汇合内边界最大单步变化占总塌陷量的比例下限，用来要求“尖锐度”。
 MERGE_GUIDE_MIN_INNER_SHARPNESS = 0.10
+# 是否要求塌陷侧上方存在贴边行，减少普通宽弯误判为汇合。
 MERGE_GUIDE_REQUIRE_EDGE_ABOVE_INNER = True
+# 开启 REQUIRE_EDGE_ABOVE 后，上方至少需要多少贴边行。
 MERGE_GUIDE_MIN_EDGE_ABOVE_ROWS = 2
+# 塌陷侧成立后，对侧边界从底到顶允许的总漂移量。
 MERGE_GUIDE_OPPOSITE_MAX_DRIFT = 16.0
 # 塌陷侧成立后，对侧可信边界允许的逐行最大跳变。
 # 例如左侧塌陷时，右侧边界必须连续稳定，不能中途突然横跳。
 MERGE_GUIDE_OPPOSITE_MAX_STEP_JUMP = 10.0
+# 汇合尖角 run 中允许中断的最大行数。
 MERGE_GUIDE_MAX_MISS_ROWS = 2
 # 汇合补线命中后，沿 y 方向额外覆盖的行数。
 # 这里不是斜率外推；每一行仍按“可信侧边界 +/- 当前行完整赛道宽度”单独计算。
@@ -358,14 +399,57 @@ MERGE_GUIDE_LINE_Y_MAX = 160
 # 补左线时，如果它离右边界太近，就限制到“右边界 - gap”左侧；
 # 补右线时，如果它离左边界太近，就推到“左边界 + gap”右侧。
 MERGE_GUIDE_LINE_MIN_GAP = 13.0
+# 汇合 guide line 画入搜索 mask 时使用的线宽。
 MERGE_GUIDE_LINE_THICKNESS = 2
 # 汇合状态机：连续命中若干帧才进入补线；进入后等底部赛道宽度稳定恢复再退出。
+# 汇合特征连续命中多少帧才正式进入补线状态。
 MERGE_STATE_CONFIRM_FRAMES = 3
+# 汇合特征命中统计窗口，单位秒；窗口内累计命中 CONFIRM_FRAMES 次即确认。
+MERGE_STATE_CONFIRM_WINDOW_SECONDS = 0.5
+# 汇合确认过程中允许偶发漏检多少帧，避免 1/0/1/1 这种抖动把确认计数清零。
+MERGE_STATE_MISS_TOLERANCE_FRAMES = 2
+# 退出补线时检查底部多少行的总白区宽度。
 MERGE_STATE_EXIT_BOTTOM_ROWS = 5
+# 汇合补线进入后至少保持多久，单位秒；在这之前即使满足退出条件也不退出。
+MERGE_STATE_MIN_HOLD_SECONDS = 2.0
+# 底部总白区宽度低于该阈值时，认为更像恢复成单路。
 MERGE_STATE_EXIT_WIDTH_THRESH = 340.0
+# 退出条件连续满足多少帧才真正退出补线状态。
 MERGE_STATE_EXIT_CONFIRM_FRAMES = 2
+# 退出补线时检查“不再贴边”的 y 范围上界。
 MERGE_STATE_EXIT_NO_EDGE_Y_TOP = 40
+# 退出补线时检查“不再贴边”的 y 范围下界。
 MERGE_STATE_EXIT_NO_EDGE_Y_BOTTOM = 140
+
+# 贴边侧八邻域方向特征：作为汇合检测的额外 OR 条件。
+# 从右侧底部种子所在的八连通边缘块中，按从上往下的连续八邻域生长方向记录方向码。
+# 是否启用贴边侧八邻域方向模式检测。
+MERGE_EDGE_TRACE_ENABLED = True
+# 贴边方向检测的 y 搜索范围。
+MERGE_EDGE_TRACE_SCAN_Y_TOP = 10
+MERGE_EDGE_TRACE_SCAN_Y_BOTTOM = 130
+# 判断右侧贴边的距离阈值：右边界距离画面右边小于该值时算贴边。
+MERGE_EDGE_TRACE_TOUCH_DISTANCE = 10
+# 至少多少行右侧贴边，才启用连续方向 walk。
+MERGE_EDGE_TRACE_MIN_TOUCH_ROWS = 3
+# 从最底部贴边行继续向下偏移多少行取起点，再沿边缘向上爬。
+MERGE_EDGE_TRACE_START_BELOW_ROWS = 20
+# 连续八邻域 walk 的安全上限；实际会在满足特征后提前停止。
+MERGE_EDGE_TRACE_WALK_MAX_STEPS = 260
+# 连续方向低频调试打印。0 表示关闭；开大一点避免终端 I/O 拖慢帧率。
+MERGE_EDGE_TRACE_WALK_DEBUG_INTERVAL = 0
+# 调试打印中最多输出多少个方向码。
+MERGE_EDGE_TRACE_DEBUG_MAX_DIRS = 96
+# 调试打印中最多输出多少段 run。
+MERGE_EDGE_TRACE_DEBUG_MAX_RUNS = 32
+# 汇合口方向特征：4 长段 -> 5/6 过渡 -> 6/7 延伸。
+MERGE_EDGE_TRACE_MIN_LEFT_RUN = 12
+MERGE_EDGE_TRACE_MIN_TURN_RUN = 4
+MERGE_EDGE_TRACE_MIN_DOWN_RUN = 12
+# 汇合口方向特征匹配时，每段内部允许少量杂向跳点。
+MERGE_EDGE_TRACE_PATTERN_MAX_NOISE = 3
+# walk 过程中每隔多少步检查一次是否已满足特征。
+MERGE_EDGE_TRACE_MATCH_CHECK_STEP = 8
 
 # 固定赛道宽度表的来源坐标系。
 # 当前表仍然是旧 320x320 搜索平面里的样本；代码会按当前 SEG_SIZE 和裁剪比例映射到 416x160。
@@ -479,7 +563,8 @@ STEER_SIGNAL_ROW_WEIGHT_GAMMA = 1.3
 # 这里把它放大到更接近旧版累计控制量的显示和 PWM 调参量级。
 STEER_SIGNAL_NORMALIZED_SCALE = 3000.0
 # 无金币/无车时，控制只看中下部这一段，底部最靠下 30 行不参与。
-# 这两个值是分割图坐标里的 y 行号；在 416x160 输入下，60~130 表示只取中下部路径。
+# 这两个值是分割图坐标里的 y 行号；当前 10~120 表示取远处到中下部路径。
+# 如果中线最上端低于 ROW_MIN，会额外补一个 ROW_MIN 行的点，x 使用最上端点。
 STEER_SIGNAL_NO_TARGET_ROW_MIN = 10.0
 STEER_SIGNAL_NO_TARGET_ROW_MAX = 120.0
 # 无目标控制增益：只在没有金币、没有避障车时乘到 steer_signal 上。
@@ -563,18 +648,18 @@ DEFAULT_FPS_STATS = {
 
 # 三条工作队列容量。
 # 当前策略是“宁可丢旧帧，也不堆积延迟”，所以容量都很小：
-# - SEG_QUEUE_MAXSIZE: 分割主控链路，只保留最新一帧
-# - YOLO_QUEUE_MAXSIZE: 检测链路，也只保留最新一帧
-# - OCR_QUEUE_MAXSIZE: OCR 相对更慢，允许保留极少量待处理任务
 # 如果你发现整机“反应慢但 FPS 看起来还行”，先不要盲目把这些值调大。
 # 队列变大通常只会让显示和控制更滞后。
+# 分割主控链路队列容量，只保留最新帧，避免控制滞后。
 SEG_QUEUE_MAXSIZE = 1
+# YOLO 检测链路队列容量，只保留最新帧，避免检测结果过旧。
 YOLO_QUEUE_MAXSIZE = 1
 
 # YOLO 投帧降频。Seg 是主控链路，每帧都跑；YOLO 只需要更新目标状态，
 # 不必和 Seg 抢每一帧的 NPU/CPU 时间。
 # 1 表示每帧都投；10 表示每 10 帧投 1 帧。
 YOLO_PRODUCER_FRAME_INTERVAL = 1
+# OCR 队列容量。OCR 慢于检测，允许保留少量任务，但不应堆积太多旧帧。
 OCR_QUEUE_MAXSIZE = 2
 
 # Seg 流水线模式。
@@ -583,6 +668,7 @@ OCR_QUEUE_MAXSIZE = 2
 # - 后处理线程: 取最新 mask，负责路径搜索 / 控制量 / 渲染
 # 这样吞吐接近 max(推理耗时, 后处理耗时)，代价是控制结果通常会对应上一帧。
 SEG_PIPELINE_ENABLED = True
+# Seg 流水线后处理队列容量，通常保持 1，只处理最新推理结果。
 SEG_PIPELINE_QUEUE_MAXSIZE = 1
 
 # 帧率统计刷新周期，单位秒。
@@ -593,12 +679,14 @@ FPS_STATS_UPDATE_INTERVAL = 1.0
 # Seg 阶段耗时诊断日志。
 # 开启后每隔一段时间打印 inference / search / fit / render / total，用来定位掉帧瓶颈。
 SEG_PROFILE_LOG_ENABLED = False
+# Seg profile 日志节流间隔，单位秒。
 SEG_PROFILE_LOG_INTERVAL = 2.0
 
 # 主流程运行时耗时诊断日志。
 # 开启后会额外打印采集预处理、Seg 推理线程等待、发布、MJPEG 编码等耗时。
 # 用来判断页面 FPS 是卡在输入来帧、模型推理、后处理发布还是网页推流。
 MAIN_PROFILE_LOG_ENABLED = False
+# 主流程 profile 日志节流间隔，单位秒。
 MAIN_PROFILE_LOG_INTERVAL = 2.0
 
 
@@ -649,12 +737,19 @@ PERSON_CLASS_ID_FALLBACK = 2
 # 行人停车/绕行逻辑。
 # 触发不做路径 ROI 过滤，和斑马线类似，只看 person 框底边是否足够靠近画面底部。
 # 当前策略: 先停车，确认行人持续向右移动后，解除停车并给控制量一个左偏。
-PERSON_STOP_TRIGGER_DIST = 300    #貌似200也不是很多（720）
+# 行人框底边距离画面底部小于该值时触发停车，单位 TARGET_RES 像素。
+PERSON_STOP_TRIGGER_DIST = 300
+# 行人连续向右移动多少帧后允许从停车切到左绕行。
 PERSON_CLEAR_MOVE_FRAMES = 1
+# 判定“行人向右移动”的最小底部中心 x 增量。
 PERSON_CLEAR_MIN_RIGHT_DX = 3.0
+# 左绕行时临时叠加到 steer_signal 的左偏量。
 PERSON_LEFT_AVOID_STEER_BIAS = 45.0
+# 左绕行期间，行人连续漏检多少帧后开始退出候选。
 PERSON_AVOID_EXIT_MISSING_FRAMES = 3
+# 左绕行退出候选需要保持多少帧才真正结束绕行。
 PERSON_AVOID_EXIT_HOLD_FRAMES = 10
+# 普通行人停车状态下，连续漏检多少帧后释放停车。
 PERSON_STOP_MISS_RELEASE_FRAMES = 3
 
 # OCR 检测框与 OCR 文字框做“最近中心点匹配”时使用的初始最大距离。
@@ -738,9 +833,11 @@ SERIAL_TIMEOUT = 0.1
 # - CONTROL_MAX_SPEED: 直道或轻弯时允许的最高速度
 CONTROL_MIN_SPEED = 30
 CONTROL_MAX_SPEED = 30
-# 速度平滑。上升慢一点，避免金币/弯道控制量变化时突然加速；下降保留更快响应。
+# 是否启用速度档位平滑。
 CONTROL_SPEED_SMOOTH_ENABLED = True
+# 速度上升时每个控制周期最多增加多少档，避免突然加速。
 CONTROL_SPEED_MAX_STEP_UP = 1
+# 速度下降时每个控制周期最多减少多少档，保留弯道/停车响应速度。
 CONTROL_SPEED_MAX_STEP_DOWN = 2
 
 # 串口数据包头尾。
@@ -752,12 +849,19 @@ SERIAL_PACKET_TAIL = (0x0D, 0x0A)
 # 这些值主要影响 CPU 占用、实时性和页面刷新感受：
 # - 太小: 更灵敏，但更吃 CPU
 # - 太大: 更省资源，但会更“顿”
+# 串口控制线程循环间隔。
 CONTROL_LOOP_SLEEP = 0.01
+# 共享内存无新帧时的轮询间隔。
 SHM_FRAME_POLL_SLEEP = 0.002
+# 共享内存连接失败后的重试间隔。
 SHM_RETRY_SLEEP = 1.0
+# 网页推流没有可用帧时的等待间隔。
 VIDEO_FEED_IDLE_SLEEP = 0.01
+# MJPEG 每帧推送后的主动 sleep，限制页面推流频率和编码压力。
 VIDEO_FEED_FRAME_SLEEP = 0.02
+# 启动共享内存/检测等普通线程之间的错峰等待。
 STARTUP_SHARED_THREAD_SLEEP = 0.1
+# 启动 Seg 线程之间的错峰等待，避免 RKNN 初始化同时抢资源。
 STARTUP_SEG_THREAD_SLEEP = 0.2
 
 # Flask 推流监听地址。
@@ -795,7 +899,9 @@ OCR_DET_DILATE_ITERATIONS = 2
 # OCR 调试图保存。只在排查 rec 空文本时打开。
 # 打开后会保存 OCR det 拉正后的 crop，不改变识别流程。
 OCR_DEBUG_SAVE_EMPTY_CROPS = True
+# OCR 调试图保存目录。
 OCR_DEBUG_SAVE_DIR = str(PROJECT_ROOT / "debug_ocr")
+# OCR 调试图最多保存多少张，避免长时间运行写爆磁盘。
 OCR_DEBUG_SAVE_MAX_IMAGES = 30
 
 
@@ -825,21 +931,20 @@ YOLO_PRE_NMS_TOPK_PER_CLASS = 80
 # 越接近 1.0 越稳，越接近 0.0 响应越快。
 SEG_EMA_ALPHA = 0.6
 
-# 相邻帧路径稳定约束。
-# 这组参数工作在 SEG_SIZE 路径平面里，用来防止分割噪声或分叉候选切换
-# 造成路径横向瞬间跳变。
-# - MAX_FRAME_X_JUMP: 最终输出路径每帧允许横向移动的最大像素量，设为 0 可关闭限幅
-# - TEMPORAL_SCORE_GAIN: 候选路径相对上一帧偏移越大，打分扣得越多
-# - TEMPORAL_SOFT_MAX_JUMP: 超过这个单点跳变量后，候选会受到额外重罚
-# - TEMPORAL_EXCESS_SCORE_GAIN: 超出软阈值部分的额外扣分权重
-# - TEMPORAL_MIN_OVERLAP_POINTS: 候选与上一帧路径至少重叠多少个采样点才参与时域打分
-# - HOLD_MISSING_FRAMES: 当前帧没搜到路径时，短暂沿用上一帧路径的最大帧数
+# 相邻帧路径稳定约束总开关。
+# 工作在 SEG_SIZE 路径平面里，用于抑制分割噪声或分叉候选切换导致的横跳。
 SEG_PATH_STABILITY_ENABLED = True
+# 最终输出路径每帧允许横向移动的最大像素量；设为 0 可关闭硬限幅。
 SEG_PATH_MAX_FRAME_X_JUMP = 29.0
+# 候选路径相对上一帧偏移越大，打分扣得越多。
 SEG_PATH_TEMPORAL_SCORE_GAIN = 5.0
+# 单点跳变量超过这个软阈值后，候选会受到额外重罚。
 SEG_PATH_TEMPORAL_SOFT_MAX_JUMP = 32.0
+# 超出软阈值部分的额外扣分权重。
 SEG_PATH_TEMPORAL_EXCESS_SCORE_GAIN = 18.0
+# 候选与上一帧路径至少重叠多少个采样点，才参与时域打分。
 SEG_PATH_TEMPORAL_MIN_OVERLAP_POINTS = 4
+# 当前帧没搜到路径时，短暂沿用上一帧路径的最大帧数。
 SEG_PATH_HOLD_MISSING_FRAMES = 2
 
 # 估计石头更靠近左/右分支时，左右候选路径至少要拉开这么多像素才认为可比较。
@@ -849,6 +954,8 @@ STONE_BRANCH_MIN_SEP = 12
 # 自底向上路径搜索参数。
 # 这些值决定了 mask 搜索的采样密度、连通判定和候选路径数量上限。
 # 如果分叉口容易漏掉某一支，或直道上路径抖动明显，优先看这里。
+# 路径搜索沿 y 方向每次向上跳多少行。
+# 调小更细致但更慢；调大更快但可能跳过窄分支。
 SEG_PATH_SEARCH_STEP_Y = 14
 
 # 快速中心线模式。
@@ -956,38 +1063,59 @@ TRACK_WIDTH_LOG_INTERVAL = 1.5
 CAR_AVOIDANCE_ENABLED = True
 # 固定分段偏移：检测框底部离画面底部 150 行内开始左偏 60，
 # 80 行内左偏 90。贴右下角且高度较矮时单独固定左偏 50。
+# car 框底部进入底部多少行内后，开始触发普通左偏。
 CAR_AVOIDANCE_START_OFFSET_ROWS = 150.0
+# 普通避障阶段的左偏基准量。
 CAR_AVOIDANCE_START_LEFT_OFFSET = 80.0
+# car 更靠近车身时使用的近距离阈值。
 CAR_AVOIDANCE_NEAR_OFFSET_ROWS = 60.0
+# 近距离避障时使用的更强左偏量。
 CAR_AVOIDANCE_NEAR_LEFT_OFFSET = 90.0
 # car 跟踪锁定。锁定主要看车框底部中心点的连续性，面积只做异常框过滤。
 # 连续命中后进入避障；短暂漏检会继续沿用锁定目标，超过允许帧数后进入 CLEARING。
+# 新 car 目标需要连续命中多少帧才锁定。
 CAR_AVOIDANCE_LOCK_HIT_FRAMES = 2
+# 锁定目标和新检测框匹配的搜索半径。
 CAR_AVOIDANCE_SEARCH_RADIUS = 48.0
+# 目标漏检期间，搜索半径随漏检帧数增加的增益。
 CAR_AVOIDANCE_SEARCH_RADIUS_MISS_GAIN = 16.0
+# 锁定目标位置 EMA 平滑系数。
 CAR_AVOIDANCE_TRACK_EMA_ALPHA = 0.65
 # car 框短暂变小、被遮挡或漏检时，继续沿用最近一次锁定目标的帧数。
 # 调大可避免太早回正；过大会让已经绕过车后继续偏左太久。
 CAR_AVOIDANCE_MISS_FRAMES = 5
+# car 检测最低置信度过滤；0 表示不额外过滤。
 CAR_AVOIDANCE_MIN_SCORE = 0.0
+# car 检测最大面积过滤；0 表示不额外过滤。
 CAR_AVOIDANCE_MAX_AREA = 0.0
 
 # 避障退出状态机。
 # 车丢失后不立刻回正，而是先进入 CLEARING。
 # CLEARING 里会先保留一段左偏，再慢慢回到正常巡线。
+# 进入 CLEARING 前需要连续漏检多少帧。
 CAR_AVOIDANCE_CLEARING_MISS_FRAMES = 3
+# CLEARING 状态里左偏衰减到结束需要多少帧。
 CAR_AVOIDANCE_CLEARING_DECAY_FRAMES = 12
+# CLEARING 初期保留原避障偏置的比例。
 CAR_AVOIDANCE_CLEARING_RESIDUAL_KEEP = 1.0
+# 衰减残余低于该比例时认为回正完成。
 CAR_AVOIDANCE_CLEARING_DONE_RESIDUAL = 0.06
+# CLEARING 期间允许保留的最大左偏量。
 CAR_AVOIDANCE_CLEARING_LEFT_BIAS_MAX = 30.0
 # 车框还在但已经很贴底、贴右且高度较小时，直接给固定左偏。
+# 固定左偏特殊规则的 car 框高度上限。
 CAR_AVOIDANCE_FIXED_LEFT_BIAS_HEIGHT_THRESH = 60.0
+# 固定左偏特殊规则要求 car 离右边界的最大距离。
 CAR_AVOIDANCE_FIXED_LEFT_BIAS_RIGHT_MARGIN = 10.0
+# 固定左偏特殊规则要求 car 离底边的最大距离。
 CAR_AVOIDANCE_FIXED_LEFT_BIAS_BOTTOM_MARGIN = 10.0
+# 固定左偏特殊规则输出的左偏量。
 CAR_AVOIDANCE_FIXED_LEFT_BIAS_VALUE = 50.0
 # 避障时允许金币的窗口。
 # AVOIDING 期间只允许“底部第一段金币”；CLEARING 期间只允许更靠底且更安全的金币。
+# AVOIDING 状态下，coin 距底部多少行内才允许接管。
 CAR_AVOIDANCE_COIN_ALLOW_BOTTOM_ROWS = 28.0
+# CLEARING 状态下，coin 需要更靠底才允许接管。
 CAR_AVOIDANCE_CLEARING_COIN_SAFE_ROWS = 16.0
 
 # ---------------------------------------------------------------------------
@@ -1070,7 +1198,9 @@ SEG_DEBUG_COIN_PATH_COLOR = (0, 255, 255)
 SEG_DEBUG_COIN_PATH_DOT_RADIUS = 4
 # 是否绘制 steer_signal 斜率累计实际使用的 y 区域，两条横线分别表示参与控制点的上下边界。
 SEG_DEBUG_CONTROL_BAND_ENABLED = True
+# steer_signal 控制区域横线颜色。
 SEG_DEBUG_CONTROL_BAND_COLOR = (255, 0, 255)
+# steer_signal 控制区域横线粗细。
 SEG_DEBUG_CONTROL_BAND_THICKNESS = 2
 # 是否绘制 coin 底部严格区分界线。
 SEG_DEBUG_COIN_BOTTOM_STRICT_LINE_ENABLED = True
@@ -1084,15 +1214,27 @@ SEG_DEBUG_COIN_BOTTOM_STRICT_LINE_THICKNESS = 1
 # - Seg / YOLO FPS
 # - 当前 steer_signal 与估算舵机 PWM
 # - 石头分支判断的调试文本
+# 调试文字字号。
 SEG_DEBUG_TEXT_FONT_SCALE = 0.8
+# 调试文字线宽。
 SEG_DEBUG_TEXT_THICKNESS = 1
+# Seg/Yolo FPS 文本位置。
 SEG_DEBUG_TEXT_POS_FPS = (5, 18)
+# steer_signal / PWM 文本位置。
 SEG_DEBUG_TEXT_POS_CTRL = (5, 36)
+# 石头分支判断文本位置。
 SEG_DEBUG_TEXT_POS_STONE = (5, 54)
+# 分叉/汇合调试文本位置。
 SEG_DEBUG_TEXT_POS_BRANCH = (5, 72)
+# 金币调试文本位置。
 SEG_DEBUG_TEXT_POS_COIN = (5, 90)
+# FPS 文本颜色。
 SEG_DEBUG_TEXT_COLOR_FPS = (0, 255, 0)
+# 控制量文本颜色。
 SEG_DEBUG_TEXT_COLOR_CTRL = (0, 255, 255)
+# 石头文本颜色。
 SEG_DEBUG_TEXT_COLOR_STONE = (0, 200, 255)
+# 分叉/汇合文本颜色。
 SEG_DEBUG_TEXT_COLOR_BRANCH = (255, 200, 0)
+# 金币文本颜色。
 SEG_DEBUG_TEXT_COLOR_COIN = (0, 255, 255)

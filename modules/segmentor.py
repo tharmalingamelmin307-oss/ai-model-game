@@ -74,9 +74,13 @@ class RoadSegmentor:
         }
         self.merge_state_active = False
         self.merge_state_hit_frames = 0
+        self.merge_state_hit_times = []
+        self.merge_state_miss_frames = 0
         self.merge_state_exit_frames = 0
+        self.merge_state_enter_time = None
         self.merge_state_info = None
         self.merge_state_side = None
+        self.merge_edge_trace_debug_counter = 0
         self.locked_car = None
         self.locked_car_miss_frames = 0
         self.car_avoidance_state = "FOLLOW_LANE"
@@ -1106,6 +1110,226 @@ class RoadSegmentor:
             "guide_polyline": guide_polyline,
         }
 
+    def _detect_edge_trace_merge_guide(self, search_mask, edge_mask):
+        """沿左右贴边八连通边缘的连续生长方向找汇合补线触发特征."""
+        if not bool(getattr(config, "MERGE_EDGE_TRACE_ENABLED", True)):
+            return None
+        if search_mask is None or search_mask.size == 0:
+            return None
+
+        h, w = search_mask.shape[:2]
+        scan_y_top = int(np.clip(int(getattr(config, "MERGE_EDGE_TRACE_SCAN_Y_TOP", 10)), 0, h - 1))
+        scan_y_bottom = int(np.clip(int(getattr(config, "MERGE_EDGE_TRACE_SCAN_Y_BOTTOM", 130)), 0, h - 1))
+        if scan_y_bottom < scan_y_top:
+            scan_y_top, scan_y_bottom = scan_y_bottom, scan_y_top
+        touch_distance = max(0, int(getattr(config, "MERGE_EDGE_TRACE_TOUCH_DISTANCE", 10)))
+        min_touch_rows = max(1, int(getattr(config, "MERGE_EDGE_TRACE_MIN_TOUCH_ROWS", 3)))
+        start_below_rows = max(0, int(getattr(config, "MERGE_EDGE_TRACE_START_BELOW_ROWS", 20)))
+        max_steps = max(1, int(getattr(config, "MERGE_EDGE_TRACE_WALK_MAX_STEPS", 260)))
+        debug_interval = int(getattr(config, "MERGE_EDGE_TRACE_WALK_DEBUG_INTERVAL", 0))
+        match_check_step = max(1, int(getattr(config, "MERGE_EDGE_TRACE_MATCH_CHECK_STEP", 8)))
+        debug_max_dirs = max(1, int(getattr(config, "MERGE_EDGE_TRACE_DEBUG_MAX_DIRS", 96)))
+        debug_max_runs = max(1, int(getattr(config, "MERGE_EDGE_TRACE_DEBUG_MAX_RUNS", 32)))
+
+        def _compress_runs(codes):
+            runs = []
+            for code in codes:
+                if code is None:
+                    continue
+                if runs and runs[-1][0] == code:
+                    runs[-1][1] += 1
+                else:
+                    runs.append([int(code), 1])
+            return runs
+
+        def _consume_pattern(codes, first_codes, first_count_codes, turn_codes, down_codes):
+            min_first = max(1, int(getattr(config, "MERGE_EDGE_TRACE_MIN_LEFT_RUN", 12)))
+            min_turn = max(1, int(getattr(config, "MERGE_EDGE_TRACE_MIN_TURN_RUN", 4)))
+            min_down = max(1, int(getattr(config, "MERGE_EDGE_TRACE_MIN_DOWN_RUN", 12)))
+            max_noise = max(0, int(getattr(config, "MERGE_EDGE_TRACE_PATTERN_MAX_NOISE", 3)))
+            n = len(codes)
+
+            def _consume(start_idx, good_codes, count_codes, need):
+                idx = start_idx
+                count = 0
+                noise = 0
+                while idx < n:
+                    code = codes[idx]
+                    if code in good_codes:
+                        if code in count_codes:
+                            count += 1
+                        noise = 0
+                        idx += 1
+                        continue
+                    if count >= need:
+                        break
+                    if noise >= max_noise:
+                        return None
+                    noise += 1
+                    idx += 1
+                if count < need:
+                    return None
+                return idx
+
+            for i in range(n):
+                j = _consume(i, first_codes, first_count_codes, min_first)
+                if j is None:
+                    continue
+                k = _consume(j, turn_codes, turn_codes, min_turn)
+                if k is None:
+                    continue
+                m = _consume(k, down_codes, down_codes, min_down)
+                if m is not None:
+                    return True
+            return False
+
+        def _match_merge_pattern(side, codes):
+            """从下方向上爬：右侧匹配 3/2 -> 2/1 -> 0，左侧镜像匹配 1/2 -> 2/3 -> 4。"""
+            if not codes:
+                return False
+            if side == "left":
+                return _consume_pattern(codes, (1,), (1,), (2, 3), (4,))
+            return _consume_pattern(codes, (3,), (3,), (2, 1), (0,))
+
+        def _walk_edge_codes(side):
+            touch_points = []
+            for y in range(scan_y_top, scan_y_bottom + 1):
+                xs = np.where(edge_mask[y] > 0)[0]
+                if len(xs) == 0:
+                    continue
+                if side == "left":
+                    left_x = int(xs[0])
+                    if left_x < touch_distance:
+                        touch_points.append((left_x, int(y)))
+                else:
+                    right_x = int(xs[-1])
+                    if (w - 1 - right_x) < touch_distance:
+                        touch_points.append((right_x, int(y)))
+            if len(touch_points) < min_touch_rows:
+                return None, f"touch_rows={len(touch_points)}<{min_touch_rows}"
+
+            seed_x, seed_y = max(
+                touch_points,
+                key=(lambda pt: (pt[1], -pt[0])) if side == "left" else (lambda pt: (pt[1], pt[0])),
+            )
+            fill_mask = (edge_mask > 0).astype(np.uint8)
+            cv2.floodFill(fill_mask, None, (int(seed_x), int(seed_y)), 2)
+            component = fill_mask == 2
+            ys, xs = np.where(component)
+            if len(xs) == 0:
+                return None, f"touch_rows={len(touch_points)} empty_component"
+
+            touch_set = {(int(x), int(y)) for x, y in touch_points}
+            component_touch_rows = [
+                y for x, y in touch_set
+                if 0 <= y < h and 0 <= x < w and bool(component[y, x])
+            ]
+            if len(component_touch_rows) < min_touch_rows:
+                return None, f"component_touch_rows={len(component_touch_rows)}<{min_touch_rows}"
+
+            pixels = {(int(x), int(y)) for x, y in zip(xs, ys)}
+            bottom_touch_y = max(component_touch_rows)
+            target_start_y = min(h - 1, int(bottom_touch_y) + start_below_rows)
+            start_candidates = []
+            for radius in range(0, start_below_rows + 6):
+                row_candidates = []
+                for yy in (target_start_y - radius, target_start_y + radius):
+                    if yy < 0 or yy >= h:
+                        continue
+                    xs_on_row = xs[ys == yy]
+                    if len(xs_on_row) == 0:
+                        continue
+                    if side == "left":
+                        row_candidates.append((int(np.min(xs_on_row)), int(yy)))
+                    else:
+                        row_candidates.append((int(np.max(xs_on_row)), int(yy)))
+                if row_candidates:
+                    start_candidates = row_candidates
+                    break
+            if not start_candidates:
+                return None, f"touch_rows={len(touch_points)} no_start_y={target_start_y}"
+            if side == "left":
+                curr = min(start_candidates, key=lambda pt: pt[0])
+                neighbor_order = [
+                    (1, -1, 1), (0, -1, 2), (-1, -1, 3), (-1, 0, 4),
+                    (1, 0, 0), (-1, 1, 5), (0, 1, 6), (1, 1, 7),
+                ]
+            else:
+                curr = max(start_candidates, key=lambda pt: pt[0])
+                neighbor_order = [
+                    (-1, -1, 3), (0, -1, 2), (1, -1, 1), (1, 0, 0),
+                    (-1, 0, 4), (1, 1, 7), (0, 1, 6), (-1, 1, 5),
+                ]
+
+            start_point = curr
+            visited = {curr}
+            dirs = []
+            matched = False
+            for step_idx in range(max_steps):
+                cx, cy = curr
+                choices = []
+                for rank, (dx, dy, code) in enumerate(neighbor_order):
+                    nxt = (cx + dx, cy + dy)
+                    if nxt in pixels and nxt not in visited:
+                        choices.append((rank, abs(dx), code, nxt))
+                if not choices:
+                    break
+                _, _, code, curr = min(choices, key=lambda item: (item[0], item[1]))
+                visited.add(curr)
+                dirs.append(int(code))
+                if len(dirs) >= match_check_step and len(dirs) % match_check_step == 0:
+                    matched = _match_merge_pattern(side, dirs)
+                elif step_idx + 1 >= max_steps:
+                    matched = _match_merge_pattern(side, dirs)
+                if matched:
+                    break
+            return dirs, f"touch_rows={len(touch_points)} start_y={start_point[1]}"
+
+        for side in ("right", "left"):
+            dirs, walk_reason = _walk_edge_codes(side)
+            if dirs is None:
+                if debug_interval > 0:
+                    self.merge_edge_trace_debug_counter += 1
+                    if self.merge_edge_trace_debug_counter % debug_interval == 0:
+                        print(
+                            f"[merge_edge_trace][{side}_walk] "
+                            f"matched=0 steps=0 reason={walk_reason}",
+                            flush=True,
+                        )
+                continue
+
+            matched = _match_merge_pattern(side, dirs)
+            if debug_interval > 0:
+                self.merge_edge_trace_debug_counter += 1
+                if self.merge_edge_trace_debug_counter % debug_interval == 0:
+                    runs = _compress_runs(dirs)
+                    dir_text = "".join(str(code) for code in dirs[:debug_max_dirs])
+                    if len(dirs) > debug_max_dirs:
+                        dir_text += f"...(+{len(dirs) - debug_max_dirs})"
+                    shown_runs = runs[:debug_max_runs]
+                    run_text = " ".join(f"{code}x{count}" for code, count in shown_runs)
+                    if len(runs) > debug_max_runs:
+                        run_text += f" ...(+{len(runs) - debug_max_runs})"
+                    print(
+                        f"[merge_edge_trace][{side}_walk] "
+                        f"matched={int(bool(matched))} steps={len(dirs)} reason={walk_reason} "
+                        f"dirs={dir_text} runs={run_text}",
+                        flush=True,
+                    )
+            if not matched:
+                continue
+
+            guide_polyline = self._build_merge_guide_line([0, 1], side, search_mask, edge_mask)
+            if guide_polyline is None:
+                continue
+            return {
+                "side": side,
+                "guide_polyline": guide_polyline,
+                "source": "edge_trace_walk",
+                "direction_codes": [int(code) for code in dirs],
+            }
+        return None
+
     def _merge_bottom_width_exit_ready(self, search_mask):
         """底部连续若干行总白区宽度小于阈值时，认为汇合补线可以退出."""
         if search_mask is None or search_mask.size == 0:
@@ -1133,38 +1357,71 @@ class RoadSegmentor:
         return True
 
     def _update_merge_state(self, merge_detect_info, search_mask):
-        """汇合补线状态机：三帧确认进入，底部宽度连续恢复两帧退出."""
+        """汇合补线状态机：时间窗口内累计命中确认，底部宽度连续恢复后退出."""
         confirm_frames = max(1, int(getattr(config, "MERGE_STATE_CONFIRM_FRAMES", 3)))
+        confirm_window_s = max(0.05, float(getattr(config, "MERGE_STATE_CONFIRM_WINDOW_SECONDS", 0.5)))
+        miss_tolerance = max(0, int(getattr(config, "MERGE_STATE_MISS_TOLERANCE_FRAMES", 2)))
+        min_hold_s = max(0.0, float(getattr(config, "MERGE_STATE_MIN_HOLD_SECONDS", 2.0)))
         exit_confirm_frames = max(1, int(getattr(config, "MERGE_STATE_EXIT_CONFIRM_FRAMES", 2)))
+        now_s = time.perf_counter()
+
+        def _drop_old_hit_times():
+            self.merge_state_hit_times = [
+                t for t in self.merge_state_hit_times
+                if now_s - float(t) <= confirm_window_s
+            ]
 
         detected_side = None if merge_detect_info is None else merge_detect_info.get("side")
         if self.merge_state_active and self.merge_state_side in ("left", "right"):
             if detected_side == self.merge_state_side:
                 self.merge_state_hit_frames += 1
+                self.merge_state_hit_times.append(now_s)
+                _drop_old_hit_times()
+                self.merge_state_miss_frames = 0
                 self.merge_state_info = merge_detect_info
             elif detected_side is None:
-                self.merge_state_hit_frames = 0
+                self.merge_state_miss_frames += 1
+                _drop_old_hit_times()
+                if self.merge_state_miss_frames > miss_tolerance:
+                    self.merge_state_hit_frames = 0
+                    self.merge_state_hit_times = []
             else:
                 # 当前边还在，不允许直接跳到另一边；先按退出流程走。
                 detected_side = None
                 merge_detect_info = None
                 self.merge_state_hit_frames = 0
+                self.merge_state_hit_times = []
+                self.merge_state_miss_frames = 0
         else:
             if merge_detect_info is not None:
                 self.merge_state_hit_frames += 1
+                self.merge_state_hit_times.append(now_s)
+                _drop_old_hit_times()
+                self.merge_state_miss_frames = 0
                 self.merge_state_info = merge_detect_info
             else:
-                self.merge_state_hit_frames = 0
+                self.merge_state_miss_frames += 1
+                _drop_old_hit_times()
+                if self.merge_state_miss_frames > miss_tolerance:
+                    self.merge_state_hit_frames = 0
+                    self.merge_state_hit_times = []
+                    self.merge_state_info = None
 
         if not self.merge_state_active:
             self.merge_state_exit_frames = 0
-            if self.merge_state_hit_frames >= confirm_frames and self.merge_state_info is not None:
+            if len(self.merge_state_hit_times) >= confirm_frames and self.merge_state_info is not None:
                 self.merge_state_active = True
                 self.merge_state_side = self.merge_state_info.get("side")
+                self.merge_state_enter_time = now_s
             else:
                 return None
 
-        if self._merge_bottom_width_exit_ready(search_mask):
+        hold_elapsed_s = (
+            None if self.merge_state_enter_time is None
+            else max(0.0, float(now_s - self.merge_state_enter_time))
+        )
+        hold_ready = hold_elapsed_s is None or hold_elapsed_s >= min_hold_s
+        if hold_ready and self._merge_bottom_width_exit_ready(search_mask):
             self.merge_state_exit_frames += 1
         else:
             self.merge_state_exit_frames = 0
@@ -1172,7 +1429,10 @@ class RoadSegmentor:
         if self.merge_state_exit_frames >= exit_confirm_frames:
             self.merge_state_active = False
             self.merge_state_hit_frames = 0
+            self.merge_state_hit_times = []
+            self.merge_state_miss_frames = 0
             self.merge_state_exit_frames = 0
+            self.merge_state_enter_time = None
             self.merge_state_info = None
             self.merge_state_side = None
             return None
@@ -2797,7 +3057,11 @@ class RoadSegmentor:
         pts_final_orig = None
         search_mask = self._prepare_search_mask(mask)
         search_edge_mask = self._extract_edge_mask(search_mask)
-        merge_detect_info = self._detect_merge_guide(search_mask, search_edge_mask)
+        merge_detect_info = None
+        if not self.merge_state_active:
+            merge_detect_info = self._detect_merge_guide(search_mask, search_edge_mask)
+            if merge_detect_info is None:
+                merge_detect_info = self._detect_edge_trace_merge_guide(search_mask, search_edge_mask)
         merge_guide_info = self._update_merge_state(merge_detect_info, search_mask)
         merge_side = None
         if merge_guide_info is not None:
