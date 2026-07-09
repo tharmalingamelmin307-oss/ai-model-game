@@ -95,6 +95,7 @@ class RoadSegmentor:
             "merge_guide": None,
             "fork_point": None,
             "coin_path": None,
+            "control_band": None,
             "bottom_mid": (0.0, 0.0),
             "base_size": tuple(config.SEG_SIZE),
         }
@@ -147,6 +148,7 @@ class RoadSegmentor:
         merge_guide_pts=None,
         fork_point=None,
         coin_path=None,
+        control_band=None,
     ):
         """缓存主图路径叠加层，供主线程在其它元素之上重绘."""
         self.last_main_overlay = {
@@ -158,6 +160,7 @@ class RoadSegmentor:
             "merge_guide": None if merge_guide_pts is None else np.array(merge_guide_pts, dtype=np.float32).copy(),
             "fork_point": None if fork_point is None else (float(fork_point[0]), float(fork_point[1])),
             "coin_path": coin_path,
+            "control_band": control_band,
             "bottom_mid": (float(img_w) / 2.0, float(img_h) - 1.0),
             "base_size": (int(img_w), int(img_h)),
         }
@@ -198,6 +201,7 @@ class RoadSegmentor:
         merge_guide_thickness = max(1, int(round(config.SEG_DEBUG_MERGE_GUIDE_THICKNESS * scale)))
         bottom_mid_radius = max(1, int(round(config.SEG_DEBUG_BOTTOM_MID_RADIUS * scale)))
         coin_dot_radius = max(1, int(round(config.SEG_DEBUG_COIN_PATH_DOT_RADIUS * scale)))
+        control_band_thickness = max(1, int(round(getattr(config, "SEG_DEBUG_CONTROL_BAND_THICKNESS", 2) * scale)))
         coin_strict_line_thickness = max(1, int(round(getattr(config, "SEG_DEBUG_COIN_BOTTOM_STRICT_LINE_THICKNESS", 1) * scale)))
 
         def _scale_point(pt):
@@ -255,6 +259,19 @@ class RoadSegmentor:
                 merge_guide_thickness,
                 cv2.LINE_AA,
             )
+
+        control_band = overlay.get("control_band")
+        if bool(getattr(config, "SEG_DEBUG_CONTROL_BAND_ENABLED", True)) and control_band is not None:
+            try:
+                y_min = float(control_band[0])
+                y_max = float(control_band[1])
+                y1 = int(round(np.clip(y_min * scale_y, 0, img_h - 1)))
+                y2 = int(round(np.clip(y_max * scale_y, 0, img_h - 1)))
+                color = getattr(config, "SEG_DEBUG_CONTROL_BAND_COLOR", (255, 0, 255))
+                cv2.line(image, (0, y1), (img_w - 1, y1), color, control_band_thickness, cv2.LINE_AA)
+                cv2.line(image, (0, y2), (img_w - 1, y2), color, control_band_thickness, cv2.LINE_AA)
+            except Exception:
+                pass
 
         if bool(getattr(config, "SEG_DEBUG_COIN_BOTTOM_STRICT_LINE_ENABLED", True)):
             strict_rows = float(getattr(config, "COIN_PATH_ROI_BOTTOM_STRICT_ROWS", 0.0))
@@ -1949,7 +1966,7 @@ class RoadSegmentor:
         return selected.astype(np.float32)
 
     def _select_no_target_control_points(self, path_points, img_h):
-        """无金币/无车时，使用中下部指定行段参与控制，避开最底部几行."""
+        """无金币/无车时，使用指定行段；若上边界缺失则用最上端点补齐。"""
         if path_points is None or len(path_points) == 0:
             return None
 
@@ -1958,10 +1975,17 @@ class RoadSegmentor:
         row_max = float(getattr(config, "STEER_SIGNAL_NO_TARGET_ROW_MAX", 130.0))
         lo = max(0.0, min(row_min, row_max))
         hi = min(float(img_h) - 1.0, max(row_min, row_max))
+        if hi < lo:
+            return None
+
         selected = pts[(pts[:, 1] >= lo) & (pts[:, 1] <= hi)]
-        if len(selected) > 0:
-            return selected.astype(np.float32)
-        return self._select_bottom_band_control_points(path_points, img_h, band_height=max(1.0, float(img_h) - lo))
+        if len(selected) == 0:
+            return None
+        selected = selected[np.argsort(selected[:, 1])]
+        if float(selected[0, 1]) > lo:
+            top_pad = np.array([[float(selected[0, 0]), lo]], dtype=np.float32)
+            selected = np.vstack([top_pad, selected])
+        return selected.astype(np.float32)
 
     def _path_x_at_y_points(self, path_points, y):
         """在一组路径点上按 y 插值得到 x."""
@@ -2583,6 +2607,45 @@ class RoadSegmentor:
         bias = near_offset if rows_to_car <= near_rows else start_offset
         return float(bias) * float(bias_sign), (center_y, path_bottom_y)
 
+    def _bottom_obstacle_bias_sign(self, planning_items, base):
+        """用最靠底部的 car/person 决定绕行方向，避免两类目标互相打架."""
+        base = np.array(base, dtype=np.float32).reshape((-1, 2))
+        if len(base) < 2:
+            return None
+
+        best = None
+        for item in planning_items:
+            if item.get("class_name", "") not in ("car", "person"):
+                continue
+            seg_box = item.get("seg_box")
+            if seg_box is None:
+                continue
+            box = np.array(seg_box, dtype=np.float32).reshape((-1, 2))
+            if len(box) < 4:
+                continue
+            y_sorted = np.argsort(box[:, 1])
+            bottom_pts = box[y_sorted[-2:]]
+            bottom_y = float(np.max(bottom_pts[:, 1]))
+            bottom_center_x = float(np.mean(bottom_pts[:, 0]))
+            if best is None or bottom_y > best["bottom_y"]:
+                best = {
+                    "class_name": item.get("class_name", ""),
+                    "bottom_y": bottom_y,
+                    "bottom_center_x": bottom_center_x,
+                }
+
+        if best is None:
+            return None
+
+        path_y_min = float(np.min(base[:, 1]))
+        path_y_max = float(np.max(base[:, 1]))
+        center_y = float(np.clip(best["bottom_y"], path_y_min, path_y_max))
+        path_x = self._path_x_at_y_points(base, center_y)
+        if path_x is None:
+            return None
+        # 目标在路径左边则向右偏，目标在路径右边则向左偏。
+        return -1.0 if float(best["bottom_center_x"]) < float(path_x) else 1.0
+
     def _update_car_avoidance_center_bias(self, base_path, planning_items, w_seg, h_seg):
         """检测到 car 时，先锁定同一辆车，再输出控制基准偏移量."""
         debug = {
@@ -2940,9 +3003,19 @@ class RoadSegmentor:
             external_bias_active = external_left_bias_x > 0.0
             avoid_center_bias_x = car_center_bias_x if car_active else 0.0
             avoid_bias_source = "car" if car_active else "none"
-            if external_bias_active and external_left_bias_x > abs(float(avoid_center_bias_x)):
-                avoid_center_bias_x = external_left_bias_x
-                avoid_bias_source = "external"
+            if external_bias_active:
+                external_bias_x = external_left_bias_x
+                bottom_obstacle_sign = self._bottom_obstacle_bias_sign(planning_items, path_points_orig)
+                if bottom_obstacle_sign is not None:
+                    external_bias_x = float(external_left_bias_x) * float(bottom_obstacle_sign)
+                elif car_active and abs(float(car_center_bias_x)) > 0.0:
+                    external_bias_x = float(np.copysign(external_left_bias_x, car_center_bias_x))
+                if abs(float(external_bias_x)) > abs(float(avoid_center_bias_x)):
+                    avoid_center_bias_x = external_bias_x
+                    if bottom_obstacle_sign is not None:
+                        avoid_bias_source = "external_bottom_obstacle_dir"
+                    else:
+                        avoid_bias_source = "external_car_dir" if car_active else "external"
             car_state = "FOLLOW_LANE"
             if car_path_debug is not None:
                 car_state = str(car_path_debug.get("state", "FOLLOW_LANE"))
@@ -3017,12 +3090,26 @@ class RoadSegmentor:
                 steer_signal *= float(getattr(config, "STEER_SIGNAL_CAR_GAIN", 1.0))
             elif not car_active:
                 steer_signal *= float(getattr(config, "STEER_SIGNAL_NO_TARGET_GAIN", 1.0))
+            control_band = None
+            if control_path_points is not None and len(control_path_points) > 0:
+                control_pts = np.array(control_path_points, dtype=np.float32).reshape((-1, 2))
+                control_band = (
+                    float(np.min(control_pts[:, 1])),
+                    float(np.max(control_pts[:, 1])),
+                )
             pts_final_orig = path_points_orig.reshape((-1, 1, 2))
         else:
             held_path = self._hold_last_path()
             if held_path is not None:
                 path_points_orig = held_path
                 steer_signal = self._compute_weighted_steer_signal(path_points_orig, w_seg, h_seg)
+                control_band = None
+                if path_points_orig is not None and len(path_points_orig) > 0:
+                    control_pts = np.array(path_points_orig, dtype=np.float32).reshape((-1, 2))
+                    control_band = (
+                        float(np.min(control_pts[:, 1])),
+                        float(np.max(control_pts[:, 1])),
+                    )
                 pts_final_orig = path_points_orig.reshape((-1, 1, 2))
             else:
                 self.last_poly_coeffs = None
@@ -3052,6 +3139,7 @@ class RoadSegmentor:
             merge_guide_pts=None if merge_guide_info is None else merge_guide_info.get("guide_polyline"),
             fork_point=y_fork_info.get("fork_point") if y_fork_active else None,
             coin_path=coin_path_debug,
+            control_band=control_band if 'control_band' in locals() else None,
         )
         t_fit_end = time.perf_counter()
 

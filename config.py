@@ -79,19 +79,37 @@ DICT_PATH = str(PROJECT_ROOT / "models/ocr/keys.txt")
 # ---------------------------------------------------------------------------
 # NPU 核心分配
 # ---------------------------------------------------------------------------
-# 分割线程占用的 NPU 核列表。
-# 现在只开了一个分割线程，所以这里只有 [0]。
-# 如果后面想尝试多分割线程并行，可以把多个 core id 放进来，
-# 但要注意多线程争抢输入队列和结果覆盖的问题。
+# 分割线程占用的 NPU 核列表。路牌前只启用这组核心。
 SEG_CORES = [0]
 
+# 语义路牌结果出来后仍保持单核 Seg。实测双 Seg worker 会拖低帧率。
+SEG_CORES_AFTER_SIGN = [0]
+
 # YOLO 检测线程绑定的 NPU 核。
-# 目标是让检测和 OCR 分开跑，避免互相卡住。
+# 这里保持原先稳定可用的单核配置；部分板端 RKNNLite/模型组合不支持直接传多核 mask。
 YOLO_CORE = 2
 
+# YOLO 多 worker 配置。
+# 不把单个 RKNN runtime 绑到多核，而是启动多个单核 YOLODetector 实例。
+# 如果双 worker 不稳定，把这里改回 [YOLO_CORE] 即可回到单 worker。
+YOLO_CORES = [1, 2]
+
+# 语义路牌结果出来后仍保持 YOLO 双 worker。
+YOLO_ACTIVE_WORKERS_AFTER_SIGN = 2
+
 # OCR 识别线程绑定的 NPU 核。
-# OCR 虽然不是每帧都触发，但一旦触发就可能拖慢其它推理，所以单独占核更稳。
+# OCR 不再启动时常驻初始化，只有路牌面积达标、任务进队后才初始化。
+# 触发 OCR 时会短时间和 YOLO 争用 Core1。
 REC_CORE = 1
+
+# 路牌 OCR 正在运行时，是否暂停 YOLO 检测。
+# True: OCR 期间 YOLO 不跑推理，避免双核 YOLO 抢 NPU；OCR 结束后自动恢复。
+# False: OCR 和 YOLO 并行跑，检测连续性更好，但 OCR 期间可能互相抢核。
+YOLO_PAUSE_DURING_OCR = True
+
+# YOLO 因 OCR 暂停的最长时间，单位秒。
+# 超过这个时间还没收到 OCR 完成信号，就自动恢复 YOLO，避免检测 FPS 长时间为 0。
+YOLO_PAUSE_OCR_TIMEOUT = 1.5
 
 
 # ---------------------------------------------------------------------------
@@ -137,21 +155,27 @@ OCR_MIN_SIGN_BOX_AREA = 6000
 # 这样可以尽量避开“框看起来够大，但其实有一部分已经贴边截断”的情况。
 OCR_SIGN_EDGE_MARGIN_RATIO = 0.03
 
+# 语义路牌停车触发比普通 OCR 更严格：框离边缘太近时不停车，避免牌子被截断还触发采样。
+SIGN_LLM_TRIGGER_EDGE_MARGIN_RATIO = 0.05
+
+# sign 停车采样时，把 YOLO 路牌框按宽高向外扩展的比例，用来收集同一块牌子上的多行 OCR 文本。
+SIGN_OCR_MATCH_EXPAND_RATIO = 0.20
+
 # OCR 识别结果的最小平均置信度阈值。
 # 低于这个值的 OCR 文本会在进入主逻辑前直接丢弃，避免低分脏结果参与。
 OCR_MIN_SCORE = 0.50
 
 # 语义路牌大模型判定。
-# sign 面积达到阈值后先停车，停车期间连续收集若干次 OCR 结果，再一次性发给千帆。
+# sign 面积达到阈值且不贴边后先停车，停车期间连续收集若干次 OCR 结果，再一次性发给千帆。
 SIGN_LLM_ENABLED = True
-SIGN_LLM_TRIGGER_AREA = 7000
+SIGN_LLM_TRIGGER_AREA = 5500
 SIGN_LLM_OCR_SAMPLES = 10
 SIGN_LLM_MIN_VALID_SAMPLES = 3
 SIGN_LLM_COLLECT_TIMEOUT = 3.0
 SIGN_LLM_API_TIMEOUT = 10.0
 SIGN_LLM_RESULT_MAX_AGE_FRAMES = 60
 SIGN_ROUTE_SINGLE_ROAD_EXIT_FRAMES = 20
-SIGN_ROUTE_MIN_FORK_HOLD_SECONDS = 1.0
+SIGN_ROUTE_MIN_FORK_HOLD_SECONDS = 3.0
 SIGN_ROUTE_MAX_DRIVE_HOLD_SECONDS = 10.0
 
 # YOLO 默认置信度阈值。
@@ -439,7 +463,7 @@ SERVO_MIN, SERVO_MAX = 590, 910
 # 调小:
 # - 舵机更稳
 # - 但可能转不过弯
-STEER_SIGNAL_PWM_GAIN = 0.015
+STEER_SIGNAL_PWM_GAIN = 0.012
 
 # 用单一转向控制量做动态降速时的增益。
 # 控制量绝对值越大，说明当前横向偏差/路径趋势越强，目标速度会随之降低。
@@ -456,8 +480,8 @@ STEER_SIGNAL_ROW_WEIGHT_GAMMA = 1.3
 STEER_SIGNAL_NORMALIZED_SCALE = 3000.0
 # 无金币/无车时，控制只看中下部这一段，底部最靠下 30 行不参与。
 # 这两个值是分割图坐标里的 y 行号；在 416x160 输入下，60~130 表示只取中下部路径。
-STEER_SIGNAL_NO_TARGET_ROW_MIN = 60.0
-STEER_SIGNAL_NO_TARGET_ROW_MAX = 130.0
+STEER_SIGNAL_NO_TARGET_ROW_MIN = 10.0
+STEER_SIGNAL_NO_TARGET_ROW_MAX = 120.0
 # 无目标控制增益：只在没有金币、没有避障车时乘到 steer_signal 上。
 # 可用于补偿无目标控制行段变短、归一化后转向偏软等情况。
 STEER_SIGNAL_NO_TARGET_GAIN = 1.0
@@ -497,10 +521,12 @@ DEFAULT_CONTROL_DATA = {
     "sign_llm_started_at": None,
     "sign_llm_frame_id": -1,
     "sign_llm_ocr_inflight": False,
+    "sign_llm_ocr_inflight_started_at": None,
     "sign_llm_result": "",
     "sign_llm_error": "",
     "sign_route_state": "IDLE",
     "sign_route_choice": 0,
+    "post_sign_phase": False,
     "sign_route_locked_rect": None,
     "sign_route_drive_started_at": None,
     "sign_route_fork_entered_at": None,
@@ -566,13 +592,13 @@ FPS_STATS_UPDATE_INTERVAL = 1.0
 
 # Seg 阶段耗时诊断日志。
 # 开启后每隔一段时间打印 inference / search / fit / render / total，用来定位掉帧瓶颈。
-SEG_PROFILE_LOG_ENABLED = True
+SEG_PROFILE_LOG_ENABLED = False
 SEG_PROFILE_LOG_INTERVAL = 2.0
 
 # 主流程运行时耗时诊断日志。
 # 开启后会额外打印采集预处理、Seg 推理线程等待、发布、MJPEG 编码等耗时。
 # 用来判断页面 FPS 是卡在输入来帧、模型推理、后处理发布还是网页推流。
-MAIN_PROFILE_LOG_ENABLED = True
+MAIN_PROFILE_LOG_ENABLED = False
 MAIN_PROFILE_LOG_INTERVAL = 2.0
 
 
@@ -624,7 +650,7 @@ PERSON_CLASS_ID_FALLBACK = 2
 # 触发不做路径 ROI 过滤，和斑马线类似，只看 person 框底边是否足够靠近画面底部。
 # 当前策略: 先停车，确认行人持续向右移动后，解除停车并给控制量一个左偏。
 PERSON_STOP_TRIGGER_DIST = 300    #貌似200也不是很多（720）
-PERSON_CLEAR_MOVE_FRAMES = 2
+PERSON_CLEAR_MOVE_FRAMES = 1
 PERSON_CLEAR_MIN_RIGHT_DX = 3.0
 PERSON_LEFT_AVOID_STEER_BIAS = 45.0
 PERSON_AVOID_EXIT_MISSING_FRAMES = 3
@@ -710,7 +736,7 @@ SERIAL_TIMEOUT = 0.1
 # 当前并不是直接发电机 PWM，而是发一个速度档位：
 # - CONTROL_MIN_SPEED: 常规最低巡航速度
 # - CONTROL_MAX_SPEED: 直道或轻弯时允许的最高速度
-CONTROL_MIN_SPEED = 10
+CONTROL_MIN_SPEED = 30
 CONTROL_MAX_SPEED = 30
 # 速度平滑。上升慢一点，避免金币/弯道控制量变化时突然加速；下降保留更快响应。
 CONTROL_SPEED_SMOOTH_ENABLED = True
@@ -931,8 +957,8 @@ CAR_AVOIDANCE_ENABLED = True
 # 固定分段偏移：检测框底部离画面底部 150 行内开始左偏 60，
 # 80 行内左偏 90。贴右下角且高度较矮时单独固定左偏 50。
 CAR_AVOIDANCE_START_OFFSET_ROWS = 150.0
-CAR_AVOIDANCE_START_LEFT_OFFSET = 60.0
-CAR_AVOIDANCE_NEAR_OFFSET_ROWS = 50.0
+CAR_AVOIDANCE_START_LEFT_OFFSET = 80.0
+CAR_AVOIDANCE_NEAR_OFFSET_ROWS = 60.0
 CAR_AVOIDANCE_NEAR_LEFT_OFFSET = 90.0
 # car 跟踪锁定。锁定主要看车框底部中心点的连续性，面积只做异常框过滤。
 # 连续命中后进入避障；短暂漏检会继续沿用锁定目标，超过允许帧数后进入 CLEARING。
@@ -971,7 +997,7 @@ CAR_AVOIDANCE_CLEARING_COIN_SAFE_ROWS = 16.0
 # - 使用检测框底部两点中点作为金币锚点
 # - 只保留落在当前路径纵向范围内、附近有 mask、且离当前中线不超过赛道半宽的金币点
 # - 路径按“底部路径点 -> 金币点 -> 最远路径点”从近到远分段重采样
-COIN_PATH_ENABLED = True
+COIN_PATH_ENABLED = False
 # 新锁定金币必须位于这个 y 行以下，防止太远的金币过早拉动路径。
 COIN_PATH_ROI_Y_MIN = 15
 # coin 底部边缘严格区。靠近分割输入底边时，用“当前路径中线 +/- 赛道半宽”
@@ -1042,6 +1068,10 @@ SEG_DEBUG_COIN_PATH_ENABLED = True
 SEG_DEBUG_COIN_PATH_COLOR = (0, 255, 255)
 # coin 锚点圆点半径。
 SEG_DEBUG_COIN_PATH_DOT_RADIUS = 4
+# 是否绘制 steer_signal 斜率累计实际使用的 y 区域，两条横线分别表示参与控制点的上下边界。
+SEG_DEBUG_CONTROL_BAND_ENABLED = True
+SEG_DEBUG_CONTROL_BAND_COLOR = (255, 0, 255)
+SEG_DEBUG_CONTROL_BAND_THICKNESS = 2
 # 是否绘制 coin 底部严格区分界线。
 SEG_DEBUG_COIN_BOTTOM_STRICT_LINE_ENABLED = True
 # coin 底部严格区分界线颜色。

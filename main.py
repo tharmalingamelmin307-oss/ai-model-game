@@ -3,8 +3,8 @@
 整体流程:
 1. ai_producer_thread 从共享内存读取最新图像。
 2. 图像被拆成两条支路:
-   - seg_queue: 送给分割 / 路径规划线程
-   - yolo_queue: 送给目标检测线程
+   - seg_queues: 按赛程阶段送给一个或多个分割 / 路径规划线程
+   - yolo_queues: 轮流送给多个目标检测线程
 3. yolo_worker 只负责检测；如果检测到 sign，再把 OCR 任务异步送入 ocr_queue。
 4. ocr_worker 单独占用一个 NPU 核，对整张 TARGET_RES 图执行 OCR det + rec，
    再把识别结果按中心点回匹配到 sign 检测框。
@@ -61,11 +61,18 @@ data_lock = threading.Lock()
 log_lock = threading.Lock()
 
 # 三条工作队列:
-# - seg_queue: 最新一帧分割输入
-# - yolo_queue: 最新一帧检测输入
+# - seg_queues: 每个 Seg worker 一条最新帧分割输入队列
+# - yolo_queues: 每个 YOLO worker 一条最新帧检测输入队列
 # - ocr_queue: 检测线程生成的 sign OCR 任务
-seg_queue = Queue(maxsize=config.SEG_QUEUE_MAXSIZE)
-yolo_queue = Queue(maxsize=config.YOLO_QUEUE_MAXSIZE)
+seg_core_ids = list(getattr(config, "SEG_CORES_AFTER_SIGN", getattr(config, "SEG_CORES", [0])))
+if not seg_core_ids:
+    seg_core_ids = list(getattr(config, "SEG_CORES", [0]))
+seg_initial_worker_count = max(1, len(getattr(config, "SEG_CORES", [0])))
+seg_queues = [Queue(maxsize=config.SEG_QUEUE_MAXSIZE) for _ in seg_core_ids]
+yolo_core_ids = list(getattr(config, "YOLO_CORES", [getattr(config, "YOLO_CORE", 2)]))
+if not yolo_core_ids:
+    yolo_core_ids = [getattr(config, "YOLO_CORE", 2)]
+yolo_queues = [Queue(maxsize=config.YOLO_QUEUE_MAXSIZE) for _ in yolo_core_ids]
 ocr_queue = Queue(maxsize=config.OCR_QUEUE_MAXSIZE)
 llm_queue = MPQueue(maxsize=2)
 llm_result_queue = MPQueue(maxsize=2)
@@ -521,11 +528,14 @@ def should_trigger_sign_route(cls_id, rect):
     if len(rect) != 4:
         return False, "invalid_rect"
     area = rect_area(rect)
-    trigger_area = float(getattr(config, "SIGN_LLM_TRIGGER_AREA", 7000))
+    trigger_area = float(getattr(config, "SIGN_LLM_TRIGGER_AREA", 6000))
     if area < trigger_area:
         return False, f"area_too_small({int(area)}<{int(trigger_area)})"
     frame_w, frame_h = config.TARGET_RES
-    edge_margin_ratio = float(config.OCR_SIGN_EDGE_MARGIN_RATIO)
+    edge_margin_ratio = max(
+        float(config.OCR_SIGN_EDGE_MARGIN_RATIO),
+        float(getattr(config, "SIGN_LLM_TRIGGER_EDGE_MARGIN_RATIO", config.OCR_SIGN_EDGE_MARGIN_RATIO)),
+    )
     edge_margin_x = frame_w * edge_margin_ratio
     edge_margin_y = frame_h * edge_margin_ratio
     x, y, w, h = rect
@@ -563,6 +573,30 @@ def points_center(points):
     return (float(center[0]), float(center[1]))
 
 
+def expanded_rect(rect, expand_ratio):
+    """按宽高比例向外扩展 [x, y, w, h] 框，并裁剪到 TARGET_RES 内."""
+    if len(rect) != 4:
+        return [0.0, 0.0, 0.0, 0.0]
+    x, y, w, h = [float(v) for v in rect]
+    pad_x = max(0.0, w * float(expand_ratio))
+    pad_y = max(0.0, h * float(expand_ratio))
+    frame_w, frame_h = config.TARGET_RES
+    x1 = float(np.clip(x - pad_x, 0.0, float(frame_w)))
+    y1 = float(np.clip(y - pad_y, 0.0, float(frame_h)))
+    x2 = float(np.clip(x + w + pad_x, 0.0, float(frame_w)))
+    y2 = float(np.clip(y + h + pad_y, 0.0, float(frame_h)))
+    return [x1, y1, max(0.0, x2 - x1), max(0.0, y2 - y1)]
+
+
+def point_in_rect(point, rect):
+    """判断点是否在 [x, y, w, h] 框内."""
+    if len(rect) != 4:
+        return False
+    px, py = point
+    x, y, w, h = [float(v) for v in rect]
+    return x <= float(px) <= x + w and y <= float(py) <= y + h
+
+
 def rect_area(rect):
     """返回 [x, y, w, h] 框面积."""
     if len(rect) != 4:
@@ -580,6 +614,7 @@ def clear_sign_llm_state(state, keep_completed=False):
     state["sign_llm_started_at"] = None
     state["sign_llm_frame_id"] = -1
     state["sign_llm_ocr_inflight"] = False
+    state["sign_llm_ocr_inflight_started_at"] = None
     state["sign_llm_error"] = ""
     if not keep_completed:
         state["sign_llm_completed_hold"] = False
@@ -597,6 +632,7 @@ def reset_sign_route_state(state, next_state="IDLE"):
     state["sign_route_single_road_frames"] = 0
     state["sign_route_api_submitted"] = False
     state["sign_llm_ocr_inflight"] = False
+    state["sign_llm_ocr_inflight_started_at"] = None
     state["sign_llm_completed_hold"] = False
 
 
@@ -767,6 +803,7 @@ def record_sign_llm_sample(state, frame_id, text="", score=0.0, reason=""):
 def mark_sign_ocr_done():
     with data_lock:
         global_control_data["sign_llm_ocr_inflight"] = False
+        global_control_data["sign_llm_ocr_inflight_started_at"] = None
 
 
 def sign_llm_worker():
@@ -847,6 +884,7 @@ def drain_sign_llm_results():
                 global_control_data["sign_route_fork_entered_at"] = None
                 global_control_data["sign_route_single_road_frames"] = 0
                 global_control_data["sign_llm_completed_hold"] = False
+                global_control_data["post_sign_phase"] = True
                 clear_sign_llm_state(global_control_data, keep_completed=True)
             else:
                 fallback_error = error or "invalid_empty_result"
@@ -865,7 +903,7 @@ def drain_sign_llm_results():
 # ==============================================================================
 # 核心线程 1：YOLO 检测线程
 # ==============================================================================
-def yolo_worker():
+def yolo_worker(core_id=None, worker_id=0):
     """纯检测线程.
 
     这个线程只做两件事:
@@ -874,16 +912,40 @@ def yolo_worker():
 
     这样 OCR 不会反过来阻塞 YOLO，能显著降低检测延迟。
     """
+    if core_id is None:
+        core_id = config.YOLO_CORE
+    worker_id = int(worker_id)
+    input_queue = yolo_queues[worker_id % len(yolo_queues)]
     try:
-        det = YOLODetector(core_id=config.YOLO_CORE)
+        det = YOLODetector(core_id=core_id)
     except Exception as e:
-        log_once("yolo_init_error", f"YOLO启动失败: {e}")
+        log_once(f"yolo_init_error_{worker_id}", f"YOLO启动失败(worker={worker_id}, core={core_id}): {e}")
         return
 
     while True:
         try:
             t_loop_start = time.perf_counter()
-            frame_data = yolo_queue.get()
+            if bool(getattr(config, "YOLO_PAUSE_DURING_OCR", True)):
+                with data_lock:
+                    pause_for_ocr = bool(global_control_data.get("sign_llm_ocr_inflight", False))
+                    pause_started_at = global_control_data.get("sign_llm_ocr_inflight_started_at")
+                    if pause_for_ocr and pause_started_at is not None:
+                        pause_timeout = float(getattr(config, "YOLO_PAUSE_OCR_TIMEOUT", 1.5))
+                        if time.monotonic() - float(pause_started_at) >= pause_timeout:
+                            pause_for_ocr = False
+                            global_control_data["sign_llm_ocr_inflight"] = False
+                            global_control_data["sign_llm_ocr_inflight_started_at"] = None
+                            throttled_log(
+                                "yolo_pause_ocr_timeout",
+                                f"YOLO等待OCR超时，恢复检测: timeout={pause_timeout:.1f}s",
+                                state="timeout",
+                                min_interval=0.0,
+                            )
+                if pause_for_ocr:
+                    time.sleep(0.005)
+                    continue
+
+            frame_data = input_queue.get()
             t_after_get = time.perf_counter()
             if frame_data is None:
                 break
@@ -903,10 +965,14 @@ def yolo_worker():
 
             with data_lock:
                 global global_yolo_boxes, global_yolo_frame_id
-                global_yolo_boxes = objs
-                global_yolo_frame_id = int(frame_id)
+                frame_is_current = int(frame_id) >= int(global_yolo_frame_id)
+                if frame_is_current:
+                    global_yolo_boxes = objs
+                    global_yolo_frame_id = int(frame_id)
                 fps_stats["yolo_frames"] += 1
             t_update_end = time.perf_counter()
+            if not frame_is_current:
+                continue
 
             # 只把通过门槛的 sign 送去 OCR，减少不必要的整图文字检测开销。
             sign_jobs = []
@@ -949,6 +1015,7 @@ def yolo_worker():
                         global_control_data["sign_llm_samples"] = []
                         global_control_data["sign_llm_attempts"] = 0
                         global_control_data["sign_llm_ocr_inflight"] = False
+                        global_control_data["sign_llm_ocr_inflight_started_at"] = None
                         global_control_data["sign_llm_started_at"] = time.monotonic()
                         global_control_data["sign_llm_result"] = ""
                         global_control_data["sign_llm_error"] = ""
@@ -976,6 +1043,7 @@ def yolo_worker():
                             sign_jobs = []
                         else:
                             global_control_data["sign_llm_ocr_inflight"] = True
+                            global_control_data["sign_llm_ocr_inflight_started_at"] = time.monotonic()
 
             if sign_jobs:
                 job_names = tuple(class_name_from_id(cls_id) for _, cls_id, _ in sign_jobs)
@@ -994,8 +1062,8 @@ def yolo_worker():
                 ocr_queue.put((vis_frame.copy(), sign_jobs, int(frame_id)))
             t_loop_end = time.perf_counter()
             profile_log(
-                "yolo_worker_loop",
-                "YoloProfile",
+                f"yolo_worker_loop_{worker_id}",
+                f"YoloProfile[{worker_id}]",
                 {
                     "wait_input": t_after_get - t_loop_start,
                     "det_run": t_det_end - t_det_start,
@@ -1006,7 +1074,7 @@ def yolo_worker():
             )
 
         except Exception as e:
-            log_once("yolo_worker_error", f"YOLO线程异常: {e}")
+            log_once(f"yolo_worker_error_{worker_id}", f"YOLO线程异常(worker={worker_id}, core={core_id}): {e}")
 
 
 # ==============================================================================
@@ -1027,16 +1095,22 @@ def ocr_worker():
     - 同一帧里的多个 OCR 结果，会按“中心点最近”去匹配各个路牌框
     - 匹配结果回写时还会再核对 frame_id，避免旧帧 OCR 迟到污染新状态
     """
-    try:
-        ocr = OCRRecognizer(core_id=config.REC_CORE)
-    except Exception as e:
-        log_once("ocr_init_error", f"OCR启动失败: {e}")
-        return
+    ocr = None
+
+    def close_ocr():
+        nonlocal ocr
+        if ocr is not None:
+            try:
+                ocr.close()
+            except Exception as e:
+                log_once("ocr_release_error", f"OCR释放失败: {e}")
+            ocr = None
 
     while True:
         try:
             job = ocr_queue.get()
             if job is None:
+                close_ocr()
                 break
 
             frame_data, sign_jobs, frame_id = job
@@ -1051,7 +1125,16 @@ def ocr_worker():
             ]
             if not sign_jobs:
                 mark_sign_ocr_done()
+                close_ocr()
                 continue
+
+            if ocr is None:
+                try:
+                    ocr = OCRRecognizer(core_id=config.REC_CORE)
+                except Exception as e:
+                    log_once("ocr_init_error", f"OCR启动失败: {e}")
+                    mark_sign_ocr_done()
+                    continue
 
             updates = []
             # 这里跑的是整图 OCR，再把结果按中心点回匹配给 sign_jobs。
@@ -1090,6 +1173,7 @@ def ocr_worker():
                     min_interval=config.LOG_INTERVAL_OCR_RAW
                 )
                 mark_sign_ocr_done()
+                close_ocr()
                 continue
 
             min_ocr_score = float(config.OCR_MIN_SCORE)
@@ -1109,42 +1193,68 @@ def ocr_worker():
             used_result_ids = set()
             for idx, cls_id, rect in sign_jobs:
                 try:
-                    det_cx, det_cy = rect_center(rect)
-                    best_match = None
-                    best_dist = float(config.OCR_MATCH_INIT_DIST)
+                    match_expand_ratio = float(getattr(config, "SIGN_OCR_MATCH_EXPAND_RATIO", 0.20))
+                    match_rect = expanded_rect(rect, match_expand_ratio)
+                    grouped_matches = []
+                    valid_matches = []
 
                     for result_id, result in enumerate(ocr_results):
                         if result_id in used_result_ids:
                             continue
                         ocr_cx, ocr_cy = points_center(result.get("points"))
-                        dist = (ocr_cx - det_cx) ** 2 + (ocr_cy - det_cy) ** 2
-                        if dist < best_dist:
-                            best_dist = dist
-                            best_match = (result_id, result)
+                        text = str(result.get("text", "")).strip().upper()
+                        score = float(result.get("score", 0.0))
+                        if not text or score < min_ocr_score:
+                            continue
+                        match_item = (result_id, result, ocr_cx, ocr_cy)
+                        valid_matches.append(match_item)
+                        if point_in_rect((ocr_cx, ocr_cy), match_rect):
+                            grouped_matches.append(match_item)
 
-                    if best_match is None:
+                    if grouped_matches:
+                        grouped_matches.sort(key=lambda item: (float(item[3]), float(item[2])))
+                        used_result_ids.update(result_id for result_id, _, _, _ in grouped_matches)
+                        texts = [str(result.get("text", "")).strip().upper() for _, result, _, _ in grouped_matches]
+                        scores = [float(result.get("score", 0.0)) for _, result, _, _ in grouped_matches]
+                        text = "；".join([item for item in texts if item])
+                        score = float(sum(scores) / max(len(scores), 1))
+                        match_detail = [
+                            f"{str(result.get('text', '')).strip()}:{float(result.get('score', 0.0)):.3f}"
+                            for _, result, _, _ in grouped_matches
+                        ]
+                        throttled_log(
+                            "ocr_sign_match_raw",
+                            f"OCR匹配到sign扩展框: 文本={text or '<空>'} 置信度={score:.3f} "
+                            f"条数={len(grouped_matches)} 扩展比例={match_expand_ratio:.2f} rect={rect} matches={match_detail}",
+                            state=(idx, text, round(score, 3), len(grouped_matches)),
+                            min_interval=config.LOG_INTERVAL_OCR_RAW
+                        )
+                    elif valid_matches:
+                        valid_matches.sort(key=lambda item: (float(item[3]), float(item[2])))
+                        used_result_ids.update(result_id for result_id, _, _, _ in valid_matches)
+                        texts = [str(result.get("text", "")).strip().upper() for _, result, _, _ in valid_matches]
+                        scores = [float(result.get("score", 0.0)) for _, result, _, _ in valid_matches]
+                        text = "；".join([item for item in texts if item])
+                        score = float(sum(scores) / max(len(scores), 1))
+                        match_detail = [
+                            f"{str(result.get('text', '')).strip()}:{float(result.get('score', 0.0)):.3f}"
+                            for _, result, _, _ in valid_matches
+                        ]
+                        throttled_log(
+                            "ocr_sign_match_raw",
+                            f"OCR扩展框无命中，打包整图有效文本: 文本={text or '<空>'} 置信度={score:.3f} "
+                            f"条数={len(valid_matches)} rect={rect} matches={match_detail}",
+                            state=(idx, text, round(score, 3), len(valid_matches), "fallback_all"),
+                            min_interval=config.LOG_INTERVAL_OCR_RAW
+                        )
+                    else:
                         throttled_log(
                             "ocr_match_missing",
-                            f"OCR无可匹配文本: sign_rect={rect} 文本框={len(ocr_results)}",
+                            f"OCR无达标文本可打包: sign_rect={rect} 文本框={len(ocr_results)}",
                             state=(idx, len(ocr_results)),
                             min_interval=config.LOG_INTERVAL_OCR_RAW
                         )
                         continue
-
-                    result_id, result = best_match
-                    used_result_ids.add(result_id)
-                    text = str(result.get("text", "")).strip().upper()
-                    score = float(result.get("score", 0.0))
-
-                    if score < min_ocr_score:
-                        continue
-
-                    throttled_log(
-                        "ocr_sign_match_raw",
-                        f"OCR匹配到sign: 文本={text or '<空>'} 置信度={score:.3f} 距离平方={best_dist:.1f} rect={rect}",
-                        state=(idx, text, round(score, 3)),
-                        min_interval=config.LOG_INTERVAL_OCR_RAW
-                    )
 
                     if not text:
                         throttled_log(
@@ -1182,6 +1292,7 @@ def ocr_worker():
                     min_interval=config.LOG_INTERVAL_OCR_RAW
                 )
                 mark_sign_ocr_done()
+                close_ocr()
                 continue
 
             # 回写时再做一次 class_id 检查，避免队列延迟导致“框已经换帧”的情况。
@@ -1242,15 +1353,17 @@ def ocr_worker():
                                     min_interval=config.LOG_INTERVAL_TURN_INTENT
                                 )
             mark_sign_ocr_done()
+            close_ocr()
 
         except Exception as e:
             mark_sign_ocr_done()
+            close_ocr()
             log_once("ocr_worker_error", f"OCR线程异常: {e}")
 
 # ==============================================================================
 # 核心线程 2：分割与路径规划线程
 # ==============================================================================
-def seg_worker(core_id):
+def seg_worker(core_id, worker_id=0):
     """分割 + 路径规划线程.
 
     默认启用流水线:
@@ -1423,7 +1536,7 @@ def seg_worker(core_id):
     if not bool(getattr(config, "SEG_PIPELINE_ENABLED", True)):
         fps_start_holder = [fps_start_time]
         while True:
-            seg_item = seg_queue.get()
+            seg_item = seg_queues[int(worker_id) % len(seg_queues)].get()
             if seg_item is None:
                 break
             blob_rgb_320, preview_frame = unpack_seg_item(seg_item)
@@ -1434,7 +1547,10 @@ def seg_worker(core_id):
                 turn_intent = global_control_data.get("turn_intent", -1)
                 external_left_bias_x = (
                     float(getattr(config, "PERSON_LEFT_AVOID_STEER_BIAS", 45.0))
-                    if bool(global_control_data.get("person_avoid_active", False))
+                    if (
+                        bool(global_control_data.get("person_stop_active", False)) or
+                        bool(global_control_data.get("person_avoid_active", False))
+                    )
                     else 0.0
                 )
 
@@ -1521,7 +1637,7 @@ def seg_worker(core_id):
 
     while True:
         t_get_start = time.perf_counter()
-        seg_item = seg_queue.get()
+        seg_item = seg_queues[int(worker_id) % len(seg_queues)].get()
         t_after_get = time.perf_counter()
         if seg_item is None:
             mask_queue.put(None)
@@ -1536,7 +1652,10 @@ def seg_worker(core_id):
             turn_intent = global_control_data.get("turn_intent", -1)
             external_left_bias_x = (
                 float(getattr(config, "PERSON_LEFT_AVOID_STEER_BIAS", 45.0))
-                if bool(global_control_data.get("person_avoid_active", False))
+                if (
+                    bool(global_control_data.get("person_stop_active", False)) or
+                    bool(global_control_data.get("person_avoid_active", False))
+                )
                 else 0.0
             )
         t_lock_end = time.perf_counter()
@@ -1799,6 +1918,7 @@ def ai_producer_thread():
             remove_shm_from_resource_tracker()
             last_fid = 0
             yolo_frame_counter = 0
+            yolo_dispatch_idx = 0
 
             while True:
                 t_frame_start = time.perf_counter()
@@ -1825,14 +1945,19 @@ def ai_producer_thread():
                 # 分割分支按当前模型约定裁剪/缩放 RGB 小图，尽可能减轻主控制链路负担。
                 seg_blob = make_seg_input(frame_rgb)
                 t_seg_end = time.perf_counter()
+                with data_lock:
+                    post_sign_phase = bool(global_control_data.get("post_sign_phase", False))
+                active_seg_workers = len(seg_queues) if post_sign_phase else seg_initial_worker_count
+                active_seg_workers = max(1, min(active_seg_workers, len(seg_queues)))
                 dropped_seg = 0
-                if seg_queue.full():
-                    try:
-                        seg_queue.get_nowait()
-                        dropped_seg = 1
-                    except:
-                        pass
-                seg_queue.put((seg_blob, vis_img_large))
+                for seg_queue in seg_queues[:active_seg_workers]:
+                    if seg_queue.full():
+                        try:
+                            seg_queue.get_nowait()
+                            dropped_seg += 1
+                        except:
+                            pass
+                    seg_queue.put((seg_blob, vis_img_large))
                 t_seg_put_end = time.perf_counter()
 
                 # 检测分支直接生成 YOLO 输入尺寸的小图，避免大图先放大再缩小。
@@ -1850,13 +1975,25 @@ def ai_producer_thread():
 
                 dropped_yolo = 0
                 if submit_yolo:
-                    if yolo_queue.full():
-                        try:
-                            yolo_queue.get_nowait()
-                            dropped_yolo = 1
-                        except:
-                            pass
-                    yolo_queue.put((det_img, vis_img_large, (w, h), int(fid)))
+                    active_yolo_workers = len(yolo_queues)
+                    if post_sign_phase:
+                        active_yolo_workers = max(
+                            0,
+                            min(
+                                int(getattr(config, "YOLO_ACTIVE_WORKERS_AFTER_SIGN", 1)),
+                                len(yolo_queues),
+                            ),
+                        )
+                    if active_yolo_workers > 0:
+                        yolo_queue = yolo_queues[yolo_dispatch_idx % active_yolo_workers]
+                        yolo_dispatch_idx += 1
+                        if yolo_queue.full():
+                            try:
+                                yolo_queue.get_nowait()
+                                dropped_yolo = 1
+                            except:
+                                pass
+                        yolo_queue.put((det_img, vis_img_large, (w, h), int(fid)))
                 t_frame_end = time.perf_counter()
                 profile_log(
                     "producer_loop",
@@ -1941,12 +2078,13 @@ if __name__ == "__main__":
     threading.Thread(target=serial_control_thread, daemon=True).start()
     time.sleep(config.STARTUP_SHARED_THREAD_SLEEP)
 
-    for core_id in config.SEG_CORES:
-        threading.Thread(target=seg_worker, args=(core_id,), daemon=True).start()
+    for worker_id, core_id in enumerate(seg_core_ids):
+        threading.Thread(target=seg_worker, args=(core_id, worker_id), daemon=True).start()
         time.sleep(config.STARTUP_SEG_THREAD_SLEEP)
 
     Process(target=sign_llm_worker, daemon=True).start()
-    threading.Thread(target=yolo_worker, daemon=True).start()
+    for worker_id, core_id in enumerate(yolo_core_ids):
+        threading.Thread(target=yolo_worker, args=(core_id, worker_id), daemon=True).start()
     threading.Thread(target=ocr_worker, daemon=True).start()
 
     app.run(host=config.FLASK_HOST, port=config.STREAM_PORT, threaded=True)
