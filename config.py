@@ -635,6 +635,9 @@ STEER_SIGNAL_NORMALIZED_SCALE = 3000.0
 #
 # B 算法输出链路:
 #   B 算法内部参数 -> steer_signal -> STANLEY_PWM_GAIN -> 舵机 PWM
+# 点来源:
+# - 航向误差使用拟合后的平滑路径点，适合看远处整体趋势。
+# - 横向误差优先使用拟合前/补线后的中心点，适合看底部真实偏移，减少拟合线底部抖动影响。
 #
 # B 算法专用舵机 PWM 映射增益。
 # 它不参与 B 算法内部的航向/横向计算，只负责把 B 算出来的 steer_signal 放大成舵机 PWM。
@@ -669,15 +672,15 @@ STANLEY_LATERAL_Y_MAX = 130.0
 # 航向误差增益，控制“看见弯道后提前转向”的力度。
 # 增大：入弯更积极，更容易过弯；过大可能弯前摆动或出弯过冲。
 # 减小：直道更稳；过小可能入弯晚、转不过。
-STANLEY_HEADING_GAIN = 0.1         #0.85
+STANLEY_HEADING_GAIN = 0.05         #0.1
 # 横向误差增益，控制“偏离中心线后拉回来”的力度。
 # 增大：贴边时更快回中；过大容易左右蛇形。
 # 减小：更柔和；过小可能长期贴边跑。
-STANLEY_LATERAL_GAIN = 0.5      #0.028
+STANLEY_LATERAL_GAIN = 0.4     #0.5
 # 横向误差软化常数，放在 atan(k * lateral_error / soft) 的分母里。
 # 增大：横向修正更温和，抑制抖动。
 # 减小：横向修正更敏感，适合舵机反应慢或车速低但可能更抖。
-STANLEY_SOFT = 24.0
+STANLEY_SOFT = 30.0
 # Stanley 两项相加后的整体输出缩放。
 # 它决定最终 steer_signal 的量级，再由 STANLEY_PWM_GAIN 映射成 PWM。
 # 增大：整体舵机幅度变大；减小：整体舵机幅度变小。

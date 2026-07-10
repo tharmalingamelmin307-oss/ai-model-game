@@ -2194,7 +2194,7 @@ class RoadSegmentor:
 
         return slope_signal
 
-    def _compute_stanley_band_steer_signal(self, path_points, img_w, img_h, center_bias_x=0.0):
+    def _compute_stanley_band_steer_signal(self, path_points, img_w, img_h, center_bias_x=0.0, lateral_points=None):
         """用路径段拟合航向误差，并用近处路径段计算横向误差."""
         if path_points is None or len(path_points) == 0:
             return None
@@ -2202,6 +2202,9 @@ class RoadSegmentor:
         pts = np.array(path_points, dtype=np.float32).reshape((-1, 2))
         if len(pts) < 2:
             return None
+        lateral_src_pts = pts
+        if lateral_points is not None and len(lateral_points) > 0:
+            lateral_src_pts = np.array(lateral_points, dtype=np.float32).reshape((-1, 2))
 
         bottom_mid_x = float(img_w) / 2.0 + float(center_bias_x)
         bottom_y = float(img_h) - 1.0
@@ -2219,7 +2222,10 @@ class RoadSegmentor:
         lateral_y_max = min(bottom_y, float(getattr(config, "STANLEY_LATERAL_Y_MAX", 130.0)))
         if lateral_y_max < lateral_y_min:
             lateral_y_min, lateral_y_max = lateral_y_max, lateral_y_min
-        lateral_pts = pts[(pts[:, 1] >= lateral_y_min) & (pts[:, 1] <= lateral_y_max)]
+        lateral_pts = lateral_src_pts[
+            (lateral_src_pts[:, 1] >= lateral_y_min) &
+            (lateral_src_pts[:, 1] <= lateral_y_max)
+        ]
         min_lateral_points = max(1, int(getattr(config, "STANLEY_MIN_LATERAL_POINTS", 3)))
         if len(lateral_pts) < min_lateral_points:
             return None
@@ -2248,7 +2254,7 @@ class RoadSegmentor:
         lateral_term = float(np.arctan(lateral_gain * lateral_error / soft))
         return (heading_term + lateral_term) * signal_scale
 
-    def _compute_control_steer_signal(self, path_points, img_w, img_h, center_bias_x=0.0):
+    def _compute_control_steer_signal(self, path_points, img_w, img_h, center_bias_x=0.0, lateral_points=None):
         """按配置选择转向控制器；试验控制器不可用时回退到原算法."""
         mode = str(getattr(config, "STEER_CONTROL_MODE", "weighted_slope")).lower()
         if mode == "stanley_band":
@@ -2257,6 +2263,7 @@ class RoadSegmentor:
                 img_w,
                 img_h,
                 center_bias_x=center_bias_x,
+                lateral_points=lateral_points,
             )
             if stanley_signal is not None and np.isfinite(stanley_signal):
                 return float(stanley_signal)
@@ -3328,6 +3335,11 @@ class RoadSegmentor:
             dense_y = np.clip(dense_y, 0, h_seg - 1)
 
             path_points_orig = np.vstack((dense_x, dense_y)).astype(np.float32).T
+            lateral_path_points = None
+            raw_lateral_x = self._interp_path_xs(fit_path, dense_y)
+            if raw_lateral_x is not None:
+                raw_lateral_x = np.clip(raw_lateral_x, 0, w_seg - 1)
+                lateral_path_points = np.vstack((raw_lateral_x, dense_y)).astype(np.float32).T
             base_path_points = path_points_orig.copy()
             car_center_bias_x, car_path_debug = self._update_car_avoidance_center_bias(
                 path_points_orig,
@@ -3407,20 +3419,24 @@ class RoadSegmentor:
             self.last_path_points_orig = path_points_orig.copy()
             self.missing_path_frames = 0
             control_path_points = path_points_orig
+            lateral_control_points = lateral_path_points
             if coin_path_debug is not None and coin_path_debug.get("active"):
                 if coin_path_debug.get("control_points") is not None:
                     control_path_points = coin_path_debug["control_points"]
+                    lateral_control_points = coin_path_debug["control_points"]
             else:
                 control_mode = str(getattr(config, "STEER_CONTROL_MODE", "weighted_slope")).lower()
                 if control_mode != "stanley_band":
                     no_target_points = self._select_no_target_control_points(path_points_orig, h_seg)
                     if no_target_points is not None:
                         control_path_points = no_target_points
+                        lateral_control_points = no_target_points
             steer_signal = self._compute_control_steer_signal(
                 control_path_points,
                 w_seg,
                 h_seg,
                 center_bias_x=avoid_center_bias_x if (car_active or external_bias_active) else 0.0,
+                lateral_points=lateral_control_points,
             )
             if coin_path_debug is not None and coin_path_debug.get("active"):
                 steer_signal *= float(coin_path_debug.get("control_gain", 1.0))
