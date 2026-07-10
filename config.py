@@ -23,7 +23,7 @@ from pathlib import Path
 # 6. 岔路口判断参数
 # 7. 汇合判断参数
 # 8. 固定赛道宽度表
-# 9. 下位机串口与转向控制参数
+# 9. 下位机串口、速度与转向控制参数
 # 10. 主流程运行时参数
 # 11. 场景停车、行人、交通灯与 OCR 参数
 # 12. 路径搜索、稳定与调试参数
@@ -166,7 +166,7 @@ SIGN_CLASS_ID = 9
 # - 但远距离误判风险会上升
 # detv3 输入从 detv2 的 768x576 换到 512x384，面积类门槛按输入面积比例缩放。
 # 50 * 100 * (512 * 384) / (768 * 576) = 2222。
-OCR_MIN_SIGN_BOX_AREA = 6000
+OCR_MIN_SIGN_BOX_AREA = 5000
 
 # sign 在进入 OCR 前，四周需要保留的最小边距比例。
 # 例如 0.03 表示检测框四边都要距离画面边界至少 3% 的宽/高。
@@ -542,10 +542,7 @@ PLANNING_CLASS_NAMES = (
 )
 
 # ---------------------------------------------------------------------------
-# 串口与控制参数
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# 下位机串口与转向控制参数
+# 下位机串口、速度与转向控制参数
 # ---------------------------------------------------------------------------
 # 下位机串口设备名。
 # 如果板卡串口号变了，这里要跟着改。
@@ -554,6 +551,29 @@ SERIAL_PORT = '/dev/ttyS2'
 # 串口波特率。
 # 必须和下位机固件配置一致，否则会通信异常或乱码。
 BAUD_RATE = 115200
+
+# 串口线程最终允许输出的目标速度范围。
+# 当前并不是直接发电机 PWM，而是发一个速度档位：
+# - CONTROL_MIN_SPEED: 常规最低巡航速度
+# - CONTROL_MAX_SPEED: 直道或轻弯时允许的最高速度
+CONTROL_MIN_SPEED = 20
+CONTROL_MAX_SPEED = 20
+
+# 用单一转向控制量做动态降速时的增益。
+# 控制量绝对值越大，说明当前横向偏差/路径趋势越强，目标速度会随之降低。
+STEER_SIGNAL_SPEED_GAIN = 0.002
+
+# 是否启用速度档位平滑。
+CONTROL_SPEED_SMOOTH_ENABLED = True
+# 速度上升时每个控制周期最多增加多少档，避免突然加速。
+CONTROL_SPEED_MAX_STEP_UP = 1
+# 速度下降时每个控制周期最多减少多少档，保留弯道/停车响应速度。
+CONTROL_SPEED_MAX_STEP_DOWN = 2
+
+# ---------------------------------------------------------------------------
+# 转向公共参数: 舵机最终输出限制
+# ---------------------------------------------------------------------------
+# 这些参数不属于算法 A 或算法 B，而是两个算法最终都会经过的舵机输出层。
 
 # 舵机中心值。
 # 这是“车身理论正前方”对应的 PWM。
@@ -564,12 +584,28 @@ SERVO_CENTER = 750
 # 用于硬限制输出，避免控制算法在极端情况下打到危险位置。
 SERVO_MIN, SERVO_MAX = 590, 910
 
-# 单一转向控制量换算到舵机 PWM 的增益。
-# 当前控制量先由路径点斜率做“带远近权重的归一化平均”得到：
+# 当前启用的转向控制器。
+# - "weighted_slope": 算法 A，原始稳定算法。把路径点到底部中点的斜率做远近加权平均。
+# - "stanley_band": 算法 B，前轮/Stanley-band 算法。把路径段拆成“航向误差 + 横向误差”。
+# 如果 stanley_band 点数不足或拟合失败，会自动回退到 weighted_slope。
+# STEER_CONTROL_MODE = "weighted_slope"
+STEER_CONTROL_MODE = "stanley_band"
+
+
+# ---------------------------------------------------------------------------
+# 转向算法 A: weighted_slope 参数
+# ---------------------------------------------------------------------------
+# 下面这组只服务算法 A。
+# 当 STEER_CONTROL_MODE = "weighted_slope" 时，它们作为主转向算法使用。
+# 当 STEER_CONTROL_MODE = "stanley_band" 但 B 算法点数不足/拟合失败时，会临时回退到 A 算法。
+#
+# 算法公式：
 #   slope = (path_x - image_bottom_center_x) / max(image_bottom_y - path_y, STEER_SIGNAL_MIN_DY)
 #   weight = path_y ** STEER_SIGNAL_ROW_WEIGHT_GAMMA
-#   steer_signal = sum(slope * weight) / sum(weight)
-# 再按普通巡线 / 金币 / 避障模式乘对应模式增益，最后乘本参数换算为 PWM。
+#   steer_signal = sum(slope * weight) / sum(weight) * STEER_SIGNAL_NORMALIZED_SCALE
+#
+# A 算法 steer_signal 到舵机 PWM 的映射增益。
+# 注意：B 算法正常工作时不用它；B 算法使用 STANLEY_PWM_GAIN。
 # 调大:
 # - 舵机转向更积极
 # - 但更容易抖或打满
@@ -577,10 +613,6 @@ SERVO_MIN, SERVO_MAX = 590, 910
 # - 舵机更稳
 # - 但可能转不过弯
 STEER_SIGNAL_PWM_GAIN = 0.012
-
-# 用单一转向控制量做动态降速时的增益。
-# 控制量绝对值越大，说明当前横向偏差/路径趋势越强，目标速度会随之降低。
-STEER_SIGNAL_SPEED_GAIN = 0.002
 
 # 计算“点到底部中点连线斜率”时使用的最小纵向间距。
 # 作用是防止路径底部附近的点因为 dy 过小，把控制量瞬间放得过大。
@@ -591,22 +623,26 @@ STEER_SIGNAL_ROW_WEIGHT_GAMMA = 1.3
 # 归一化控制量缩放。归一化后原始 steer_signal 常为个位数，
 # 这里把它放大到更接近旧版累计控制量的显示和 PWM 调参量级。
 STEER_SIGNAL_NORMALIZED_SCALE = 3000.0
-# 转向控制器模式。
-# - "weighted_slope": 原始稳定算法。把路径点到底部中点的斜率做远近加权平均，
-#   再乘 STEER_SIGNAL_NORMALIZED_SCALE 得到 steer_signal。
-# - "stanley_band": 试验算法。把路径段拆成“航向误差 + 横向误差”两项：
-#   y=STANLEY_BAND_Y_MIN~STANLEY_BAND_Y_MAX 拟合整体路径方向；
-#   y=STANLEY_LATERAL_Y_MIN~STANLEY_LATERAL_Y_MAX 计算近处横向偏移。
-#   如果路径点不足或拟合失败，会自动回退到 weighted_slope。
-# STEER_CONTROL_MODE = "weighted_slope" 
 
-STEER_CONTROL_MODE = "stanley_band" 
-# Stanley-band 专用 PWM 映射增益。
-# 只在 STEER_CONTROL_MODE = "stanley_band" 时使用；其它模式仍使用 STEER_SIGNAL_PWM_GAIN。
-# 默认跟随当前 STEER_SIGNAL_PWM_GAIN，保证刚加这个参数时不改变车辆行为。
-# 如果只想让 Stanley-band 舵机更积极，不影响 weighted_slope，就优先调这里。
-# 例如感觉 Ctrl 已经很大但舵机仍不够拐，可试 0.018、0.020、0.024。
+
+# ---------------------------------------------------------------------------
+# 转向算法 B: stanley_band 参数
+# ---------------------------------------------------------------------------
+# stanley_band 把路径控制拆成两项：
+# - 航向误差: y=STANLEY_BAND_Y_MIN~STANLEY_BAND_Y_MAX 拟合整体路径方向。
+# - 横向误差: y=STANLEY_LATERAL_Y_MIN~STANLEY_LATERAL_Y_MAX 计算近处中心偏移。
+# 下面这组只在 STEER_CONTROL_MODE = "stanley_band" 时作为主算法使用。
+#
+# B 算法输出链路:
+#   B 算法内部参数 -> steer_signal -> STANLEY_PWM_GAIN -> 舵机 PWM
+#
+# B 算法专用舵机 PWM 映射增益。
+# 它不参与 B 算法内部的航向/横向计算，只负责把 B 算出来的 steer_signal 放大成舵机 PWM。
+# 调大：舵机整体更积极；调小：舵机整体更稳。
+# 速度升高后轻微摆头，优先可以小幅调低这里，或增大 STANLEY_SOFT。
 STANLEY_PWM_GAIN = STEER_SIGNAL_PWM_GAIN
+
+# --- B 算法内部参数: 采样区间 ---
 # Stanley-band 航向拟合区间，坐标均为 SEG_SIZE 分割图坐标。
 # 当前 SEG_SIZE 高度为 160，y=0 在图像顶部，y=159 在图像底部。
 # 这里取 20~130，表示用车前方较完整的 110 行路径估计整体走向。
@@ -619,6 +655,17 @@ STANLEY_BAND_Y_MAX = 130.0
 # 区间越靠下，回正更积极但更抖；区间越靠上，回正更平顺但可能偏慢。
 STANLEY_LATERAL_Y_MIN = 90.0
 STANLEY_LATERAL_Y_MAX = 130.0
+
+# 速度  10-15  
+# 参数：STANLEY_HEADING_GAIN = 0.1  
+#      STANLEY_LATERAL_GAIN = 0.5 
+#      STANLEY_SOFT = 24.0
+#      STANLEY_SIGNAL_SCALE = 10000.0
+#      STANLEY_ROW_WEIGHT_GAMMA = 1.2
+#      STANLEY_MIN_HEADING_POINTS = 6
+#      STANLEY_MIN_LATERAL_POINTS = 3
+
+# --- B 算法内部参数: 航向/横向控制 ---
 # 航向误差增益，控制“看见弯道后提前转向”的力度。
 # 增大：入弯更积极，更容易过弯；过大可能弯前摆动或出弯过冲。
 # 减小：直道更稳；过小可能入弯晚、转不过。
@@ -639,12 +686,19 @@ STANLEY_SIGNAL_SCALE = 10000.0
 # 权重为 y ** gamma，gamma 越大越重视靠近底部/车身的点。
 # 增大：近处纠偏更强；减小：横向误差更像整段平均，更平顺。
 STANLEY_ROW_WEIGHT_GAMMA = 1.2
+
+# --- B 算法内部参数: 可用性门槛 ---
 # Stanley-band 可用性的最低点数门槛。
 # 航向拟合至少需要 STANLEY_MIN_HEADING_POINTS 个点，横向平均至少需要
 # STANLEY_MIN_LATERAL_POINTS 个点；不足时自动回退原 weighted_slope。
 # 调低可让断线时更容易启用 Stanley，但拟合可信度会下降。
 STANLEY_MIN_HEADING_POINTS = 6
 STANLEY_MIN_LATERAL_POINTS = 3
+
+
+# ---------------------------------------------------------------------------
+# 转向模式增益与控制取样窗口
+# ---------------------------------------------------------------------------
 # 无金币/无车时，控制只看中下部这一段，底部最靠下 30 行不参与。
 # 这两个值是分割图坐标里的 y 行号；当前 10~120 表示取远处到中下部路径。
 # 如果中线最上端低于 ROW_MIN，会额外补一个 ROW_MIN 行的点，x 使用最上端点。
@@ -904,24 +958,11 @@ PREVIEW_TEXT_POS_YOLO_SUMMARY = (6, 172)
 
 
 # ---------------------------------------------------------------------------
-# 串口控制与线程节奏参数
+# 串口协议与线程节奏参数
 # ---------------------------------------------------------------------------
 # 串口超时时间，单位秒。
 # 串口偶尔抖动时，这个值太大可能会拖慢控制循环；太小则更容易把一次短暂卡顿视为失败。
 SERIAL_TIMEOUT = 0.1
-
-# 串口线程最终允许输出的目标速度范围。
-# 当前并不是直接发电机 PWM，而是发一个速度档位：
-# - CONTROL_MIN_SPEED: 常规最低巡航速度
-# - CONTROL_MAX_SPEED: 直道或轻弯时允许的最高速度
-CONTROL_MIN_SPEED = 10
-CONTROL_MAX_SPEED = 10
-# 是否启用速度档位平滑。
-CONTROL_SPEED_SMOOTH_ENABLED = True
-# 速度上升时每个控制周期最多增加多少档，避免突然加速。
-CONTROL_SPEED_MAX_STEP_UP = 1
-# 速度下降时每个控制周期最多减少多少档，保留弯道/停车响应速度。
-CONTROL_SPEED_MAX_STEP_DOWN = 2
 
 # 串口数据包头尾。
 # 只有在你同时修改上下位机通信协议时才需要调整。

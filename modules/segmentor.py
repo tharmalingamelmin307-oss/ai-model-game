@@ -3436,6 +3436,17 @@ class RoadSegmentor:
                     float(np.min(control_pts[:, 1])),
                     float(np.max(control_pts[:, 1])),
                 )
+                control_mode = str(getattr(config, "STEER_CONTROL_MODE", "weighted_slope")).lower()
+                if (
+                    control_mode == "stanley_band" and
+                    not coin_active and
+                    not car_active and
+                    not external_bias_active
+                ):
+                    control_band = (
+                        float(getattr(config, "STANLEY_BAND_Y_MIN", control_band[0])),
+                        float(getattr(config, "STANLEY_BAND_Y_MAX", control_band[1])),
+                    )
             pts_final_orig = path_points_orig.reshape((-1, 1, 2))
         else:
             held_path = self._hold_last_path()

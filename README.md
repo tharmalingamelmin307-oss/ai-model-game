@@ -12,7 +12,7 @@
 ## 快速索引
 
 - [config 参数分区索引](./config.py#L16)
-- [下位机控制、串口与速度](./config.py#L548)
+- [下位机控制、速度与转向](./config.py#L547)
 - [岔路口判断](./config.py#L316)
 - [汇合判断](./config.py#L373)
 - [固定宽度与规划类别](./config.py#L478)
@@ -475,7 +475,7 @@ target_speed = 0                                # 若红/黄灯停车或行人�
 - [岔路口判断](#岔路口判断)
 - [汇合判断](#汇合判断)
 - [固定宽度与规划类别](#固定宽度与规划类别)
-- [下位机控制、串口与速度](#下位机控制串口与速度)
+- [下位机控制、速度与转向](#下位机控制速度与转向)
 - [运行态、队列与日志](#运行态队列与日志)
 - [场景停车与 OCR 后处理](#场景停车与-ocr-后处理)
 - [路径搜索、稳定与调试](#路径搜索稳定与调试)
@@ -607,21 +607,27 @@ target_speed = 0                                # 若红/黄灯停车或行人�
 | `PATH_LOCK_FORK_MIN_SEP` | 判断左右候选已经明显分叉的最小横距 |
 | `PLANNING_CLASS_NAMES` | 会映射进分割平面参与规划/场景判断的类别 |
 
-### 下位机控制、串口与速度
+### 下位机控制、速度与转向
 
 | 参数 | 用途 |
 |---|---|
 | `SERIAL_PORT` | 下位机串口设备名 |
 | `BAUD_RATE` | 串口波特率 |
+| `CONTROL_MIN_SPEED` / `CONTROL_MAX_SPEED` | 串口线程目标速度范围 |
+| `STEER_SIGNAL_SPEED_GAIN` | 根据转向幅度动态降速的增益 |
+| `CONTROL_SPEED_SMOOTH_ENABLED` | 是否启用目标速度平滑 |
+| `CONTROL_SPEED_MAX_STEP_UP` / `CONTROL_SPEED_MAX_STEP_DOWN` | 速度单帧最大上升/下降步长 |
+| **公共舵机输出** |  |
 | `SERVO_CENTER` | 舵机中位 PWM |
 | `SERVO_MIN` / `SERVO_MAX` | 舵机 PWM 安全上下限 |
-| `STEER_SIGNAL_PWM_GAIN` | 默认 steer_signal 转舵机 PWM 的增益，主要给 `weighted_slope` 使用 |
-| `STANLEY_PWM_GAIN` | `stanley_band` 专用 PWM 映射增益；只想调新控制器舵机幅度时优先改它 |
-| `STEER_SIGNAL_SPEED_GAIN` | 根据转向幅度动态降速的增益 |
+| `STEER_CONTROL_MODE` | 转向控制器模式，`weighted_slope` 为算法 A，`stanley_band` 为算法 B |
+| **算法 A: `weighted_slope`** | 原始稳定算法，把路径点到底部中点的斜率做远近加权平均 |
+| `STEER_SIGNAL_PWM_GAIN` | `weighted_slope` 的 steer_signal 转舵机 PWM 增益；`stanley_band` 回退时也会用这套算法 |
 | `STEER_SIGNAL_MIN_DY` | 斜率计算最小纵向距离 |
 | `STEER_SIGNAL_ROW_WEIGHT_GAMMA` | 路径点远近权重指数 |
 | `STEER_SIGNAL_NORMALIZED_SCALE` | 归一化 steer_signal 的整体放大系数 |
-| `STEER_CONTROL_MODE` | 转向控制器模式，`weighted_slope` 为原控制器，`stanley_band` 为试验控制器 |
+| **算法 B: `stanley_band`** | 前轮/Stanley-band 算法，把控制拆成航向误差和横向误差 |
+| `STANLEY_PWM_GAIN` | `stanley_band` 专用 PWM 映射增益；只想调新控制器舵机幅度时优先改它 |
 | `STANLEY_BAND_Y_MIN` / `STANLEY_BAND_Y_MAX` | Stanley-band 航向拟合区间；默认 `20~130`，用这段路径估计整体方向 |
 | `STANLEY_LATERAL_Y_MIN` / `STANLEY_LATERAL_Y_MAX` | Stanley-band 横向误差区间；默认 `90~130`，用近处路径估计偏离中心线多少 |
 | `STANLEY_HEADING_GAIN` | 航向误差增益；越大越提前入弯，过大可能摆动或过冲 |
@@ -631,14 +637,12 @@ target_speed = 0                                # 若红/黄灯停车或行人�
 | `STANLEY_ROW_WEIGHT_GAMMA` | Stanley-band 横向误差行权重；越大越重视靠近车身的点 |
 | `STANLEY_MIN_HEADING_POINTS` | Stanley-band 航向拟合最低点数；不足时回退原控制器 |
 | `STANLEY_MIN_LATERAL_POINTS` | Stanley-band 横向误差最低点数；不足时回退原控制器 |
+| **模式增益与取样窗口** | 普通巡线、coin、car 等模式对最终控制量的额外修正 |
 | `STEER_SIGNAL_NO_TARGET_ROW_MIN` / `STEER_SIGNAL_NO_TARGET_ROW_MAX` | 无 coin/无 car 时控制只看这段 y 范围 |
 | `STEER_SIGNAL_NO_TARGET_GAIN` | 普通巡线模式控制增益 |
 | `STEER_SIGNAL_COIN_GAIN` | coin 路径 active 时控制增益 |
 | `STEER_SIGNAL_CAR_GAIN` | car 避障 active 时控制增益 |
 | `SERIAL_TIMEOUT` | 串口读写超时 |
-| `CONTROL_MIN_SPEED` / `CONTROL_MAX_SPEED` | 串口线程目标速度范围 |
-| `CONTROL_SPEED_SMOOTH_ENABLED` | 是否启用目标速度平滑 |
-| `CONTROL_SPEED_MAX_STEP_UP` / `CONTROL_SPEED_MAX_STEP_DOWN` | 速度单帧最大上升/下降步长 |
 | `SERIAL_PACKET_HEADER` / `SERIAL_PACKET_TAIL` | 串口协议包头包尾 |
 | `CONTROL_LOOP_SLEEP` | 串口控制循环 sleep |
 | `SHM_FRAME_POLL_SLEEP` | 共享内存轮询 sleep |
