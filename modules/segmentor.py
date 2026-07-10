@@ -2194,6 +2194,79 @@ class RoadSegmentor:
 
         return slope_signal
 
+    def _compute_stanley_band_steer_signal(self, path_points, img_w, img_h, center_bias_x=0.0):
+        """用路径段拟合航向误差，并用近处路径段计算横向误差."""
+        if path_points is None or len(path_points) == 0:
+            return None
+
+        pts = np.array(path_points, dtype=np.float32).reshape((-1, 2))
+        if len(pts) < 2:
+            return None
+
+        bottom_mid_x = float(img_w) / 2.0 + float(center_bias_x)
+        bottom_y = float(img_h) - 1.0
+
+        band_y_min = max(0.0, float(getattr(config, "STANLEY_BAND_Y_MIN", 20.0)))
+        band_y_max = min(bottom_y, float(getattr(config, "STANLEY_BAND_Y_MAX", 130.0)))
+        if band_y_max < band_y_min:
+            band_y_min, band_y_max = band_y_max, band_y_min
+        heading_pts = pts[(pts[:, 1] >= band_y_min) & (pts[:, 1] <= band_y_max)]
+        min_heading_points = max(2, int(getattr(config, "STANLEY_MIN_HEADING_POINTS", 6)))
+        if len(heading_pts) < min_heading_points:
+            return None
+
+        lateral_y_min = max(0.0, float(getattr(config, "STANLEY_LATERAL_Y_MIN", 90.0)))
+        lateral_y_max = min(bottom_y, float(getattr(config, "STANLEY_LATERAL_Y_MAX", 130.0)))
+        if lateral_y_max < lateral_y_min:
+            lateral_y_min, lateral_y_max = lateral_y_max, lateral_y_min
+        lateral_pts = pts[(pts[:, 1] >= lateral_y_min) & (pts[:, 1] <= lateral_y_max)]
+        min_lateral_points = max(1, int(getattr(config, "STANLEY_MIN_LATERAL_POINTS", 3)))
+        if len(lateral_pts) < min_lateral_points:
+            return None
+
+        # x = a*y + b。图像 y 向下增大，所以从近处看向远处的航向角约为 atan(-a)。
+        try:
+            slope_y_to_x, _ = np.polyfit(heading_pts[:, 1], heading_pts[:, 0], 1)
+        except Exception:
+            return None
+        heading_error = float(np.arctan(-float(slope_y_to_x)))
+
+        row_gamma = float(getattr(config, "STANLEY_ROW_WEIGHT_GAMMA", 1.2))
+        weights = np.power(np.clip(lateral_pts[:, 1], 0.0, bottom_y), row_gamma)
+        weight_sum = float(np.sum(weights))
+        if weight_sum <= 1e-6:
+            return None
+        lateral_x = float(np.sum(lateral_pts[:, 0] * weights) / weight_sum)
+        lateral_error = lateral_x - bottom_mid_x
+
+        soft = max(1e-6, float(getattr(config, "STANLEY_SOFT", 24.0)))
+        heading_gain = float(getattr(config, "STANLEY_HEADING_GAIN", 0.85))
+        lateral_gain = float(getattr(config, "STANLEY_LATERAL_GAIN", 0.028))
+        signal_scale = float(getattr(config, "STANLEY_SIGNAL_SCALE", 950.0))
+
+        heading_term = heading_gain * heading_error
+        lateral_term = float(np.arctan(lateral_gain * lateral_error / soft))
+        return (heading_term + lateral_term) * signal_scale
+
+    def _compute_control_steer_signal(self, path_points, img_w, img_h, center_bias_x=0.0):
+        """按配置选择转向控制器；试验控制器不可用时回退到原算法."""
+        mode = str(getattr(config, "STEER_CONTROL_MODE", "weighted_slope")).lower()
+        if mode == "stanley_band":
+            stanley_signal = self._compute_stanley_band_steer_signal(
+                path_points,
+                img_w,
+                img_h,
+                center_bias_x=center_bias_x,
+            )
+            if stanley_signal is not None and np.isfinite(stanley_signal):
+                return float(stanley_signal)
+        return self._compute_weighted_steer_signal(
+            path_points,
+            img_w,
+            img_h,
+            center_bias_x=center_bias_x,
+        )
+
     def _build_single_row_control_points(self, path_points, img_h, y_ratio=None):
         """把整条路径压成单行控制点，降低无金币时的抖动."""
         if path_points is None or len(path_points) == 0:
@@ -3338,10 +3411,12 @@ class RoadSegmentor:
                 if coin_path_debug.get("control_points") is not None:
                     control_path_points = coin_path_debug["control_points"]
             else:
-                no_target_points = self._select_no_target_control_points(path_points_orig, h_seg)
-                if no_target_points is not None:
-                    control_path_points = no_target_points
-            steer_signal = self._compute_weighted_steer_signal(
+                control_mode = str(getattr(config, "STEER_CONTROL_MODE", "weighted_slope")).lower()
+                if control_mode != "stanley_band":
+                    no_target_points = self._select_no_target_control_points(path_points_orig, h_seg)
+                    if no_target_points is not None:
+                        control_path_points = no_target_points
+            steer_signal = self._compute_control_steer_signal(
                 control_path_points,
                 w_seg,
                 h_seg,
@@ -3366,7 +3441,7 @@ class RoadSegmentor:
             held_path = self._hold_last_path()
             if held_path is not None:
                 path_points_orig = held_path
-                steer_signal = self._compute_weighted_steer_signal(path_points_orig, w_seg, h_seg)
+                steer_signal = self._compute_control_steer_signal(path_points_orig, w_seg, h_seg)
                 control_band = None
                 if path_points_orig is not None and len(path_points_orig) > 0:
                     control_pts = np.array(path_points_orig, dtype=np.float32).reshape((-1, 2))
@@ -3446,9 +3521,12 @@ class RoadSegmentor:
             # 路径直接画在分割调试平面里，主线程只负责整体缩放和其它信息叠加。
             ai_view = self.draw_path_overlay(ai_view)
 
+        pwm_gain = float(config.STEER_SIGNAL_PWM_GAIN)
+        if str(getattr(config, "STEER_CONTROL_MODE", "weighted_slope")).lower() == "stanley_band":
+            pwm_gain = float(getattr(config, "STANLEY_PWM_GAIN", config.STEER_SIGNAL_PWM_GAIN))
         servo_pwm = int(
             config.SERVO_CENTER
-            - steer_signal * config.STEER_SIGNAL_PWM_GAIN
+            - steer_signal * pwm_gain
         )
         servo_pwm = int(max(config.SERVO_MIN, min(config.SERVO_MAX, servo_pwm)))
         cv2.putText(

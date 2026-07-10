@@ -9,6 +9,20 @@
 - `OCR` 负责整图 `det + rec`；`sign` 只在停车采样状态下触发 OCR，`limit_sign` 链路保留但当前通过 `LIMIT_SIGN_ENABLED=False` 临时关闭
 - 各线程都优先保“最新帧”，必要时主动丢掉旧任务，避免累积延迟
 
+## 快速索引
+
+- [config 参数分区索引](./config.py#L16)
+- [下位机控制、串口与速度](./config.py#L548)
+- [岔路口判断](./config.py#L316)
+- [汇合判断](./config.py#L373)
+- [固定宽度与规划类别](./config.py#L478)
+- [路径搜索、稳定与调试](./config.py#L1007)
+- [车辆避障、金币规划与分割画面](./config.py#L1131)
+- [README 参数说明](#参数调试索引)
+- [README 常用调参入口](#常用调参入口)
+- [项目结构](#项目结构)
+- [当前系统总览](#当前系统总览)
+
 ## 项目结构
 
 ```text
@@ -218,7 +232,7 @@
 启用 `SIGN_LLM_ENABLED` 后，`sign` 不再在行驶中直接 OCR 生效，而是走一次性停车状态机：
 
 1. 未停车前只看 YOLO 检测框，不对 `sign` 做 OCR。
-2. 当 `sign` 面积达到 `SIGN_LLM_TRIGGER_AREA`，车辆进入停车采样状态。
+2. 当 `sign` 面积达到 `SIGN_LLM_TRIGGER_AREA` 且不贴边时，车辆进入停车采样状态。
 3. 停车后才把 `sign` 投给 OCR，连续收集 `SIGN_LLM_OCR_SAMPLES` 条有效 OCR 文本。
 4. 收满样本后停止继续 `sign` OCR，把样本提交给千帆独立进程。
 5. 千帆返回 `LEFT / RIGHT` 时写入 `turn_intent` 并放行。
@@ -281,14 +295,22 @@
 15. 对最终路径做多项式拟合
 16. 对拟合系数做 EMA 平滑
 17. 结合金币规划和避车状态机选择控制路径或控制中心偏移
-18. 将路径转换成单一 `steer_signal`，并渲染调试图
+18. 按 `STEER_CONTROL_MODE` 将路径转换成单一 `steer_signal`，并渲染调试图
 
 当前输出：
 
 - `steer_signal`
-  由“路径点到底部中点的斜率 * 行号”聚合得到的单一转向控制量
+  单一转向控制量，后续由串口线程映射成舵机 PWM
 - `ai_view`
   调试渲染图，后续会被放大回 `TARGET_RES`
+
+转向控制器目前有两种：
+
+- `weighted_slope`
+  原始稳定模式。对控制路径点计算“路径点到底部中点连线斜率”，再按行号做远近加权平均。这个模式简单、抗噪，仍然作为默认配置。
+- `stanley_band`
+  试验模式。使用 `SEG_SIZE` 路径平面里的路径段做 Stanley 风格控制：
+  `y=20~130` 拟合整体路径方向，得到航向误差；`y=90~130` 对近处路径中心做加权平均，得到横向误差。两项合成 `steer_signal`。如果路径点不足或拟合失败，会自动回退到 `weighted_slope`。
 
 补充说明：
 
@@ -427,7 +449,7 @@ target_speed = 0                                # 若红/黄灯停车或行人�
 
 默认配置见 `config.py`：
 
-- 分割模型：`models/seg/segv3/pipi416x160_argmax_rk3588_int8.rknn`
+- 分割模型：`models/seg/segv4/pipi416x160_77_1600_argmax_rk3588_int8.rknn`
 - 检测模型：`models/det/dev4/ppyoloe_crn_m_100e_custom_7_5_512x384_split_rk3588_int8.rknn`
 - OCR det 模型：`models/ocr/ppocrv4_det_int8.rknn`
 - OCR rec 模型：`models/ocr/ppocrv4_rec_fp16.rknn`
@@ -444,6 +466,20 @@ target_speed = 0                                # 若红/黄灯停车或行人�
 ## 参数调试索引
 
 `config.py` 是唯一集中调参入口。下面按功能分区列出当前参数用途；实际运行值以 `config.py` 为准。
+
+快速定位：
+
+- [基础运行与模型](#基础运行与模型)
+- [类别、检测与 OCR 触发](#类别检测与-ocr-触发)
+- [输入尺寸与预处理](#输入尺寸与预处理)
+- [岔路口判断](#岔路口判断)
+- [汇合判断](#汇合判断)
+- [固定宽度与规划类别](#固定宽度与规划类别)
+- [下位机控制、串口与速度](#下位机控制串口与速度)
+- [运行态、队列与日志](#运行态队列与日志)
+- [场景停车与 OCR 后处理](#场景停车与-ocr-后处理)
+- [路径搜索、稳定与调试](#路径搜索稳定与调试)
+- [车辆避障、金币规划与分割画面](#车辆避障金币规划与分割画面)
 
 ### 基础运行与模型
 
@@ -477,7 +513,7 @@ target_speed = 0                                # 若红/黄灯停车或行人�
 | `OCR_SIGN_EDGE_MARGIN_RATIO` | 路牌框距离画面边缘的安全边距比例 |
 | `OCR_MIN_SCORE` | OCR 文本进入主逻辑的最低平均置信度 |
 | `SIGN_LLM_ENABLED` | 是否启用语义路牌停车、多次 OCR、千帆综合判定 |
-| `SIGN_LLM_TRIGGER_AREA` | sign 面积达到多少后触发停车采样，当前默认 7000 |
+| `SIGN_LLM_TRIGGER_AREA` | sign 面积达到多少且不贴边后触发停车采样，当前默认 6000 |
 | `SIGN_LLM_OCR_SAMPLES` | 停车后收集多少条有效 OCR 结果再发给千帆 |
 | `SIGN_LLM_MIN_VALID_SAMPLES` | 保留参数；当前语义路牌流程要求收满 `SIGN_LLM_OCR_SAMPLES` 条有效样本 |
 | `SIGN_LLM_COLLECT_TIMEOUT` / `SIGN_LLM_API_TIMEOUT` | OCR 采集超时保留参数 / 千帆 API 超时 |
@@ -513,7 +549,7 @@ target_speed = 0                                # 若红/黄灯停车或行人�
 | `SEG_DEBUG_DRAW_MASK` | 是否在预览上绘制整块 mask |
 | `SEG_PREVIEW_OVERLAY_DIFF_THRESH` | Seg 渲染图叠回主预览时的差异阈值 |
 
-### 分叉、汇合与固定宽度
+### 岔路口判断
 
 | 参数 | 用途 |
 |---|---|
@@ -531,6 +567,11 @@ target_speed = 0                                # 若红/黄灯停车或行人�
 | `FORK_INNER_OPEN_MAX_STEP_REGRESSION` | 允许的单步回退上限 |
 | `FORK_INNER_OPEN_MAX_MISS_ROWS` | 张开过程中允许缺失的最大行数 |
 | `FORK_TRUNK_SUPPORT_*` | Y 岔路分叉点到底部主干线附近的 mask 支撑约束 |
+
+### 汇合判断
+
+| 参数 | 用途 |
+|---|---|
 | `SEG_SCENE_SCAN_BOTTOM_HEIGHT` | 汇合/场景扫描只看底部多少行 |
 | `MERGE_GUIDE_SCAN_Y_TOP` / `MERGE_GUIDE_SCAN_Y_BOTTOM` | 汇合宽带前置扫描范围 |
 | `MERGE_GUIDE_FREE_SCAN_Y_TOP` / `MERGE_GUIDE_FREE_SCAN_Y_BOTTOM` | 底部自由汇合扫描范围 |
@@ -553,6 +594,12 @@ target_speed = 0                                # 若红/黄灯停车或行人�
 | `MERGE_STATE_EXIT_WIDTH_THRESH` | 底部宽度恢复到多少才允许退出 |
 | `MERGE_STATE_EXIT_CONFIRM_FRAMES` | 汇合退出条件连续满足帧数 |
 | `MERGE_STATE_EXIT_NO_EDGE_Y_TOP` / `MERGE_STATE_EXIT_NO_EDGE_Y_BOTTOM` | 无边缘退出检查范围 |
+| `MERGE_EDGE_TRACE_*` | 贴边侧八邻域方向特征，用作汇合判断的额外 OR 条件 |
+
+### 固定宽度与规划类别
+
+| 参数 | 用途 |
+|---|---|
 | `SEG_FIXED_WIDTH_SOURCE_SIZE` | 固定宽度表来源坐标系 |
 | `SEG_FIXED_WIDTH_SOURCE_CROP_TOP_RATIO` | 固定宽度表来源裁剪比例 |
 | `SEG_FIXED_WIDTHS_320` | 原始固定赛道宽度表 |
@@ -560,7 +607,7 @@ target_speed = 0                                # 若红/黄灯停车或行人�
 | `PATH_LOCK_FORK_MIN_SEP` | 判断左右候选已经明显分叉的最小横距 |
 | `PLANNING_CLASS_NAMES` | 会映射进分割平面参与规划/场景判断的类别 |
 
-### 控制、串口与速度
+### 下位机控制、串口与速度
 
 | 参数 | 用途 |
 |---|---|
@@ -568,11 +615,22 @@ target_speed = 0                                # 若红/黄灯停车或行人�
 | `BAUD_RATE` | 串口波特率 |
 | `SERVO_CENTER` | 舵机中位 PWM |
 | `SERVO_MIN` / `SERVO_MAX` | 舵机 PWM 安全上下限 |
-| `STEER_SIGNAL_PWM_GAIN` | steer_signal 转舵机 PWM 的增益 |
+| `STEER_SIGNAL_PWM_GAIN` | 默认 steer_signal 转舵机 PWM 的增益，主要给 `weighted_slope` 使用 |
+| `STANLEY_PWM_GAIN` | `stanley_band` 专用 PWM 映射增益；只想调新控制器舵机幅度时优先改它 |
 | `STEER_SIGNAL_SPEED_GAIN` | 根据转向幅度动态降速的增益 |
 | `STEER_SIGNAL_MIN_DY` | 斜率计算最小纵向距离 |
 | `STEER_SIGNAL_ROW_WEIGHT_GAMMA` | 路径点远近权重指数 |
 | `STEER_SIGNAL_NORMALIZED_SCALE` | 归一化 steer_signal 的整体放大系数 |
+| `STEER_CONTROL_MODE` | 转向控制器模式，`weighted_slope` 为原控制器，`stanley_band` 为试验控制器 |
+| `STANLEY_BAND_Y_MIN` / `STANLEY_BAND_Y_MAX` | Stanley-band 航向拟合区间；默认 `20~130`，用这段路径估计整体方向 |
+| `STANLEY_LATERAL_Y_MIN` / `STANLEY_LATERAL_Y_MAX` | Stanley-band 横向误差区间；默认 `90~130`，用近处路径估计偏离中心线多少 |
+| `STANLEY_HEADING_GAIN` | 航向误差增益；越大越提前入弯，过大可能摆动或过冲 |
+| `STANLEY_LATERAL_GAIN` | 横向误差增益；越大越快回中，过大容易蛇形 |
+| `STANLEY_SOFT` | 横向误差软化常数；越大越稳，越小越敏感 |
+| `STANLEY_SIGNAL_SCALE` | Stanley-band 输出整体缩放；越大舵机幅度越大 |
+| `STANLEY_ROW_WEIGHT_GAMMA` | Stanley-band 横向误差行权重；越大越重视靠近车身的点 |
+| `STANLEY_MIN_HEADING_POINTS` | Stanley-band 航向拟合最低点数；不足时回退原控制器 |
+| `STANLEY_MIN_LATERAL_POINTS` | Stanley-band 横向误差最低点数；不足时回退原控制器 |
 | `STEER_SIGNAL_NO_TARGET_ROW_MIN` / `STEER_SIGNAL_NO_TARGET_ROW_MAX` | 无 coin/无 car 时控制只看这段 y 范围 |
 | `STEER_SIGNAL_NO_TARGET_GAIN` | 普通巡线模式控制增益 |
 | `STEER_SIGNAL_COIN_GAIN` | coin 路径 active 时控制增益 |
@@ -825,19 +883,35 @@ target_speed = 0                                # 若红/黄灯停车或行人�
 
 - `SERVO_CENTER`
 - `SERVO_MIN / SERVO_MAX`
+- `STEER_CONTROL_MODE`
 - `STEER_SIGNAL_PWM_GAIN`
+- `STANLEY_PWM_GAIN`
 - `STEER_SIGNAL_SPEED_GAIN`
+- `STANLEY_HEADING_GAIN`
+- `STANLEY_LATERAL_GAIN`
+- `STANLEY_SOFT`
+- `STANLEY_SIGNAL_SCALE`
 - `CONTROL_MIN_SPEED / CONTROL_MAX_SPEED`
 - `ZEBRA_STOPLINE_TRIGGER_DIST`
 
 调参建议：
 
+- 想试 Stanley-band 控制器
+  先只把 `STEER_CONTROL_MODE` 从 `weighted_slope` 改成 `stanley_band`，其它参数保持默认；确认方向没有打反后，再开始调增益
 - 车总是自然偏向一侧
   优先校准 `SERVO_CENTER`
 - 舵机转向不够积极，明显拐不过弯
-  适当增大 `STEER_SIGNAL_PWM_GAIN`
+  如果当前是 `stanley_band`，优先增大 `STANLEY_PWM_GAIN`；如果是 `weighted_slope`，增大 `STEER_SIGNAL_PWM_GAIN`
 - 转向一激烈就容易抖或打满
-  适当减小 `STEER_SIGNAL_PWM_GAIN`
+  如果当前是 `stanley_band`，优先减小 `STANLEY_PWM_GAIN`；如果是 `weighted_slope`，减小 `STEER_SIGNAL_PWM_GAIN`
+- Stanley-band 入弯晚、弯道转不过
+  优先增大 `STANLEY_HEADING_GAIN`，例如 `0.85 -> 1.1`
+- Stanley-band 贴边回不来
+  适当增大 `STANLEY_LATERAL_GAIN`，例如 `0.028 -> 0.035`
+- Stanley-band 直道左右蛇形
+  先增大 `STANLEY_SOFT`，例如 `24 -> 30`；如果还抖，再降低 `STANLEY_LATERAL_GAIN`
+- Stanley-band 整体舵机幅度太小或太大
+  先调 `STANLEY_PWM_GAIN`；如果 `Ctrl` 本身太小，再调 `STANLEY_SIGNAL_SCALE`
 - 弯道时车速降得不够
   增大 `STEER_SIGNAL_SPEED_GAIN`
 - 整体跑得太慢或太快

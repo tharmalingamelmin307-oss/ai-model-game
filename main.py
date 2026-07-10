@@ -1797,9 +1797,12 @@ def serial_control_thread():
                         last_output_speed = int(target_speed)
                 target_speed = int(last_output_speed)
 
+            pwm_gain = float(config.STEER_SIGNAL_PWM_GAIN)
+            if str(getattr(config, "STEER_CONTROL_MODE", "weighted_slope")).lower() == "stanley_band":
+                pwm_gain = float(getattr(config, "STANLEY_PWM_GAIN", config.STEER_SIGNAL_PWM_GAIN))
             raw_pwm = (
                 config.SERVO_CENTER
-                - steer_signal * config.STEER_SIGNAL_PWM_GAIN
+                - steer_signal * pwm_gain
             )
             servo_pwm = int(max(config.SERVO_MIN, min(config.SERVO_MAX, raw_pwm)))
         except:
