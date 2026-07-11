@@ -153,7 +153,6 @@ class RoadSegmentor:
         fork_point=None,
         coin_path=None,
         control_band=None,
-        lateral_control_pts=None,
     ):
         """缓存主图路径叠加层，供主线程在其它元素之上重绘."""
         self.last_main_overlay = {
@@ -166,7 +165,6 @@ class RoadSegmentor:
             "fork_point": None if fork_point is None else (float(fork_point[0]), float(fork_point[1])),
             "coin_path": coin_path,
             "control_band": control_band,
-            "lateral_control": None if lateral_control_pts is None else np.array(lateral_control_pts, dtype=np.float32).copy(),
             "bottom_mid": (float(img_w) / 2.0, float(img_h) - 1.0),
             "base_size": (int(img_w), int(img_h)),
         }
@@ -200,7 +198,6 @@ class RoadSegmentor:
         candidate_left_poly = _scaled_polyline(overlay.get("candidate_left"))
         candidate_right_poly = _scaled_polyline(overlay.get("candidate_right"))
         merge_guide_poly = _scaled_polyline(overlay.get("merge_guide"))
-        lateral_control_poly = _scaled_polyline(overlay.get("lateral_control"))
 
         path_thickness = max(1, int(round(config.SEG_DEBUG_PATH_THICKNESS * scale)))
         boundary_thickness = max(1, int(round(config.SEG_DEBUG_BOUNDARY_THICKNESS * scale)))
@@ -210,7 +207,6 @@ class RoadSegmentor:
         coin_dot_radius = max(1, int(round(config.SEG_DEBUG_COIN_PATH_DOT_RADIUS * scale)))
         control_band_thickness = max(1, int(round(getattr(config, "SEG_DEBUG_CONTROL_BAND_THICKNESS", 2) * scale)))
         coin_strict_line_thickness = max(1, int(round(getattr(config, "SEG_DEBUG_COIN_BOTTOM_STRICT_LINE_THICKNESS", 1) * scale)))
-        lateral_point_radius = max(1, int(round(getattr(config, "SEG_DEBUG_LATERAL_CONTROL_POINTS_RADIUS", 2) * scale)))
 
         def _scale_point(pt):
             return (
@@ -280,31 +276,6 @@ class RoadSegmentor:
                 cv2.line(image, (0, y2), (img_w - 1, y2), color, control_band_thickness, cv2.LINE_AA)
             except Exception:
                 pass
-
-        if (
-            bool(getattr(config, "SEG_DEBUG_LATERAL_CONTROL_POINTS_ENABLED", True)) and
-            lateral_control_poly is not None and
-            len(lateral_control_poly) > 0
-        ):
-            lateral_color = getattr(config, "SEG_DEBUG_LATERAL_CONTROL_POINTS_COLOR", (0, 0, 255))
-            if bool(getattr(config, "SEG_DEBUG_LATERAL_CONTROL_POINTS_LINE", True)) and len(lateral_control_poly) >= 2:
-                cv2.polylines(
-                    image,
-                    [lateral_control_poly],
-                    False,
-                    lateral_color,
-                    max(1, int(round(scale))),
-                    cv2.LINE_AA,
-                )
-            for pt in lateral_control_poly.reshape((-1, 2)):
-                cv2.circle(
-                    image,
-                    (int(pt[0]), int(pt[1])),
-                    lateral_point_radius,
-                    lateral_color,
-                    -1,
-                    cv2.LINE_AA,
-                )
 
         if bool(getattr(config, "SEG_DEBUG_COIN_BOTTOM_STRICT_LINE_ENABLED", True)):
             strict_rows = float(getattr(config, "COIN_PATH_ROI_BOTTOM_STRICT_ROWS", 0.0))
@@ -2224,64 +2195,60 @@ class RoadSegmentor:
         return slope_signal
 
     def _compute_stanley_band_steer_signal(self, path_points, img_w, img_h, center_bias_x=0.0, lateral_points=None):
-        """用路径段拟合航向误差，并用近处路径段计算横向误差."""
+        """按单前视行 Stanley 公式计算转向量."""
         if path_points is None or len(path_points) == 0:
             return None
 
         pts = np.array(path_points, dtype=np.float32).reshape((-1, 2))
-        if len(pts) < 2:
+        min_fit_points = max(2, int(getattr(config, "STANLEY_MIN_FIT_POINTS", 3)))
+        if len(pts) < min_fit_points:
             return None
-        lateral_src_pts = pts
-        if lateral_points is not None and len(lateral_points) > 0:
-            lateral_src_pts = np.array(lateral_points, dtype=np.float32).reshape((-1, 2))
 
         bottom_mid_x = float(img_w) / 2.0 + float(center_bias_x)
         bottom_y = float(img_h) - 1.0
+        lookahead_y = float(getattr(config, "STANLEY_LOOKAHEAD_Y", 110.0))
+        lookahead_y = float(np.clip(lookahead_y, 0.0, bottom_y))
 
-        band_y_min = max(0.0, float(getattr(config, "STANLEY_BAND_Y_MIN", 20.0)))
-        band_y_max = min(bottom_y, float(getattr(config, "STANLEY_BAND_Y_MAX", 130.0)))
-        if band_y_max < band_y_min:
-            band_y_min, band_y_max = band_y_max, band_y_min
-        heading_pts = pts[(pts[:, 1] >= band_y_min) & (pts[:, 1] <= band_y_max)]
-        min_heading_points = max(2, int(getattr(config, "STANLEY_MIN_HEADING_POINTS", 6)))
-        if len(heading_pts) < min_heading_points:
+        path_x = None
+        if lateral_points is not None and len(lateral_points) > 0:
+            lateral_pts = np.array(lateral_points, dtype=np.float32).reshape((-1, 2))
+            half_window = max(0.0, float(getattr(config, "STANLEY_LATERAL_AVG_HALF_WINDOW", 5.0)))
+            lateral_mask = np.abs(lateral_pts[:, 1] - lookahead_y) <= half_window
+            window_pts = lateral_pts[lateral_mask]
+            if len(window_pts) > 0:
+                path_x = float(np.mean(window_pts[:, 0]))
+        if path_x is None:
+            path_x = self._path_x_at_y_points(pts, lookahead_y)
+        if path_x is None:
             return None
+        lateral_error = float(path_x) - bottom_mid_x
 
-        lateral_y_min = max(0.0, float(getattr(config, "STANLEY_LATERAL_Y_MIN", 90.0)))
-        lateral_y_max = min(bottom_y, float(getattr(config, "STANLEY_LATERAL_Y_MAX", 130.0)))
-        if lateral_y_max < lateral_y_min:
-            lateral_y_min, lateral_y_max = lateral_y_max, lateral_y_min
-        lateral_pts = lateral_src_pts[
-            (lateral_src_pts[:, 1] >= lateral_y_min) &
-            (lateral_src_pts[:, 1] <= lateral_y_max)
-        ]
-        min_lateral_points = max(1, int(getattr(config, "STANLEY_MIN_LATERAL_POINTS", 3)))
-        if len(lateral_pts) < min_lateral_points:
-            return None
-
-        # x = a*y + b。图像 y 向下增大，所以从近处看向远处的航向角约为 atan(-a)。
+        # x = a*y^2 + b*y + c。图像 y 向下增大，所以从车身看向前方的航向角约为 atan(-dx/dy)。
         try:
-            slope_y_to_x, _ = np.polyfit(heading_pts[:, 1], heading_pts[:, 0], 1)
+            poly_coeffs = self._fit_path_poly_coeffs(pts[:, 1], pts[:, 0])
         except Exception:
             return None
-        heading_error = float(np.arctan(-float(slope_y_to_x)))
-
-        row_gamma = float(getattr(config, "STANLEY_ROW_WEIGHT_GAMMA", 1.2))
-        weights = np.power(np.clip(lateral_pts[:, 1], 0.0, bottom_y), row_gamma)
-        weight_sum = float(np.sum(weights))
-        if weight_sum <= 1e-6:
+        if poly_coeffs is None or len(poly_coeffs) < 3:
             return None
-        lateral_x = float(np.sum(lateral_pts[:, 0] * weights) / weight_sum)
-        lateral_error = lateral_x - bottom_mid_x
+
+        a = float(poly_coeffs[0])
+        b = float(poly_coeffs[1])
+        dx_dy = 2.0 * a * lookahead_y + b
+        heading_error = float(np.arctan(-dx_dy))
+        curvature = float((2.0 * a) / np.power(1.0 + dx_dy * dx_dy, 1.5))
 
         soft = max(1e-6, float(getattr(config, "STANLEY_SOFT", 24.0)))
-        heading_gain = float(getattr(config, "STANLEY_HEADING_GAIN", 0.85))
         lateral_gain = float(getattr(config, "STANLEY_LATERAL_GAIN", 0.028))
+        speed_estimate = max(0.0, float(getattr(config, "STANLEY_SPEED_ESTIMATE", 0.0)))
+        heading_gain = float(getattr(config, "STANLEY_HEADING_GAIN", 0.85))
+        curvature_gain = float(getattr(config, "STANLEY_CURVATURE_FF_GAIN", 0.0))
+        wheelbase_m = float(getattr(config, "STANLEY_WHEELBASE_M", 0.20))
         signal_scale = float(getattr(config, "STANLEY_SIGNAL_SCALE", 950.0))
 
+        lateral_term = float(np.arctan(lateral_gain * lateral_error / (speed_estimate + soft)))
         heading_term = heading_gain * heading_error
-        lateral_term = float(np.arctan(lateral_gain * lateral_error / soft))
-        return (heading_term + lateral_term) * signal_scale
+        curvature_term = curvature_gain * float(np.arctan(wheelbase_m * curvature))
+        return (lateral_term + heading_term + curvature_term) * signal_scale
 
     def _compute_control_steer_signal(self, path_points, img_w, img_h, center_bias_x=0.0, lateral_points=None):
         """按配置选择转向控制器；试验控制器不可用时回退到原算法."""
@@ -3476,27 +3443,12 @@ class RoadSegmentor:
                 )
                 control_mode = str(getattr(config, "STEER_CONTROL_MODE", "weighted_slope")).lower()
                 if control_mode == "stanley_band":
+                    lookahead_y = float(getattr(config, "STANLEY_LOOKAHEAD_Y", 110.0))
+                    lookahead_y = float(np.clip(lookahead_y, 0.0, float(h_seg) - 1.0))
                     control_band = (
-                        control_band[0],
-                        float(getattr(config, "STANLEY_BAND_Y_MAX", control_band[1])),
+                        lookahead_y,
+                        lookahead_y,
                     )
-                    if (
-                        not coin_active and
-                        not car_active and
-                        not external_bias_active and
-                        lateral_control_points is not None and
-                        len(lateral_control_points) > 0
-                    ):
-                        lateral_pts = np.array(lateral_control_points, dtype=np.float32).reshape((-1, 2))
-                        lateral_y_min = float(getattr(config, "STANLEY_LATERAL_Y_MIN", 90.0))
-                        lateral_y_max = float(getattr(config, "STANLEY_LATERAL_Y_MAX", 130.0))
-                        if lateral_y_max < lateral_y_min:
-                            lateral_y_min, lateral_y_max = lateral_y_max, lateral_y_min
-                        lateral_mask = (
-                            (lateral_pts[:, 1] >= lateral_y_min) &
-                            (lateral_pts[:, 1] <= lateral_y_max)
-                        )
-                        lateral_debug_points = lateral_pts[lateral_mask]
             pts_final_orig = path_points_orig.reshape((-1, 1, 2))
         else:
             held_path = self._hold_last_path()
@@ -3540,7 +3492,6 @@ class RoadSegmentor:
             fork_point=y_fork_info.get("fork_point") if y_fork_active else None,
             coin_path=coin_path_debug,
             control_band=control_band if 'control_band' in locals() else None,
-            lateral_control_pts=lateral_debug_points if 'lateral_debug_points' in locals() else None,
         )
         t_fit_end = time.perf_counter()
 
@@ -3657,16 +3608,6 @@ class RoadSegmentor:
                 1,
                 config.SEG_DEBUG_TEXT_FONT_SCALE,
                 config.SEG_DEBUG_TEXT_COLOR_COIN,
-                config.SEG_DEBUG_TEXT_THICKNESS,
-            )
-        if 'lateral_debug_points' in locals() and lateral_debug_points is not None:
-            cv2.putText(
-                ai_view,
-                f"LatRaw pts:{len(lateral_debug_points)}",
-                getattr(config, "SEG_DEBUG_TEXT_POS_LATERAL", (5, 108)),
-                1,
-                config.SEG_DEBUG_TEXT_FONT_SCALE,
-                getattr(config, "SEG_DEBUG_TEXT_COLOR_LATERAL", (0, 0, 255)),
                 config.SEG_DEBUG_TEXT_THICKNESS,
             )
         t_render_end = time.perf_counter()

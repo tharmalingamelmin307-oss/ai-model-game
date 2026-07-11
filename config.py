@@ -190,7 +190,7 @@ OCR_MIN_SCORE = 0.50
 SIGN_LLM_ENABLED = True
 # 触发语义路牌停车采样的 sign 框面积阈值，单位是 TARGET_RES 坐标系像素面积。
 # 它会和 SIGN_LLM_TRIGGER_EDGE_MARGIN_RATIO 同时满足后才停车。
-SIGN_LLM_TRIGGER_AREA = 5500
+SIGN_LLM_TRIGGER_AREA = 4200
 # 停车后希望采集的有效 OCR 样本数量。
 # 收满后会提交给千帆；如果超时，也可能提前提交已有样本。
 SIGN_LLM_OCR_SAMPLES = 10
@@ -556,8 +556,8 @@ BAUD_RATE = 115200
 # 当前并不是直接发电机 PWM，而是发一个速度档位：
 # - CONTROL_MIN_SPEED: 常规最低巡航速度
 # - CONTROL_MAX_SPEED: 直道或轻弯时允许的最高速度
-CONTROL_MIN_SPEED = 25
-CONTROL_MAX_SPEED = 25
+CONTROL_MIN_SPEED = 30
+CONTROL_MAX_SPEED = 30
 
 # 用单一转向控制量做动态降速时的增益。
 # 控制量绝对值越大，说明当前横向偏差/路径趋势越强，目标速度会随之降低。
@@ -586,7 +586,7 @@ SERVO_MIN, SERVO_MAX = 590, 910
 
 # 当前启用的转向控制器。
 # - "weighted_slope": 算法 A，原始稳定算法。把路径点到底部中点的斜率做远近加权平均。
-# - "stanley_band": 算法 B，前轮/Stanley-band 算法。把路径段拆成“航向误差 + 横向误差”。
+# - "stanley_band": 算法 B，单前视行 Stanley 公式。默认取 y=110 计算 e / psi / kappa。
 # 如果 stanley_band 点数不足或拟合失败，会自动回退到 weighted_slope。
 # STEER_CONTROL_MODE = "weighted_slope"
 STEER_CONTROL_MODE = "stanley_band"
@@ -626,77 +626,46 @@ STEER_SIGNAL_NORMALIZED_SCALE = 3000.0
 
 
 # ---------------------------------------------------------------------------
-# 转向算法 B: stanley_band 参数
+# 转向算法 B: 单前视行 Stanley 参数
 # ---------------------------------------------------------------------------
-# stanley_band 把路径控制拆成两项：
-# - 航向误差: y=STANLEY_BAND_Y_MIN~STANLEY_BAND_Y_MAX 拟合整体路径方向。
-# - 横向误差: y=STANLEY_LATERAL_Y_MIN~STANLEY_LATERAL_Y_MAX 计算近处中心偏移。
-# 下面这组只在 STEER_CONTROL_MODE = "stanley_band" 时作为主算法使用。
-#
-# B 算法输出链路:
-#   B 算法内部参数 -> steer_signal -> STANLEY_PWM_GAIN -> 舵机 PWM
-# 点来源:
-# - 航向误差使用拟合后的平滑路径点，适合看远处整体趋势。
-# - 横向误差优先使用拟合前/补线后的中心点，适合看底部真实偏移，减少拟合线底部抖动影响。
-#
-# B 算法专用舵机 PWM 映射增益。
-# 它不参与 B 算法内部的航向/横向计算，只负责把 B 算出来的 steer_signal 放大成舵机 PWM。
-# 调大：舵机整体更积极；调小：舵机整体更稳。
-# 速度升高后轻微摆头，优先可以小幅调低这里，或增大 STANLEY_SOFT。
+# B 算法按图中公式计算:
+#   delta = atan(k * e / (v_s + k_soft)) + g_psi * psi_e + g_ff * atan(L * kappa)
+# 这里不做逆透视，仍工作在 SEG_SIZE 图像坐标里:
+# - e: 拟合路径在 STANLEY_LOOKAHEAD_Y 这一行相对车身中线的横向误差，单位: pixel
+# - psi_e: 拟合路径在同一行的切线航向误差，单位: rad
+# - kappa: 拟合路径在同一行的图像曲率，单位近似为 1/pixel
+# 因为速度暂时只有编码器档位，v_s 先用 STANLEY_SPEED_ESTIMATE 这个调参量。
 STANLEY_PWM_GAIN = STEER_SIGNAL_PWM_GAIN
 
-# --- B 算法内部参数: 采样区间 ---
-# Stanley-band 航向拟合区间，坐标均为 SEG_SIZE 分割图坐标。
-# 当前 SEG_SIZE 高度为 160，y=0 在图像顶部，y=159 在图像底部。
-# 这里取 20~130，表示用车前方较完整的 110 行路径估计整体走向。
-# 调小 Y_MIN 会看得更远，弯道提前量可能更强，但也更容易受远处分割噪声影响。
-# 调大 Y_MAX 会更贴近车身，响应更直接，但过近会更容易被底部毛刺影响。
-STANLEY_BAND_Y_MIN = 20.0
-STANLEY_BAND_Y_MAX = 130.0
-# Stanley-band 横向误差区间。
-# 这里取 90~130，只看车身前方中下部路径，用于判断车辆相对中心线偏了多少。
-# 区间越靠下，回正更积极但更抖；区间越靠上，回正更平顺但可能偏慢。
-STANLEY_LATERAL_Y_MIN = 90.0
-STANLEY_LATERAL_Y_MAX = 130.0
-
-# 速度  10-15                                25
-# 参数：STANLEY_HEADING_GAIN = 0.1           0.07
-#      STANLEY_LATERAL_GAIN = 0.5           0.3
-#      STANLEY_SOFT = 24.0                  40
-#      STANLEY_SIGNAL_SCALE = 10000.0       
-#      STANLEY_ROW_WEIGHT_GAMMA = 1.2       1.0
-#      STANLEY_MIN_HEADING_POINTS = 6
-#      STANLEY_MIN_LATERAL_POINTS = 3
-
-# --- B 算法内部参数: 航向/横向控制 ---
-# 航向误差增益，控制“看见弯道后提前转向”的力度。
-# 增大：入弯更积极，更容易过弯；过大可能弯前摆动或出弯过冲。
-# 减小：直道更稳；过小可能入弯晚、转不过。
-STANLEY_HEADING_GAIN = 0.07         #0.1
-# 横向误差增益，控制“偏离中心线后拉回来”的力度。
-# 增大：贴边时更快回中；过大容易左右蛇形。
-# 减小：更柔和；过小可能长期贴边跑。
-STANLEY_LATERAL_GAIN = 0.3   #0.5
+# 横向误差前视行，SEG_SIZE 坐标系。图像 y 越小表示看得越远。
+STANLEY_LOOKAHEAD_Y = 80.0
+# 航向误差前视行。
+STANLEY_HEADING_LOOKAHEAD_Y = 80.0
+# 曲率前馈前视行，选得比横向/航向更远，用来提前感知大弯。
+STANLEY_CURVATURE_LOOKAHEAD_Y = 50.0
+# 横向误差优先使用拟合前中心点在前视行附近的平均值，减少拟合线底部失真影响。
+STANLEY_LATERAL_AVG_HALF_WINDOW = 5.0
+# 横向误差增益 k，控制 atan(k * e / (v_s + soft)) 的纠偏力度。
+STANLEY_LATERAL_GAIN = 0.45
+# 航向误差增益 g_psi。
+STANLEY_HEADING_GAIN = 0.25
+# 曲率前馈增益 g_ff。图像坐标曲率不是物理曲率，第一版默认关闭。
+STANLEY_CURVATURE_FF_GAIN = 0.2
+# 轴距 L，单位 m。当前只用于曲率前馈；若 g_ff=0 则不影响输出。
+STANLEY_WHEELBASE_M = 0.20
+# 速度估计 v_s。真实编码器速度未换算前，先当调参量使用。
+STANLEY_SPEED_ESTIMATE = CONTROL_MAX_SPEED
 # 横向误差软化常数，放在 atan(k * lateral_error / soft) 的分母里。
 # 增大：横向修正更温和，抑制抖动。
 # 减小：横向修正更敏感，适合舵机反应慢或车速低但可能更抖。
-STANLEY_SOFT = 40.0        
+STANLEY_SOFT = 50.0
 # Stanley 两项相加后的整体输出缩放。
 # 它决定最终 steer_signal 的量级，再由 STANLEY_PWM_GAIN 映射成 PWM。
 # 增大：整体舵机幅度变大；减小：整体舵机幅度变小。
 STANLEY_SIGNAL_SCALE = 10000.0
-# 横向误差区间内的行权重指数。
-# 权重为 y ** gamma，gamma 越大越重视靠近底部/车身的点。
-# 增大：近处纠偏更强；减小：横向误差更像整段平均，更平顺。
-STANLEY_ROW_WEIGHT_GAMMA = 1.2
 
-# --- B 算法内部参数: 可用性门槛 ---
-# Stanley-band 可用性的最低点数门槛。
-# 航向拟合至少需要 STANLEY_MIN_HEADING_POINTS 个点，横向平均至少需要
-# STANLEY_MIN_LATERAL_POINTS 个点；不足时自动回退原 weighted_slope。
-# 调低可让断线时更容易启用 Stanley，但拟合可信度会下降。
-STANLEY_MIN_HEADING_POINTS = 6
-STANLEY_MIN_LATERAL_POINTS = 3
+# 拟合至少需要的路径点数；不足时自动回退 weighted_slope。
+STANLEY_MIN_FIT_POINTS = 3
 
 
 # ---------------------------------------------------------------------------
