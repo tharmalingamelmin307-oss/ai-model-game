@@ -153,6 +153,7 @@ class RoadSegmentor:
         fork_point=None,
         coin_path=None,
         control_band=None,
+        lateral_control_pts=None,
     ):
         """缓存主图路径叠加层，供主线程在其它元素之上重绘."""
         self.last_main_overlay = {
@@ -165,6 +166,7 @@ class RoadSegmentor:
             "fork_point": None if fork_point is None else (float(fork_point[0]), float(fork_point[1])),
             "coin_path": coin_path,
             "control_band": control_band,
+            "lateral_control": None if lateral_control_pts is None else np.array(lateral_control_pts, dtype=np.float32).copy(),
             "bottom_mid": (float(img_w) / 2.0, float(img_h) - 1.0),
             "base_size": (int(img_w), int(img_h)),
         }
@@ -198,6 +200,7 @@ class RoadSegmentor:
         candidate_left_poly = _scaled_polyline(overlay.get("candidate_left"))
         candidate_right_poly = _scaled_polyline(overlay.get("candidate_right"))
         merge_guide_poly = _scaled_polyline(overlay.get("merge_guide"))
+        lateral_control_poly = _scaled_polyline(overlay.get("lateral_control"))
 
         path_thickness = max(1, int(round(config.SEG_DEBUG_PATH_THICKNESS * scale)))
         boundary_thickness = max(1, int(round(config.SEG_DEBUG_BOUNDARY_THICKNESS * scale)))
@@ -207,6 +210,7 @@ class RoadSegmentor:
         coin_dot_radius = max(1, int(round(config.SEG_DEBUG_COIN_PATH_DOT_RADIUS * scale)))
         control_band_thickness = max(1, int(round(getattr(config, "SEG_DEBUG_CONTROL_BAND_THICKNESS", 2) * scale)))
         coin_strict_line_thickness = max(1, int(round(getattr(config, "SEG_DEBUG_COIN_BOTTOM_STRICT_LINE_THICKNESS", 1) * scale)))
+        lateral_point_radius = max(1, int(round(getattr(config, "SEG_DEBUG_LATERAL_CONTROL_POINTS_RADIUS", 2) * scale)))
 
         def _scale_point(pt):
             return (
@@ -276,6 +280,31 @@ class RoadSegmentor:
                 cv2.line(image, (0, y2), (img_w - 1, y2), color, control_band_thickness, cv2.LINE_AA)
             except Exception:
                 pass
+
+        if (
+            bool(getattr(config, "SEG_DEBUG_LATERAL_CONTROL_POINTS_ENABLED", True)) and
+            lateral_control_poly is not None and
+            len(lateral_control_poly) > 0
+        ):
+            lateral_color = getattr(config, "SEG_DEBUG_LATERAL_CONTROL_POINTS_COLOR", (0, 0, 255))
+            if bool(getattr(config, "SEG_DEBUG_LATERAL_CONTROL_POINTS_LINE", True)) and len(lateral_control_poly) >= 2:
+                cv2.polylines(
+                    image,
+                    [lateral_control_poly],
+                    False,
+                    lateral_color,
+                    max(1, int(round(scale))),
+                    cv2.LINE_AA,
+                )
+            for pt in lateral_control_poly.reshape((-1, 2)):
+                cv2.circle(
+                    image,
+                    (int(pt[0]), int(pt[1])),
+                    lateral_point_radius,
+                    lateral_color,
+                    -1,
+                    cv2.LINE_AA,
+                )
 
         if bool(getattr(config, "SEG_DEBUG_COIN_BOTTOM_STRICT_LINE_ENABLED", True)):
             strict_rows = float(getattr(config, "COIN_PATH_ROI_BOTTOM_STRICT_ROWS", 0.0))
@@ -3191,8 +3220,8 @@ class RoadSegmentor:
         car_path_debug = None
         car_active = False
         car_center_bias_x = 0.0
-        external_left_bias_x = max(0.0, float(external_left_bias_x))
-        external_bias_active = external_left_bias_x > 0.0
+        external_left_bias_x = float(external_left_bias_x)
+        external_bias_active = abs(external_left_bias_x) > 0.0
         avoid_center_bias_x = external_left_bias_x if external_bias_active else 0.0
         avoid_bias_source = "external" if external_bias_active else "none"
         centerline_only_mode = bool(getattr(config, "SEG_CENTERLINE_ONLY_MODE", False))
@@ -3348,23 +3377,15 @@ class RoadSegmentor:
                 h_seg,
             )
             car_active = car_path_debug is not None and car_path_debug.get("active")
-            external_left_bias_x = max(0.0, float(external_left_bias_x))
-            external_bias_active = external_left_bias_x > 0.0
+            external_left_bias_x = float(external_left_bias_x)
+            external_bias_active = abs(external_left_bias_x) > 0.0
             avoid_center_bias_x = car_center_bias_x if car_active else 0.0
             avoid_bias_source = "car" if car_active else "none"
             if external_bias_active:
                 external_bias_x = external_left_bias_x
-                bottom_obstacle_sign = self._bottom_obstacle_bias_sign(planning_items, path_points_orig)
-                if bottom_obstacle_sign is not None:
-                    external_bias_x = float(external_left_bias_x) * float(bottom_obstacle_sign)
-                elif car_active and abs(float(car_center_bias_x)) > 0.0:
-                    external_bias_x = float(np.copysign(external_left_bias_x, car_center_bias_x))
                 if abs(float(external_bias_x)) > abs(float(avoid_center_bias_x)):
                     avoid_center_bias_x = external_bias_x
-                    if bottom_obstacle_sign is not None:
-                        avoid_bias_source = "external_bottom_obstacle_dir"
-                    else:
-                        avoid_bias_source = "external_car_dir" if car_active else "external"
+                    avoid_bias_source = "external_car_dir" if car_active else "external"
             car_state = "FOLLOW_LANE"
             if car_path_debug is not None:
                 car_state = str(car_path_debug.get("state", "FOLLOW_LANE"))
@@ -3446,6 +3467,7 @@ class RoadSegmentor:
             elif not car_active:
                 steer_signal *= float(getattr(config, "STEER_SIGNAL_NO_TARGET_GAIN", 1.0))
             control_band = None
+            lateral_debug_points = None
             if control_path_points is not None and len(control_path_points) > 0:
                 control_pts = np.array(control_path_points, dtype=np.float32).reshape((-1, 2))
                 control_band = (
@@ -3453,16 +3475,28 @@ class RoadSegmentor:
                     float(np.max(control_pts[:, 1])),
                 )
                 control_mode = str(getattr(config, "STEER_CONTROL_MODE", "weighted_slope")).lower()
-                if (
-                    control_mode == "stanley_band" and
-                    not coin_active and
-                    not car_active and
-                    not external_bias_active
-                ):
+                if control_mode == "stanley_band":
                     control_band = (
-                        float(getattr(config, "STANLEY_BAND_Y_MIN", control_band[0])),
+                        control_band[0],
                         float(getattr(config, "STANLEY_BAND_Y_MAX", control_band[1])),
                     )
+                    if (
+                        not coin_active and
+                        not car_active and
+                        not external_bias_active and
+                        lateral_control_points is not None and
+                        len(lateral_control_points) > 0
+                    ):
+                        lateral_pts = np.array(lateral_control_points, dtype=np.float32).reshape((-1, 2))
+                        lateral_y_min = float(getattr(config, "STANLEY_LATERAL_Y_MIN", 90.0))
+                        lateral_y_max = float(getattr(config, "STANLEY_LATERAL_Y_MAX", 130.0))
+                        if lateral_y_max < lateral_y_min:
+                            lateral_y_min, lateral_y_max = lateral_y_max, lateral_y_min
+                        lateral_mask = (
+                            (lateral_pts[:, 1] >= lateral_y_min) &
+                            (lateral_pts[:, 1] <= lateral_y_max)
+                        )
+                        lateral_debug_points = lateral_pts[lateral_mask]
             pts_final_orig = path_points_orig.reshape((-1, 1, 2))
         else:
             held_path = self._hold_last_path()
@@ -3506,6 +3540,7 @@ class RoadSegmentor:
             fork_point=y_fork_info.get("fork_point") if y_fork_active else None,
             coin_path=coin_path_debug,
             control_band=control_band if 'control_band' in locals() else None,
+            lateral_control_pts=lateral_debug_points if 'lateral_debug_points' in locals() else None,
         )
         t_fit_end = time.perf_counter()
 
@@ -3622,6 +3657,16 @@ class RoadSegmentor:
                 1,
                 config.SEG_DEBUG_TEXT_FONT_SCALE,
                 config.SEG_DEBUG_TEXT_COLOR_COIN,
+                config.SEG_DEBUG_TEXT_THICKNESS,
+            )
+        if 'lateral_debug_points' in locals() and lateral_debug_points is not None:
+            cv2.putText(
+                ai_view,
+                f"LatRaw pts:{len(lateral_debug_points)}",
+                getattr(config, "SEG_DEBUG_TEXT_POS_LATERAL", (5, 108)),
+                1,
+                config.SEG_DEBUG_TEXT_FONT_SCALE,
+                getattr(config, "SEG_DEBUG_TEXT_COLOR_LATERAL", (0, 0, 255)),
                 config.SEG_DEBUG_TEXT_THICKNESS,
             )
         t_render_end = time.perf_counter()

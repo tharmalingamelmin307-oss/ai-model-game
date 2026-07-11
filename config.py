@@ -166,7 +166,7 @@ SIGN_CLASS_ID = 9
 # - 但远距离误判风险会上升
 # detv3 输入从 detv2 的 768x576 换到 512x384，面积类门槛按输入面积比例缩放。
 # 50 * 100 * (512 * 384) / (768 * 576) = 2222。
-OCR_MIN_SIGN_BOX_AREA = 5000
+OCR_MIN_SIGN_BOX_AREA = 3600
 
 # sign 在进入 OCR 前，四周需要保留的最小边距比例。
 # 例如 0.03 表示检测框四边都要距离画面边界至少 3% 的宽/高。
@@ -556,8 +556,8 @@ BAUD_RATE = 115200
 # 当前并不是直接发电机 PWM，而是发一个速度档位：
 # - CONTROL_MIN_SPEED: 常规最低巡航速度
 # - CONTROL_MAX_SPEED: 直道或轻弯时允许的最高速度
-CONTROL_MIN_SPEED = 20
-CONTROL_MAX_SPEED = 20
+CONTROL_MIN_SPEED = 25
+CONTROL_MAX_SPEED = 25
 
 # 用单一转向控制量做动态降速时的增益。
 # 控制量绝对值越大，说明当前横向偏差/路径趋势越强，目标速度会随之降低。
@@ -659,12 +659,12 @@ STANLEY_BAND_Y_MAX = 130.0
 STANLEY_LATERAL_Y_MIN = 90.0
 STANLEY_LATERAL_Y_MAX = 130.0
 
-# 速度  10-15  
-# 参数：STANLEY_HEADING_GAIN = 0.1  
-#      STANLEY_LATERAL_GAIN = 0.5 
-#      STANLEY_SOFT = 24.0
-#      STANLEY_SIGNAL_SCALE = 10000.0
-#      STANLEY_ROW_WEIGHT_GAMMA = 1.2
+# 速度  10-15                                25
+# 参数：STANLEY_HEADING_GAIN = 0.1           0.07
+#      STANLEY_LATERAL_GAIN = 0.5           0.3
+#      STANLEY_SOFT = 24.0                  40
+#      STANLEY_SIGNAL_SCALE = 10000.0       
+#      STANLEY_ROW_WEIGHT_GAMMA = 1.2       1.0
 #      STANLEY_MIN_HEADING_POINTS = 6
 #      STANLEY_MIN_LATERAL_POINTS = 3
 
@@ -672,15 +672,15 @@ STANLEY_LATERAL_Y_MAX = 130.0
 # 航向误差增益，控制“看见弯道后提前转向”的力度。
 # 增大：入弯更积极，更容易过弯；过大可能弯前摆动或出弯过冲。
 # 减小：直道更稳；过小可能入弯晚、转不过。
-STANLEY_HEADING_GAIN = 0.05         #0.1
+STANLEY_HEADING_GAIN = 0.07         #0.1
 # 横向误差增益，控制“偏离中心线后拉回来”的力度。
 # 增大：贴边时更快回中；过大容易左右蛇形。
 # 减小：更柔和；过小可能长期贴边跑。
-STANLEY_LATERAL_GAIN = 0.4     #0.5
+STANLEY_LATERAL_GAIN = 0.3   #0.5
 # 横向误差软化常数，放在 atan(k * lateral_error / soft) 的分母里。
 # 增大：横向修正更温和，抑制抖动。
 # 减小：横向修正更敏感，适合舵机反应慢或车速低但可能更抖。
-STANLEY_SOFT = 30.0
+STANLEY_SOFT = 40.0        
 # Stanley 两项相加后的整体输出缩放。
 # 它决定最终 steer_signal 的量级，再由 STANLEY_PWM_GAIN 映射成 PWM。
 # 增大：整体舵机幅度变大；减小：整体舵机幅度变小。
@@ -767,6 +767,9 @@ DEFAULT_CONTROL_DATA = {
     "person_clear_line_x": None,
     "person_stop_event": "",
     "person_avoid_active": False,
+    "person_avoid_bias_x": 0.0,
+    "person_move_direction": 0,
+    "person_missing_started_at": None,
     "person_avoid_hold_frames": 0,
     "person_clear_frames": 0,
     "person_miss_frames": 0,
@@ -875,21 +878,27 @@ PERSON_CLASS_NAME = "person"
 PERSON_CLASS_ID_FALLBACK = 2
 
 # 行人停车/绕行逻辑。
-# 触发不做路径 ROI 过滤，和斑马线类似，只看 person 框底边是否足够靠近画面底部。
-# 当前策略: 先停车，确认行人持续向右移动后，解除停车并给控制量一个左偏。
-# 行人框底边距离画面底部小于该值时触发停车，单位 TARGET_RES 像素。
-PERSON_STOP_TRIGGER_DIST = 300
-# 行人连续向右移动多少帧后允许从停车切到左绕行。
-PERSON_CLEAR_MOVE_FRAMES = 1
-# 判定“行人向右移动”的最小底部中心 x 增量。
-PERSON_CLEAR_MIN_RIGHT_DX = 3.0
-# 左绕行时临时叠加到 steer_signal 的左偏量。
+# 触发不做路径 ROI 过滤；person 框底边足够靠近画面底部后停车观察。
+# 当前策略: 先停车观察；确认行人连续横向移动，且框底部中点进入画面中线附近后，再按移动方向绕行。
+# 行人框底边距离画面底部小于该值才触发停车，单位 TARGET_RES 像素。
+PERSON_STOP_TRIGGER_DIST = 320
+# 行人连续向左/向右移动多少帧后，才允许从停车切到绕行。
+PERSON_CLEAR_MOVE_FRAMES = 2
+# 判定“行人横向移动”的最小底部中心 x 增量。
+PERSON_CLEAR_MIN_MOVE_DX = 3.0
+# 兼容旧参数名；如果外部脚本还在改旧名，也能继续生效。
+PERSON_CLEAR_MIN_RIGHT_DX = PERSON_CLEAR_MIN_MOVE_DX
+# 行人框底部中点必须进入画面中线左右该范围，才允许开始绕行。
+PERSON_CLEAR_CENTER_WINDOW_X = 50.0
+# 停车但还没绕行时，连续看不见行人超过该时间就释放停车继续走。
+PERSON_STOP_MISSING_TIMEOUT_SECONDS = 5.0
+# 绕行时临时叠加到控制基准的偏置量。正值表示左绕，负值表示右绕。
 PERSON_LEFT_AVOID_STEER_BIAS = 45.0
-# 左绕行期间，行人连续漏检多少帧后开始退出候选。
+# 绕行期间，行人连续漏检多少帧后开始退出候选。
 PERSON_AVOID_EXIT_MISSING_FRAMES = 3
-# 左绕行退出候选需要保持多少帧才真正结束绕行。
+# 绕行退出候选需要保持多少帧才真正结束绕行。
 PERSON_AVOID_EXIT_HOLD_FRAMES = 10
-# 普通行人停车状态下，连续漏检多少帧后释放停车。
+# 普通行人停车状态下的漏检帧数只用于状态显示；释放停车由 PERSON_STOP_MISSING_TIMEOUT_SECONDS 控制。
 PERSON_STOP_MISS_RELEASE_FRAMES = 3
 
 # OCR 检测框与 OCR 文字框做“最近中心点匹配”时使用的初始最大距离。
@@ -1330,7 +1339,7 @@ SEG_DEBUG_CONTROL_BAND_COLOR = (255, 0, 255)
 # steer_signal 控制区域横线粗细。
 SEG_DEBUG_CONTROL_BAND_THICKNESS = 2
 # 是否绘制 coin 底部严格区分界线。
-SEG_DEBUG_COIN_BOTTOM_STRICT_LINE_ENABLED = True
+SEG_DEBUG_COIN_BOTTOM_STRICT_LINE_ENABLED = False
 # coin 底部严格区分界线颜色。
 SEG_DEBUG_COIN_BOTTOM_STRICT_LINE_COLOR = (0, 0, 255)
 # coin 底部严格区分界线粗细。
