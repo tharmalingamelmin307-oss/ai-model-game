@@ -318,10 +318,11 @@ class RoadSegmentor:
         fork_point = overlay.get("fork_point")
         if fork_point is not None:
             fork_pt = _scale_point(fork_point)
+            fork_bottom_pt = _scale_point((float(fork_point[0]), float(base_h) - 1.0))
             cv2.line(
                 image,
                 fork_pt,
-                bottom_mid_pt,
+                fork_bottom_pt,
                 config.SEG_DEBUG_FORK_DIVIDER_COLOR,
                 max(1, int(round(config.SEG_DEBUG_FORK_DIVIDER_THICKNESS * scale))),
                 cv2.LINE_AA,
