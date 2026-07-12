@@ -833,8 +833,6 @@ class RoadSegmentor:
         h, w = search_mask.shape[:2]
         fork_x = float(fork_point[0])
         fork_y = float(fork_point[1])
-        bottom_y = float(h - 1)
-        bottom_mid_x = float(w) / 2.0
         start_y = int(np.clip(np.floor(fork_y) + 1, 0, h - 1))
         end_y = int(h - 1)
         if end_y < start_y:
@@ -849,12 +847,9 @@ class RoadSegmentor:
         hit_rows = 0
         miss_run = 0
         max_miss_run = 0
-        divider_dy = max(1.0, bottom_y - fork_y)
 
         for y in range(start_y, end_y + 1):
-            t = np.clip((float(y) - fork_y) / divider_dy, 0.0, 1.0)
-            split_x = fork_x + (bottom_mid_x - fork_x) * t
-            center_col = int(np.clip(round(split_x), 0, w - 1))
+            center_col = int(np.clip(round(fork_x), 0, w - 1))
             left = max(0, center_col - radius)
             right = min(w - 1, center_col + radius)
             has_support = bool(np.any(search_mask[y, left:right + 1] > 0))
@@ -1442,25 +1437,15 @@ class RoadSegmentor:
         return self.merge_state_info
 
     def _split_mask_by_fork(self, search_mask, fork_point):
-        """按“分叉点到底部中点”的分界线，把 mask 切成左右两大区域."""
+        """按“分叉特征点垂直向下”的分界线，把 mask 切成左右两大区域."""
         h, w = search_mask.shape[:2]
-        bottom_mid_x = float(w) / 2.0
-        bottom_y = float(h) - 1.0
         fork_x = float(fork_point[0])
-        fork_y = float(fork_point[1])
 
         left_mask = np.zeros_like(search_mask, dtype=np.uint8)
         right_mask = np.zeros_like(search_mask, dtype=np.uint8)
 
-        divider_dy = max(1.0, bottom_y - fork_y)
+        split_col = int(np.clip(round(fork_x), 0, w - 1))
         for y in range(h):
-            if float(y) <= fork_y:
-                split_x = fork_x
-            else:
-                t = np.clip((float(y) - fork_y) / divider_dy, 0.0, 1.0)
-                split_x = fork_x + (bottom_mid_x - fork_x) * t
-
-            split_col = int(np.clip(round(split_x), 0, w - 1))
             left_mask[y, :split_col + 1] = search_mask[y, :split_col + 1]
             right_mask[y, split_col:] = search_mask[y, split_col:]
 
@@ -2069,19 +2054,14 @@ class RoadSegmentor:
     def _estimate_stone_side_by_fork_divider(self, planning_items, fork_point, mask_shape):
         """按 Y 分叉切分线判断石头位于左区还是右区.
 
-        这个判断和 _split_mask_by_fork 使用同一条“fork_point -> 底部中点”分界线，
+        这个判断和 _split_mask_by_fork 使用同一条“分叉特征点垂直向下”分界线，
         比较适合已经确认 Y 型分叉的场景。
         """
         stone_items = self._get_stone_avoid_items(planning_items)
         if not stone_items or fork_point is None:
             return 0
 
-        h, w = mask_shape[:2]
-        bottom_mid_x = float(w) / 2.0
-        bottom_y = float(h) - 1.0
         fork_x = float(fork_point[0])
-        fork_y = float(fork_point[1])
-        divider_dy = max(1.0, bottom_y - fork_y)
         min_sep = float(config.STONE_BRANCH_MIN_SEP)
 
         vote = 0
@@ -2089,17 +2069,10 @@ class RoadSegmentor:
             seg_box = np.array(item["seg_box"], dtype=np.float32)
             stone_center = np.mean(seg_box, axis=0)
             stone_x = float(stone_center[0])
-            stone_y = float(stone_center[1])
 
-            if stone_y <= fork_y:
-                split_x = fork_x
-            else:
-                t = np.clip((stone_y - fork_y) / divider_dy, 0.0, 1.0)
-                split_x = fork_x + (bottom_mid_x - fork_x) * t
-
-            if abs(stone_x - split_x) < min_sep:
+            if abs(stone_x - fork_x) < min_sep:
                 continue
-            if stone_x < split_x:
+            if stone_x < fork_x:
                 vote -= 1
             else:
                 vote += 1
@@ -2233,9 +2206,15 @@ class RoadSegmentor:
 
         a = float(poly_coeffs[0])
         b = float(poly_coeffs[1])
-        dx_dy = 2.0 * a * lookahead_y + b
-        heading_error = float(np.arctan(-dx_dy))
-        curvature = float((2.0 * a) / np.power(1.0 + dx_dy * dx_dy, 1.5))
+        heading_y = float(getattr(config, "STANLEY_HEADING_LOOKAHEAD_Y", lookahead_y))
+        heading_y = float(np.clip(heading_y, 0.0, bottom_y))
+        curvature_y = float(getattr(config, "STANLEY_CURVATURE_LOOKAHEAD_Y", heading_y))
+        curvature_y = float(np.clip(curvature_y, 0.0, bottom_y))
+
+        heading_dx_dy = 2.0 * a * heading_y + b
+        curvature_dx_dy = 2.0 * a * curvature_y + b
+        heading_error = float(np.arctan(-heading_dx_dy))
+        curvature = float((2.0 * a) / np.power(1.0 + curvature_dx_dy * curvature_dx_dy, 1.5))
 
         soft = max(1e-6, float(getattr(config, "STANLEY_SOFT", 24.0)))
         lateral_gain = float(getattr(config, "STANLEY_LATERAL_GAIN", 0.028))

@@ -373,7 +373,39 @@ def extract_person_stop_candidate(boxes, frame_id):
     return best
 
 
-def update_person_stop_state(state, person_info, left_boundary_x, right_boundary_x, yolo_frame_id):
+def has_car_on_left(boxes, left_boundary_x=None, right_boundary_x=None):
+    """判断当前画面左侧是否有 car，用于决定行人绕行是否允许右偏."""
+    car_cls_id = config.CLASS_NAMES.index("car") if "car" in config.CLASS_NAMES else 0
+    target_w = config.TARGET_RES[0]
+    if left_boundary_x is not None and right_boundary_x is not None:
+        ref_x = 0.5 * (float(left_boundary_x) + float(right_boundary_x))
+    else:
+        ref_x = 0.5 * float(target_w)
+    min_score = float(getattr(config, "CAR_AVOIDANCE_MIN_SCORE", 0.0))
+
+    for obj in boxes:
+        if obj.get("class_id", -1) != car_cls_id and obj.get("class_name", "") != "car":
+            continue
+        if float(obj.get("score", 0.0)) < min_score:
+            continue
+        rect = obj.get("rect", [0, 0, 0, 0])
+        if len(rect) != 4:
+            continue
+
+        x, y, w, h = [float(v) for v in rect]
+        if w <= 0.0 or h <= 0.0:
+            continue
+
+        x1 = float(np.clip(x, 0.0, float(target_w - 1)))
+        x2 = float(np.clip(x + w, 0.0, float(target_w - 1)))
+        car_center_x = 0.5 * (x1 + x2)
+        if car_center_x < ref_x:
+            return True
+
+    return False
+
+
+def update_person_stop_state(state, person_info, left_boundary_x, right_boundary_x, yolo_frame_id, car_on_left=False):
     """行人靠近时先停车；确认连续横移且到达中线附近后，再按方向绕行."""
     active = bool(state.get("person_stop_active", False))
     avoid_active = bool(state.get("person_avoid_active", False))
@@ -392,6 +424,8 @@ def update_person_stop_state(state, person_info, left_boundary_x, right_boundary
     avoid_hold_frames = int(state.get("person_avoid_hold_frames", 0))
     move_direction = int(state.get("person_move_direction", 0))
     missing_started_at = state.get("person_missing_started_at")
+    stop_started_at = state.get("person_stop_started_at")
+    max_released = bool(state.get("person_stop_max_released", False))
     now = time.monotonic()
 
     if person_info is None:
@@ -403,17 +437,21 @@ def update_person_stop_state(state, person_info, left_boundary_x, right_boundary
                 avoid_active = False
                 avoid_hold_frames = 0
         elif active:
+            if stop_started_at is None:
+                stop_started_at = now
             if missing_started_at is None:
                 missing_started_at = now
-            missing_timeout = max(0.0, float(getattr(config, "PERSON_STOP_MISSING_TIMEOUT_SECONDS", 5.0)))
+            missing_timeout = max(0.0, float(getattr(config, "PERSON_STOP_MISSING_TIMEOUT_SECONDS", 2.0)))
             if now - float(missing_started_at) >= missing_timeout:
                 active = False
+        max_released = False
         state["person_stop_active"] = active
         state["person_avoid_active"] = avoid_active
         state["person_bottom_y"] = None
         state["person_bottom_center_x"] = None
         state["person_bottom_right_x"] = None
         state["person_dist_to_bottom"] = None
+        state["person_car_on_left"] = False
         state["person_left_boundary_x"] = None
         state["person_right_boundary_x"] = None
         state["person_clear_line_x"] = None
@@ -422,6 +460,8 @@ def update_person_stop_state(state, person_info, left_boundary_x, right_boundary
         state["person_avoid_hold_frames"] = avoid_hold_frames
         state["person_move_direction"] = 0
         state["person_missing_started_at"] = missing_started_at if active else None
+        state["person_stop_started_at"] = stop_started_at if active else None
+        state["person_stop_max_released"] = max_released
         if not avoid_active:
             state["person_avoid_bias_x"] = 0.0
         state["person_last_frame_id"] = yolo_frame_id
@@ -459,9 +499,15 @@ def update_person_stop_state(state, person_info, left_boundary_x, right_boundary
     near_bottom = dist_to_bottom <= trigger_dist
 
     missing_started_at = None
+    if not near_bottom:
+        max_released = False
 
-    if near_bottom and not avoid_active:
+    if near_bottom and not avoid_active and not max_released:
+        if not active:
+            stop_started_at = now
         active = True
+    elif not active:
+        stop_started_at = None
     miss_frames = 0
     avoid_hold_frames = 0
 
@@ -482,10 +528,24 @@ def update_person_stop_state(state, person_info, left_boundary_x, right_boundary
         clear_frames = 0
         avoid_active = True
         avoid_hold_frames = 0
+        stop_started_at = None
+        max_released = False
         avoid_bias = float(getattr(config, "PERSON_LEFT_AVOID_STEER_BIAS", 45.0))
-        state["person_avoid_bias_x"] = avoid_bias if move_direction > 0 else -avoid_bias
+        state["person_avoid_bias_x"] = -avoid_bias if bool(car_on_left) else avoid_bias
     elif not avoid_active:
         state["person_avoid_bias_x"] = 0.0
+
+    if active:
+        if stop_started_at is None:
+            stop_started_at = now
+        max_stop_seconds = max(0.0, float(getattr(config, "PERSON_STOP_MAX_SECONDS", 5.0)))
+        if now - float(stop_started_at) >= max_stop_seconds:
+            active = False
+            clear_frames = 0
+            max_released = True
+            stop_started_at = None
+    elif not avoid_active and not near_bottom:
+        stop_started_at = None
 
     state["person_stop_active"] = active
     state["person_avoid_active"] = avoid_active
@@ -493,6 +553,7 @@ def update_person_stop_state(state, person_info, left_boundary_x, right_boundary
     state["person_bottom_center_x"] = bottom_center_x
     state["person_bottom_right_x"] = bottom_right_x
     state["person_dist_to_bottom"] = dist_to_bottom
+    state["person_car_on_left"] = bool(car_on_left)
     state["person_left_boundary_x"] = left_boundary_x
     state["person_right_boundary_x"] = right_boundary_x
     state["person_clear_line_x"] = clear_line_x
@@ -501,12 +562,16 @@ def update_person_stop_state(state, person_info, left_boundary_x, right_boundary
     state["person_avoid_hold_frames"] = avoid_hold_frames
     state["person_move_direction"] = move_direction
     state["person_missing_started_at"] = missing_started_at
+    state["person_stop_started_at"] = stop_started_at
+    state["person_stop_max_released"] = max_released
     state["person_last_frame_id"] = yolo_frame_id
     state["person_last_bottom_center_x"] = bottom_center_x
     if not prev_active and active:
         state["person_stop_event"] = "stop"
     elif prev_active and not active and avoid_active:
-        state["person_stop_event"] = "avoid_left" if move_direction > 0 else "avoid_right"
+        state["person_stop_event"] = "avoid_left" if float(state.get("person_avoid_bias_x", 0.0)) >= 0.0 else "avoid_right"
+    elif prev_active and not active:
+        state["person_stop_event"] = "release_timeout"
     elif prev_avoid_active and not avoid_active:
         state["person_stop_event"] = "avoid_done"
     else:
@@ -1433,6 +1498,11 @@ def seg_worker(core_id, worker_id=0):
         if person_info is not None:
             person_left_boundary_x = seg.selected_left_boundary_x_at_target_y(person_info["bottom_y"])
             person_right_boundary_x = seg.selected_right_boundary_x_at_target_y(person_info["bottom_y"])
+        person_car_on_left = has_car_on_left(
+            current_yolo_boxes,
+            person_left_boundary_x,
+            person_right_boundary_x,
+        )
 
         if rendered_img is not None:
             if rendered_img.shape[1] != config.TARGET_RES[0] or rendered_img.shape[0] != config.TARGET_RES[1]:
@@ -1447,6 +1517,7 @@ def seg_worker(core_id, worker_id=0):
                 person_left_boundary_x,
                 person_right_boundary_x,
                 current_yolo_frame_id,
+                person_car_on_left,
             )
 
             actual_servo = global_control_data.get("actual_servo_pwm", config.SERVO_CENTER)

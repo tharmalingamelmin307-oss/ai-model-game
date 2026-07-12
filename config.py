@@ -166,7 +166,7 @@ SIGN_CLASS_ID = 9
 # - 但远距离误判风险会上升
 # detv3 输入从 detv2 的 768x576 换到 512x384，面积类门槛按输入面积比例缩放。
 # 50 * 100 * (512 * 384) / (768 * 576) = 2222。
-OCR_MIN_SIGN_BOX_AREA = 3600
+OCR_MIN_SIGN_BOX_AREA = 4200
 
 # sign 在进入 OCR 前，四周需要保留的最小边距比例。
 # 例如 0.03 表示检测框四边都要距离画面边界至少 3% 的宽/高。
@@ -556,8 +556,8 @@ BAUD_RATE = 115200
 # 当前并不是直接发电机 PWM，而是发一个速度档位：
 # - CONTROL_MIN_SPEED: 常规最低巡航速度
 # - CONTROL_MAX_SPEED: 直道或轻弯时允许的最高速度
-CONTROL_MIN_SPEED = 30
-CONTROL_MAX_SPEED = 30
+CONTROL_MIN_SPEED = 35
+CONTROL_MAX_SPEED = 35
 
 # 用单一转向控制量做动态降速时的增益。
 # 控制量绝对值越大，说明当前横向偏差/路径趋势越强，目标速度会随之降低。
@@ -638,19 +638,19 @@ STEER_SIGNAL_NORMALIZED_SCALE = 3000.0
 STANLEY_PWM_GAIN = STEER_SIGNAL_PWM_GAIN
 
 # 横向误差前视行，SEG_SIZE 坐标系。图像 y 越小表示看得越远。
-STANLEY_LOOKAHEAD_Y = 80.0
+STANLEY_LOOKAHEAD_Y = 70.0
 # 航向误差前视行。
-STANLEY_HEADING_LOOKAHEAD_Y = 80.0
+STANLEY_HEADING_LOOKAHEAD_Y = 70.0
 # 曲率前馈前视行，选得比横向/航向更远，用来提前感知大弯。
-STANLEY_CURVATURE_LOOKAHEAD_Y = 50.0
+STANLEY_CURVATURE_LOOKAHEAD_Y = 40.0
 # 横向误差优先使用拟合前中心点在前视行附近的平均值，减少拟合线底部失真影响。
 STANLEY_LATERAL_AVG_HALF_WINDOW = 5.0
 # 横向误差增益 k，控制 atan(k * e / (v_s + soft)) 的纠偏力度。
-STANLEY_LATERAL_GAIN = 0.45
+STANLEY_LATERAL_GAIN = 0.5
 # 航向误差增益 g_psi。
-STANLEY_HEADING_GAIN = 0.25
+STANLEY_HEADING_GAIN = 0.35
 # 曲率前馈增益 g_ff。图像坐标曲率不是物理曲率，第一版默认关闭。
-STANLEY_CURVATURE_FF_GAIN = 0.2
+STANLEY_CURVATURE_FF_GAIN = 0.1
 # 轴距 L，单位 m。当前只用于曲率前馈；若 g_ff=0 则不影响输出。
 STANLEY_WHEELBASE_M = 0.20
 # 速度估计 v_s。真实编码器速度未换算前，先当调参量使用。
@@ -731,6 +731,7 @@ DEFAULT_CONTROL_DATA = {
     "person_bottom_center_x": None,
     "person_bottom_right_x": None,
     "person_dist_to_bottom": None,
+    "person_car_on_left": False,
     "person_left_boundary_x": None,
     "person_right_boundary_x": None,
     "person_clear_line_x": None,
@@ -739,6 +740,8 @@ DEFAULT_CONTROL_DATA = {
     "person_avoid_bias_x": 0.0,
     "person_move_direction": 0,
     "person_missing_started_at": None,
+    "person_stop_started_at": None,
+    "person_stop_max_released": False,
     "person_avoid_hold_frames": 0,
     "person_clear_frames": 0,
     "person_miss_frames": 0,
@@ -860,7 +863,9 @@ PERSON_CLEAR_MIN_RIGHT_DX = PERSON_CLEAR_MIN_MOVE_DX
 # 行人框底部中点必须进入画面中线左右该范围，才允许开始绕行。
 PERSON_CLEAR_CENTER_WINDOW_X = 50.0
 # 停车但还没绕行时，连续看不见行人超过该时间就释放停车继续走。
-PERSON_STOP_MISSING_TIMEOUT_SECONDS = 5.0
+PERSON_STOP_MISSING_TIMEOUT_SECONDS = 2.0
+# 停车但还没绕行时，普通行人停车最多保持多久。
+PERSON_STOP_MAX_SECONDS = 5.0
 # 绕行时临时叠加到控制基准的偏置量。正值表示左绕，负值表示右绕。
 PERSON_LEFT_AVOID_STEER_BIAS = 45.0
 # 绕行期间，行人连续漏检多少帧后开始退出候选。
