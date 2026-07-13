@@ -659,7 +659,7 @@ STANLEY_CURVATURE_LOOKAHEAD_Y = 30.0
 # 横向误差优先使用拟合前中心点在前视行附近的平均值，减少拟合线底部失真影响。
 STANLEY_LATERAL_AVG_HALF_WINDOW = 5.0
 # 横向误差增益 k，控制 atan(k * e / (v_s + soft)) 的纠偏力度。
-STANLEY_LATERAL_GAIN = 0.6
+STANLEY_LATERAL_GAIN = 0.5
 # 横向 D 系数 Kd，作用在 EMA 后横向误差的帧间变化量 de 上。
 # 默认关闭；想试 B+d 时先从很小值开始，例如 0.0005 ~ 0.003。
 STANLEY_LATERAL_D_GAIN = 0.020
