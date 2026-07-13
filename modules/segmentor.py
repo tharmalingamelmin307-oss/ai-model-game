@@ -4,7 +4,7 @@
 这个模块负责:
 1. 调用分割模型得到二值赛道 mask
 2. 在 mask 空间中搜索一条可跟踪路径（引入分支局部中心约束，抑制切内线）
-3. 基于路径点到图像底部中点的加权斜率和，生成单一转向控制量
+3. 调用 path_controller 将路径点转换成单一转向控制量
 4. 引入多项式时域低通滤波 (EMA)，提升路径稳定性
 5. 返回用于控制的 steer_signal，以及一张调试渲染图
 
@@ -21,6 +21,8 @@ import numpy as np
 import time
 from rknnlite.api import RKNNLite
 import config
+from modules.debug_tools import SegDebugOverlay, SegProfileLogger, draw_seg_status_text
+from modules.path_controller import PathController
 try:
     from utils.rknn_quiet import suppress_rknn_init_output
 except ImportError:
@@ -63,6 +65,7 @@ class RoadSegmentor:
         # -------------------------------------------------------------------
         self.last_poly_coeffs = None
         self.last_path_points_orig = None
+        self.path_controller = PathController()
         self.missing_path_frames = 0
         self.ema_alpha = float(config.SEG_EMA_ALPHA)
         self.last_branch_stats = {
@@ -90,25 +93,12 @@ class RoadSegmentor:
         self.car_last_center_bias_sign = 1.0
         self.locked_coin = None
         self.locked_coin_miss_frames = 0
-        self.last_main_overlay = {
-            "path": None,
-            "left": None,
-            "right": None,
-            "candidate_left": None,
-            "candidate_right": None,
-            "merge_guide": None,
-            "fork_point": None,
-            "coin_path": None,
-            "control_band": None,
-            "bottom_mid": (0.0, 0.0),
-            "base_size": tuple(config.SEG_SIZE),
-        }
-        self.profile_ema = None
-        self.profile_last_log = 0.0
+        self.debug_overlay = SegDebugOverlay(tuple(config.SEG_SIZE))
+        self.seg_profile_logger = SegProfileLogger()
 
     def selected_left_boundary_x_at_target_y(self, target_y):
         """返回当前选中路径左边界在 TARGET_RES 坐标系下的 x."""
-        left_boundary = self.last_main_overlay.get("left")
+        left_boundary = self.debug_overlay.overlay.get("left")
         if left_boundary is None:
             return None
 
@@ -125,7 +115,7 @@ class RoadSegmentor:
 
     def selected_right_boundary_x_at_target_y(self, target_y):
         """返回当前选中路径右边界在 TARGET_RES 坐标系下的 x."""
-        right_boundary = self.last_main_overlay.get("right")
+        right_boundary = self.debug_overlay.overlay.get("right")
         if right_boundary is None:
             return None
 
@@ -155,248 +145,34 @@ class RoadSegmentor:
         control_band=None,
     ):
         """缓存主图路径叠加层，供主线程在其它元素之上重绘."""
-        self.last_main_overlay = {
-            "path": None if path_pts is None else np.array(path_pts, dtype=np.float32).copy(),
-            "left": None if left_pts is None else np.array(left_pts, dtype=np.float32).copy(),
-            "right": None if right_pts is None else np.array(right_pts, dtype=np.float32).copy(),
-            "candidate_left": None if candidate_left_pts is None else np.array(candidate_left_pts, dtype=np.float32).copy(),
-            "candidate_right": None if candidate_right_pts is None else np.array(candidate_right_pts, dtype=np.float32).copy(),
-            "merge_guide": None if merge_guide_pts is None else np.array(merge_guide_pts, dtype=np.float32).copy(),
-            "fork_point": None if fork_point is None else (float(fork_point[0]), float(fork_point[1])),
-            "coin_path": coin_path,
-            "control_band": control_band,
-            "bottom_mid": (float(img_w) / 2.0, float(img_h) - 1.0),
-            "base_size": (int(img_w), int(img_h)),
-        }
+        self.debug_overlay.store(
+            path_pts,
+            left_pts,
+            right_pts,
+            img_w,
+            img_h,
+            candidate_left_pts=candidate_left_pts,
+            candidate_right_pts=candidate_right_pts,
+            merge_guide_pts=merge_guide_pts,
+            fork_point=fork_point,
+            coin_path=coin_path,
+            control_band=control_band,
+        )
 
     def draw_path_overlay(self, image):
         """把最近一次搜索得到的主图路径/边界叠加到任意尺寸的画面最上层."""
-        if image is None:
-            return image
-
-        overlay = self.last_main_overlay
-        base_w, base_h = overlay.get("base_size", tuple(config.SEG_SIZE))
-        if base_w <= 0 or base_h <= 0:
-            return image
-
-        img_h, img_w = image.shape[:2]
-        scale_x = img_w / float(base_w)
-        scale_y = img_h / float(base_h)
-        scale = max(scale_x, scale_y)
-
-        def _scaled_polyline(polyline):
-            if polyline is None:
-                return None
-            pts = np.array(polyline, dtype=np.float32).copy().reshape((-1, 1, 2))
-            pts[:, 0, 0] *= scale_x
-            pts[:, 0, 1] *= scale_y
-            return pts.astype(np.int32)
-
-        path_poly = _scaled_polyline(overlay.get("path"))
-        left_poly = _scaled_polyline(overlay.get("left"))
-        right_poly = _scaled_polyline(overlay.get("right"))
-        candidate_left_poly = _scaled_polyline(overlay.get("candidate_left"))
-        candidate_right_poly = _scaled_polyline(overlay.get("candidate_right"))
-        merge_guide_poly = _scaled_polyline(overlay.get("merge_guide"))
-
-        path_thickness = max(1, int(round(config.SEG_DEBUG_PATH_THICKNESS * scale)))
-        boundary_thickness = max(1, int(round(config.SEG_DEBUG_BOUNDARY_THICKNESS * scale)))
-        candidate_path_thickness = max(1, int(round(config.SEG_DEBUG_CANDIDATE_PATH_THICKNESS * scale)))
-        merge_guide_thickness = max(1, int(round(config.SEG_DEBUG_MERGE_GUIDE_THICKNESS * scale)))
-        bottom_mid_radius = max(1, int(round(config.SEG_DEBUG_BOTTOM_MID_RADIUS * scale)))
-        coin_dot_radius = max(1, int(round(config.SEG_DEBUG_COIN_PATH_DOT_RADIUS * scale)))
-        control_band_thickness = max(1, int(round(getattr(config, "SEG_DEBUG_CONTROL_BAND_THICKNESS", 2) * scale)))
-        coin_strict_line_thickness = max(1, int(round(getattr(config, "SEG_DEBUG_COIN_BOTTOM_STRICT_LINE_THICKNESS", 1) * scale)))
-
-        def _scale_point(pt):
-            return (
-                int(round(float(pt[0]) * scale_x)),
-                int(round(float(pt[1]) * scale_y)),
-            )
-
-        if bool(getattr(config, "SEG_DEBUG_DRAW_CANDIDATE_PATHS", False)) and candidate_left_poly is not None:
-            cv2.polylines(
-                image,
-                [candidate_left_poly],
-                False,
-                config.SEG_DEBUG_LEFT_PATH_COLOR,
-                candidate_path_thickness,
-            )
-        if bool(getattr(config, "SEG_DEBUG_DRAW_CANDIDATE_PATHS", False)) and candidate_right_poly is not None:
-            cv2.polylines(
-                image,
-                [candidate_right_poly],
-                False,
-                config.SEG_DEBUG_RIGHT_PATH_COLOR,
-                candidate_path_thickness,
-            )
-        if path_poly is not None:
-            cv2.polylines(
-                image,
-                [path_poly],
-                False,
-                config.SEG_DEBUG_PATH_COLOR,
-                path_thickness,
-            )
-        if bool(getattr(config, "SEG_DEBUG_DRAW_BOUNDARIES", True)) and left_poly is not None:
-            cv2.polylines(
-                image,
-                [left_poly],
-                False,
-                config.SEG_DEBUG_LEFT_BOUNDARY_COLOR,
-                boundary_thickness,
-            )
-        if bool(getattr(config, "SEG_DEBUG_DRAW_BOUNDARIES", True)) and right_poly is not None:
-            cv2.polylines(
-                image,
-                [right_poly],
-                False,
-                config.SEG_DEBUG_RIGHT_BOUNDARY_COLOR,
-                boundary_thickness,
-            )
-        if bool(getattr(config, "SEG_DEBUG_DRAW_MERGE_GUIDE", True)) and merge_guide_poly is not None:
-            cv2.polylines(
-                image,
-                [merge_guide_poly],
-                False,
-                config.SEG_DEBUG_MERGE_GUIDE_COLOR,
-                merge_guide_thickness,
-                cv2.LINE_AA,
-            )
-
-        control_band = overlay.get("control_band")
-        if bool(getattr(config, "SEG_DEBUG_CONTROL_BAND_ENABLED", True)) and control_band is not None:
-            try:
-                y_min = float(control_band[0])
-                y_max = float(control_band[1])
-                y1 = int(round(np.clip(y_min * scale_y, 0, img_h - 1)))
-                y2 = int(round(np.clip(y_max * scale_y, 0, img_h - 1)))
-                color = getattr(config, "SEG_DEBUG_CONTROL_BAND_COLOR", (255, 0, 255))
-                cv2.line(image, (0, y1), (img_w - 1, y1), color, control_band_thickness, cv2.LINE_AA)
-                cv2.line(image, (0, y2), (img_w - 1, y2), color, control_band_thickness, cv2.LINE_AA)
-            except Exception:
-                pass
-
-        if bool(getattr(config, "SEG_DEBUG_COIN_BOTTOM_STRICT_LINE_ENABLED", True)):
-            strict_rows = float(getattr(config, "COIN_PATH_ROI_BOTTOM_STRICT_ROWS", 0.0))
-            if strict_rows > 0.0:
-                strict_y = int(round((float(base_h) - strict_rows) * scale_y))
-                strict_y = max(0, min(img_h - 1, strict_y))
-                cv2.line(
-                    image,
-                    (0, strict_y),
-                    (img_w - 1, strict_y),
-                    getattr(config, "SEG_DEBUG_COIN_BOTTOM_STRICT_LINE_COLOR", (0, 0, 255)),
-                    coin_strict_line_thickness,
-                    cv2.LINE_AA,
-                )
-
-        coin_path_debug = overlay.get("coin_path")
-        if bool(getattr(config, "SEG_DEBUG_COIN_PATH_ENABLED", True)) and coin_path_debug:
-            coin_planned_poly = _scaled_polyline(coin_path_debug.get("planned_path"))
-            if coin_planned_poly is not None:
-                cv2.polylines(
-                    image,
-                    [coin_planned_poly],
-                    False,
-                    config.SEG_DEBUG_COIN_PATH_COLOR,
-                    max(1, path_thickness),
-                    cv2.LINE_AA,
-                )
-            for pt in coin_path_debug.get("coin_points", []):
-                cv2.circle(
-                    image,
-                    _scale_point(pt),
-                    coin_dot_radius,
-                    config.SEG_DEBUG_COIN_PATH_COLOR,
-                    -1,
-                    cv2.LINE_AA,
-                )
-
-        bottom_mid = overlay.get("bottom_mid", (float(base_w) / 2.0, float(base_h) - 1.0))
-        bottom_mid_pt = _scale_point(bottom_mid)
-        fork_point = overlay.get("fork_point")
-        if fork_point is not None:
-            fork_pt = _scale_point(fork_point)
-            fork_bottom_pt = _scale_point((float(fork_point[0]), float(base_h) - 1.0))
-            cv2.line(
-                image,
-                fork_pt,
-                fork_bottom_pt,
-                config.SEG_DEBUG_FORK_DIVIDER_COLOR,
-                max(1, int(round(config.SEG_DEBUG_FORK_DIVIDER_THICKNESS * scale))),
-                cv2.LINE_AA,
-            )
-        cv2.circle(
-            image,
-            bottom_mid_pt,
-            bottom_mid_radius,
-            config.SEG_DEBUG_BOTTOM_MID_COLOR,
-            -1,
-        )
-        return image
+        return self.debug_overlay.draw(image)
 
     def _profile_add(self, infer_s, preprocess_s, search_s, fit_s, render_s, total_s, queue_wait_s=None):
         """按阶段统计分割链路耗时，节流打印用于定位掉帧瓶颈。"""
-        if not bool(getattr(config, "SEG_PROFILE_LOG_ENABLED", False)):
-            return
-
-        current = {
-            "infer": float(infer_s),
-            "prep": float(preprocess_s),
-            "search": float(search_s),
-            "fit": float(fit_s),
-            "render": float(render_s),
-            "total": float(total_s),
-            "queue_wait": float(queue_wait_s) if queue_wait_s is not None else 0.0,
-        }
-        # 把 measued total 与分阶段之和的差作为 overhead，便于保持打印一致性
-        stage_sum = (
-            current["infer"] + current["prep"] + current["search"] + current["fit"] + current["render"]
-        )
-        current_overhead = float(current["total"] - stage_sum)
-        current["overhead"] = current_overhead
-
-        if self.profile_ema is None:
-            self.profile_ema = current
-        else:
-            alpha = 0.85
-            # 将 overhead 纳入 EMA，使得各项平滑后仍能恢复出一致的 total
-            keys = set(list(self.profile_ema.keys()) + list(current.keys()))
-            self.profile_ema = {
-                key: alpha * float(self.profile_ema.get(key, 0.0)) + (1.0 - alpha) * float(current.get(key, 0.0))
-                for key in keys
-            }
-
-        now = time.time()
-        interval = float(getattr(config, "SEG_PROFILE_LOG_INTERVAL", 2.0))
-        if now - self.profile_last_log < interval:
-            return
-        self.profile_last_log = now
-
-        avg = self.profile_ema
-        # 使用各阶段平滑后的和作为显示的 total（包含 overhead）以保证一致性
-        total_for_print = (
-            float(avg.get("infer", 0.0))
-            + float(avg.get("prep", 0.0))
-            + float(avg.get("search", 0.0))
-            + float(avg.get("fit", 0.0))
-            + float(avg.get("render", 0.0))
-            + float(avg.get("overhead", 0.0))
-        )
-        queue_wait_avg = float(avg.get("queue_wait", 0.0))
-        fps_est = 1.0 / max(float(total_for_print), 1e-6)
-        print(
-            "SegProfile "
-            f"infer={avg['infer'] * 1000.0:.1f}ms "
-            f"prep={avg['prep'] * 1000.0:.1f}ms "
-            f"search={avg['search'] * 1000.0:.1f}ms "
-            f"fit={avg['fit'] * 1000.0:.1f}ms "
-            f"render={avg['render'] * 1000.0:.1f}ms "
-            f"queue_wait={queue_wait_avg * 1000.0:.1f}ms "
-            f"total={total_for_print * 1000.0:.1f}ms "
-            f"est={fps_est:.1f}fps",
-            flush=True,
+        self.seg_profile_logger.add(
+            infer_s=infer_s,
+            preprocess_s=preprocess_s,
+            search_s=search_s,
+            fit_s=fit_s,
+            render_s=render_s,
+            total_s=total_s,
+            queue_wait_s=queue_wait_s,
         )
 
     def _path_stability_enabled(self):
@@ -2145,111 +1921,6 @@ class RoadSegmentor:
 
         return planning_items
 
-    def _compute_weighted_steer_signal(self, path_points, img_w, img_h, center_bias_x=0.0):
-        """按“路径点到底部中点连线斜率”的加权平均聚合单一控制量."""
-        if path_points is None or len(path_points) == 0:
-            return 0.0
-
-        pts = np.array(path_points, dtype=np.float32).reshape((-1, 2))
-        # 以图像几何中线为 0；绕车时只临时偏移控制基准，不改普通循线路径点。
-        bottom_mid_x = float(img_w) / 2.0 + float(center_bias_x)
-        bottom_y = float(img_h) - 1.0
-        min_dy = float(config.STEER_SIGNAL_MIN_DY)
-        row_gamma = float(getattr(config, "STEER_SIGNAL_ROW_WEIGHT_GAMMA", 1.0))
-
-        dy = np.maximum(bottom_y - pts[:, 1], min_dy)
-        slopes = (pts[:, 0] - bottom_mid_x) / dy
-        row_weights = np.power(np.clip(pts[:, 1], 0.0, bottom_y), row_gamma)
-        weight_sum = float(np.sum(row_weights))
-        if weight_sum <= 1e-6:
-            return 0.0
-        slope_signal = float(np.sum(slopes * row_weights) / weight_sum)
-        slope_signal *= float(getattr(config, "STEER_SIGNAL_NORMALIZED_SCALE", 1.0))
-
-        return slope_signal
-
-    def _compute_stanley_band_steer_signal(self, path_points, img_w, img_h, center_bias_x=0.0, lateral_points=None):
-        """按单前视行 Stanley 公式计算转向量."""
-        if path_points is None or len(path_points) == 0:
-            return None
-
-        pts = np.array(path_points, dtype=np.float32).reshape((-1, 2))
-        min_fit_points = max(2, int(getattr(config, "STANLEY_MIN_FIT_POINTS", 3)))
-        if len(pts) < min_fit_points:
-            return None
-
-        bottom_mid_x = float(img_w) / 2.0 + float(center_bias_x)
-        bottom_y = float(img_h) - 1.0
-        lookahead_y = float(getattr(config, "STANLEY_LOOKAHEAD_Y", 110.0))
-        lookahead_y = float(np.clip(lookahead_y, 0.0, bottom_y))
-
-        path_x = None
-        if lateral_points is not None and len(lateral_points) > 0:
-            lateral_pts = np.array(lateral_points, dtype=np.float32).reshape((-1, 2))
-            half_window = max(0.0, float(getattr(config, "STANLEY_LATERAL_AVG_HALF_WINDOW", 5.0)))
-            lateral_mask = np.abs(lateral_pts[:, 1] - lookahead_y) <= half_window
-            window_pts = lateral_pts[lateral_mask]
-            if len(window_pts) > 0:
-                path_x = float(np.mean(window_pts[:, 0]))
-        if path_x is None:
-            path_x = self._path_x_at_y_points(pts, lookahead_y)
-        if path_x is None:
-            return None
-        lateral_error = float(path_x) - bottom_mid_x
-
-        # x = a*y^2 + b*y + c。图像 y 向下增大，所以从车身看向前方的航向角约为 atan(-dx/dy)。
-        try:
-            poly_coeffs = self._fit_path_poly_coeffs(pts[:, 1], pts[:, 0])
-        except Exception:
-            return None
-        if poly_coeffs is None or len(poly_coeffs) < 3:
-            return None
-
-        a = float(poly_coeffs[0])
-        b = float(poly_coeffs[1])
-        heading_y = float(getattr(config, "STANLEY_HEADING_LOOKAHEAD_Y", lookahead_y))
-        heading_y = float(np.clip(heading_y, 0.0, bottom_y))
-        curvature_y = float(getattr(config, "STANLEY_CURVATURE_LOOKAHEAD_Y", heading_y))
-        curvature_y = float(np.clip(curvature_y, 0.0, bottom_y))
-
-        heading_dx_dy = 2.0 * a * heading_y + b
-        curvature_dx_dy = 2.0 * a * curvature_y + b
-        heading_error = float(np.arctan(-heading_dx_dy))
-        curvature = float((2.0 * a) / np.power(1.0 + curvature_dx_dy * curvature_dx_dy, 1.5))
-
-        soft = max(1e-6, float(getattr(config, "STANLEY_SOFT", 24.0)))
-        lateral_gain = float(getattr(config, "STANLEY_LATERAL_GAIN", 0.028))
-        speed_estimate = max(0.0, float(getattr(config, "STANLEY_SPEED_ESTIMATE", 0.0)))
-        heading_gain = float(getattr(config, "STANLEY_HEADING_GAIN", 0.85))
-        curvature_gain = float(getattr(config, "STANLEY_CURVATURE_FF_GAIN", 0.0))
-        wheelbase_m = float(getattr(config, "STANLEY_WHEELBASE_M", 0.20))
-        signal_scale = float(getattr(config, "STANLEY_SIGNAL_SCALE", 950.0))
-
-        lateral_term = float(np.arctan(lateral_gain * lateral_error / (speed_estimate + soft)))
-        heading_term = heading_gain * heading_error
-        curvature_term = curvature_gain * float(np.arctan(wheelbase_m * curvature))
-        return (lateral_term + heading_term + curvature_term) * signal_scale
-
-    def _compute_control_steer_signal(self, path_points, img_w, img_h, center_bias_x=0.0, lateral_points=None):
-        """按配置选择转向控制器；试验控制器不可用时回退到原算法."""
-        mode = str(getattr(config, "STEER_CONTROL_MODE", "weighted_slope")).lower()
-        if mode == "stanley_band":
-            stanley_signal = self._compute_stanley_band_steer_signal(
-                path_points,
-                img_w,
-                img_h,
-                center_bias_x=center_bias_x,
-                lateral_points=lateral_points,
-            )
-            if stanley_signal is not None and np.isfinite(stanley_signal):
-                return float(stanley_signal)
-        return self._compute_weighted_steer_signal(
-            path_points,
-            img_w,
-            img_h,
-            center_bias_x=center_bias_x,
-        )
-
     def _build_single_row_control_points(self, path_points, img_h, y_ratio=None):
         """把整条路径压成单行控制点，降低无金币时的抖动."""
         if path_points is None or len(path_points) == 0:
@@ -2279,28 +1950,6 @@ class RoadSegmentor:
         selected = pts[pts[:, 1] >= y_min]
         if len(selected) == 0:
             return None
-        return selected.astype(np.float32)
-
-    def _select_no_target_control_points(self, path_points, img_h):
-        """无金币/无车时，使用指定行段；若上边界缺失则用最上端点补齐。"""
-        if path_points is None or len(path_points) == 0:
-            return None
-
-        pts = np.array(path_points, dtype=np.float32).reshape((-1, 2))
-        row_min = float(getattr(config, "STEER_SIGNAL_NO_TARGET_ROW_MIN", 60.0))
-        row_max = float(getattr(config, "STEER_SIGNAL_NO_TARGET_ROW_MAX", 130.0))
-        lo = max(0.0, min(row_min, row_max))
-        hi = min(float(img_h) - 1.0, max(row_min, row_max))
-        if hi < lo:
-            return None
-
-        selected = pts[(pts[:, 1] >= lo) & (pts[:, 1] <= hi)]
-        if len(selected) == 0:
-            return None
-        selected = selected[np.argsort(selected[:, 1])]
-        if float(selected[0, 1]) > lo:
-            top_pad = np.array([[float(selected[0, 0]), lo]], dtype=np.float32)
-            selected = np.vstack([top_pad, selected])
         return selected.astype(np.float32)
 
     def _path_x_at_y_points(self, path_points, y):
@@ -3078,7 +2727,7 @@ class RoadSegmentor:
         preview_frame=None,
         external_left_bias_x=0.0,
     ):
-        """对已推理出的 mask 做路径规划、控制量计算和调试渲染.
+        """对已推理出的 mask 做路径规划、控制器调用和调试渲染.
 
         输入:
         - blob_rgb_320: 分割线程当前拿到的最新 SEG_SIZE RGB 图
@@ -3087,7 +2736,7 @@ class RoadSegmentor:
         - turn_intent: OCR/LLM 给出的 LEFT / RIGHT 分叉意图；石头优先，无石头时参与分支选择
 
         输出:
-        - steer_signal: 单一转向控制量，来自路径点加权斜率和
+        - steer_signal: 单一转向控制量，来自 PathController 当前选中的 A/B/C 控制器
         - ai_view: SEG_SIZE 空间调试图，主线程会再放大回 TARGET_RES
         """
         t_total_start = time.perf_counter() if total_start is None else float(total_start)
@@ -3394,12 +3043,16 @@ class RoadSegmentor:
                     lateral_control_points = coin_path_debug["control_points"]
             else:
                 control_mode = str(getattr(config, "STEER_CONTROL_MODE", "weighted_slope")).lower()
-                if control_mode != "stanley_band":
-                    no_target_points = self._select_no_target_control_points(path_points_orig, h_seg)
-                    if no_target_points is not None:
-                        control_path_points = no_target_points
-                        lateral_control_points = no_target_points
-            steer_signal = self._compute_control_steer_signal(
+                if control_mode == "weighted_slope":
+                    weighted_points = self.path_controller.select_control_points(
+                        control_mode,
+                        path_points_orig,
+                        h_seg,
+                    )
+                    if weighted_points is not None:
+                        control_path_points = weighted_points
+                        lateral_control_points = weighted_points
+            steer_signal = self.path_controller.compute_steer_signal(
                 control_path_points,
                 w_seg,
                 h_seg,
@@ -3415,36 +3068,44 @@ class RoadSegmentor:
                 steer_signal *= float(getattr(config, "STEER_SIGNAL_NO_TARGET_GAIN", 1.0))
             control_band = None
             lateral_debug_points = None
-            if control_path_points is not None and len(control_path_points) > 0:
-                control_pts = np.array(control_path_points, dtype=np.float32).reshape((-1, 2))
-                control_band = (
-                    float(np.min(control_pts[:, 1])),
-                    float(np.max(control_pts[:, 1])),
-                )
-                control_mode = str(getattr(config, "STEER_CONTROL_MODE", "weighted_slope")).lower()
-                if control_mode == "stanley_band":
-                    lookahead_y = float(getattr(config, "STANLEY_LOOKAHEAD_Y", 110.0))
-                    lookahead_y = float(np.clip(lookahead_y, 0.0, float(h_seg) - 1.0))
-                    control_band = (
-                        lookahead_y,
-                        lookahead_y,
-                    )
+            control_mode = str(getattr(config, "STEER_CONTROL_MODE", "weighted_slope")).lower()
+            control_band = self.path_controller.control_band_for_mode(
+                control_mode,
+                control_path_points,
+                h_seg,
+            )
             pts_final_orig = path_points_orig.reshape((-1, 1, 2))
         else:
             held_path = self._hold_last_path()
             if held_path is not None:
                 path_points_orig = held_path
-                steer_signal = self._compute_control_steer_signal(path_points_orig, w_seg, h_seg)
-                control_band = None
-                if path_points_orig is not None and len(path_points_orig) > 0:
-                    control_pts = np.array(path_points_orig, dtype=np.float32).reshape((-1, 2))
-                    control_band = (
-                        float(np.min(control_pts[:, 1])),
-                        float(np.max(control_pts[:, 1])),
+                control_path_points = path_points_orig
+                lateral_control_points = path_points_orig
+                control_mode = str(getattr(config, "STEER_CONTROL_MODE", "weighted_slope")).lower()
+                if control_mode == "weighted_slope":
+                    weighted_points = self.path_controller.select_control_points(
+                        control_mode,
+                        path_points_orig,
+                        h_seg,
                     )
+                    if weighted_points is not None:
+                        control_path_points = weighted_points
+                        lateral_control_points = weighted_points
+                steer_signal = self.path_controller.compute_steer_signal(
+                    control_path_points,
+                    w_seg,
+                    h_seg,
+                    lateral_points=lateral_control_points,
+                )
+                control_band = self.path_controller.control_band_for_mode(
+                    control_mode,
+                    control_path_points,
+                    h_seg,
+                )
                 pts_final_orig = path_points_orig.reshape((-1, 1, 2))
             else:
                 self.last_poly_coeffs = None
+                self.path_controller.reset()
         self.last_branch_stats = {
             "branch_pair_count_max": int(branch_pair_count_max),
             "branch_support_rows": int(branch_support_rows),
@@ -3515,81 +3176,25 @@ class RoadSegmentor:
             ai_view = self.draw_path_overlay(ai_view)
 
         pwm_gain = float(config.STEER_SIGNAL_PWM_GAIN)
-        if str(getattr(config, "STEER_CONTROL_MODE", "weighted_slope")).lower() == "stanley_band":
-            pwm_gain = float(getattr(config, "STANLEY_PWM_GAIN", config.STEER_SIGNAL_PWM_GAIN))
+        control_mode = str(getattr(config, "STEER_CONTROL_MODE", "weighted_slope")).lower()
+        if control_mode == "stanley_band":
+            pwm_gain = float(getattr(config, "STANLEY_PWM_GAIN", 0.012))
+        elif control_mode == "control_c":
+            pwm_gain = float(getattr(config, "CONTROL_C_PWM_GAIN", 12.0))
         servo_pwm = int(
             config.SERVO_CENTER
             - steer_signal * pwm_gain
         )
         servo_pwm = int(max(config.SERVO_MIN, min(config.SERVO_MAX, servo_pwm)))
-        cv2.putText(
+        draw_seg_status_text(
             ai_view,
-            f"Seg FPS:{fps_stats.get('seg_fps', 0):.1f} YOLO:{fps_stats.get('yolo_fps', 0):.1f}",
-            config.SEG_DEBUG_TEXT_POS_FPS,
-            1,
-            config.SEG_DEBUG_TEXT_FONT_SCALE,
-            config.SEG_DEBUG_TEXT_COLOR_FPS,
-            config.SEG_DEBUG_TEXT_THICKNESS,
+            fps_stats=fps_stats,
+            steer_signal=steer_signal,
+            servo_pwm=servo_pwm,
+            branch_stats=self.last_branch_stats,
+            stone_branch_side=stone_branch_side if 'stone_branch_side' in locals() else None,
+            coin_path_debug=coin_path_debug,
         )
-        cv2.putText(
-            ai_view,
-            f"Ctrl:{steer_signal:.1f} PWM:{servo_pwm}",
-            config.SEG_DEBUG_TEXT_POS_CTRL,
-            1,
-            config.SEG_DEBUG_TEXT_FONT_SCALE,
-            config.SEG_DEBUG_TEXT_COLOR_CTRL,
-            config.SEG_DEBUG_TEXT_THICKNESS,
-        )
-        stone_side_text = "UNK"
-        if 'stone_branch_side' in locals():
-            if stone_branch_side == -1:
-                stone_side_text = "LEFT"
-            elif stone_branch_side == 1:
-                stone_side_text = "RIGHT"
-            else:
-                stone_side_text = "NONE"
-        cv2.putText(
-            ai_view,
-            f"Stone:{stone_side_text}",
-            config.SEG_DEBUG_TEXT_POS_STONE,
-            1,
-            config.SEG_DEBUG_TEXT_FONT_SCALE,
-            config.SEG_DEBUG_TEXT_COLOR_STONE,
-            config.SEG_DEBUG_TEXT_THICKNESS,
-        )
-        cv2.putText(
-            ai_view,
-            (
-                f"PairsMax:{self.last_branch_stats.get('branch_pair_count_max', 0)} "
-                f"Rows2+:{self.last_branch_stats.get('branch_support_rows', 0)} "
-                f"Y:{int(self.last_branch_stats.get('y_fork_active', False))} "
-                f"Merge:{self.last_branch_stats.get('merge_side') or 'NONE'}"
-            ),
-            config.SEG_DEBUG_TEXT_POS_BRANCH,
-            1,
-            config.SEG_DEBUG_TEXT_FONT_SCALE,
-            config.SEG_DEBUG_TEXT_COLOR_BRANCH,
-            config.SEG_DEBUG_TEXT_THICKNESS,
-        )
-        if coin_path_debug is not None:
-            cv2.putText(
-                ai_view,
-                (
-                    f"Coin raw:{coin_path_debug.get('raw_coin_items', 0)} "
-                    f"meas:{coin_path_debug.get('coin_measurements', 0)} "
-                    f"pts:{coin_path_debug.get('coin_points_count', 0)} "
-                    f"chg:{int(bool(coin_path_debug.get('path_changed', False)))} "
-                    f"rej:{coin_path_debug.get('reject_car_state', 0)}/"
-                    f"{coin_path_debug.get('reject_blocked', 0)} "
-                    f"st:{str(coin_path_debug.get('car_state', ''))[:3]} "
-                    f"gate:{int(bool(coin_path_debug.get('car_gate_active', False)))}"
-                ),
-                config.SEG_DEBUG_TEXT_POS_COIN,
-                1,
-                config.SEG_DEBUG_TEXT_FONT_SCALE,
-                config.SEG_DEBUG_TEXT_COLOR_COIN,
-                config.SEG_DEBUG_TEXT_THICKNESS,
-            )
         t_render_end = time.perf_counter()
         preprocess_s = t_preprocess_end - t_preprocess_start
         search_s = t_search_end - t_search_start

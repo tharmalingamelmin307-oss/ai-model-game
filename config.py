@@ -556,8 +556,8 @@ BAUD_RATE = 115200
 # 当前并不是直接发电机 PWM，而是发一个速度档位：
 # - CONTROL_MIN_SPEED: 常规最低巡航速度
 # - CONTROL_MAX_SPEED: 直道或轻弯时允许的最高速度
-CONTROL_MIN_SPEED = 35
-CONTROL_MAX_SPEED = 35
+CONTROL_MIN_SPEED = 40
+CONTROL_MAX_SPEED = 40
 
 # 用单一转向控制量做动态降速时的增益。
 # 控制量绝对值越大，说明当前横向偏差/路径趋势越强，目标速度会随之降低。
@@ -577,7 +577,7 @@ CONTROL_SPEED_MAX_STEP_DOWN = 2
 
 # 舵机中心值。
 # 这是“车身理论正前方”对应的 PWM。
-# 如果车辆总是轻微向一侧跑，即使视觉误差正常，也可能需要先调这里。
+# 当前 750 已确认机械中直；除非重新装舵机/连杆，否则不把它当控制参数来调。
 SERVO_CENTER = 750
 
 # 舵机安全最小/最大 PWM。
@@ -586,10 +586,11 @@ SERVO_MIN, SERVO_MAX = 590, 910
 
 # 当前启用的转向控制器。
 # - "weighted_slope": 算法 A，原始稳定算法。把路径点到底部中点的斜率做远近加权平均。
-# - "stanley_band": 算法 B，单前视行 Stanley 公式。默认取 y=110 计算 e / psi / kappa。
-# 如果 stanley_band 点数不足或拟合失败，会自动回退到 weighted_slope。
+# - "stanley_band": 算法 B，按 STANLEY_* 前视行计算 e / psi / kappa。
+# - "control_c": 算法 C，线性 PD + 航向抑制: Kp*e + Kd*de - Kyaw*psi。
 # STEER_CONTROL_MODE = "weighted_slope"
 STEER_CONTROL_MODE = "stanley_band"
+# STEER_CONTROL_MODE = "control_c"
 
 
 # ---------------------------------------------------------------------------
@@ -597,12 +598,12 @@ STEER_CONTROL_MODE = "stanley_band"
 # ---------------------------------------------------------------------------
 # 下面这组只服务算法 A。
 # 当 STEER_CONTROL_MODE = "weighted_slope" 时，它们作为主转向算法使用。
-# 当 STEER_CONTROL_MODE = "stanley_band" 但 B 算法点数不足/拟合失败时，会临时回退到 A 算法。
 #
 # 算法公式：
 #   slope = (path_x - image_bottom_center_x) / max(image_bottom_y - path_y, STEER_SIGNAL_MIN_DY)
 #   weight = path_y ** STEER_SIGNAL_ROW_WEIGHT_GAMMA
-#   steer_signal = sum(slope * weight) / sum(weight) * STEER_SIGNAL_NORMALIZED_SCALE
+#   p = sum(slope * weight) / sum(weight) * STEER_SIGNAL_NORMALIZED_SCALE
+#   steer_signal = p + Kd * d(p_ema)
 #
 # A 算法 steer_signal 到舵机 PWM 的映射增益。
 # 注意：B 算法正常工作时不用它；B 算法使用 STANLEY_PWM_GAIN。
@@ -612,7 +613,7 @@ STEER_CONTROL_MODE = "stanley_band"
 # 调小:
 # - 舵机更稳
 # - 但可能转不过弯
-STEER_SIGNAL_PWM_GAIN = 0.012
+STEER_SIGNAL_PWM_GAIN = 0.02
 
 # 计算“点到底部中点连线斜率”时使用的最小纵向间距。
 # 作用是防止路径底部附近的点因为 dy 过小，把控制量瞬间放得过大。
@@ -623,59 +624,136 @@ STEER_SIGNAL_ROW_WEIGHT_GAMMA = 1.3
 # 归一化控制量缩放。归一化后原始 steer_signal 常为个位数，
 # 这里把它放大到更接近旧版累计控制量的显示和 PWM 调参量级。
 STEER_SIGNAL_NORMALIZED_SCALE = 3000.0
+# A 算法输出端 D 系数，作用在 EMA 后 steer_signal 的帧间变化量上。
+# 默认关闭；想试 A+PD 时先从 0.05 ~ 0.25 小步加。
+STEER_SIGNAL_D_GAIN = 0.5
+# D 项使用前先对 A 的 steer_signal 做 EMA 平滑。数值越大越稳，但 D 项反应越慢。
+STEER_SIGNAL_D_EMA_ALPHA = 0.3
+# A 算法普通巡线时只使用这段 y 行范围内的路径点。
+# 这两个值是 SEG_SIZE 坐标里的 y 行号；y 越小表示看得越远。
+# 如果中线最上端低于 SAMPLE_ROW_MIN，会额外补一个 SAMPLE_ROW_MIN 行的点，x 使用最上端点。
+WEIGHTED_SLOPE_SAMPLE_ROW_MIN = 10.0
+WEIGHTED_SLOPE_SAMPLE_ROW_MAX = 90.0
 
 
 # ---------------------------------------------------------------------------
-# 转向算法 B: 单前视行 Stanley 参数
+# 转向算法 B: 前视行 Stanley 参数
 # ---------------------------------------------------------------------------
 # B 算法按图中公式计算:
-#   delta = atan(k * e / (v_s + k_soft)) + g_psi * psi_e + g_ff * atan(L * kappa)
+#   delta = atan(k * e / (v_s + k_soft)) + Kd * de + g_psi * psi_e + g_ff * atan(L * kappa)
 # 这里不做逆透视，仍工作在 SEG_SIZE 图像坐标里:
 # - e: 拟合路径在 STANLEY_LOOKAHEAD_Y 这一行相对车身中线的横向误差，单位: pixel
-# - psi_e: 拟合路径在同一行的切线航向误差，单位: rad
-# - kappa: 拟合路径在同一行的图像曲率，单位近似为 1/pixel
+# - de: e 经过 EMA 后的帧间变化量，单位: pixel/frame
+# - psi_e: 拟合路径在 STANLEY_HEADING_LOOKAHEAD_Y 这一行的切线航向误差，单位: rad
+# - kappa: 拟合路径在 STANLEY_CURVATURE_LOOKAHEAD_Y 这一行的图像曲率，单位近似为 1/pixel
 # 因为速度暂时只有编码器档位，v_s 先用 STANLEY_SPEED_ESTIMATE 这个调参量。
-STANLEY_PWM_GAIN = STEER_SIGNAL_PWM_GAIN
+# B 算法专用 PWM 映射增益。这里写成独立数值，不引用 A 的 STEER_SIGNAL_PWM_GAIN。
+STANLEY_PWM_GAIN = 0.015
 
 # 横向误差前视行，SEG_SIZE 坐标系。图像 y 越小表示看得越远。
-STANLEY_LOOKAHEAD_Y = 70.0
+STANLEY_LOOKAHEAD_Y = 100.0
 # 航向误差前视行。
 STANLEY_HEADING_LOOKAHEAD_Y = 70.0
 # 曲率前馈前视行，选得比横向/航向更远，用来提前感知大弯。
-STANLEY_CURVATURE_LOOKAHEAD_Y = 40.0
+STANLEY_CURVATURE_LOOKAHEAD_Y = 30.0
 # 横向误差优先使用拟合前中心点在前视行附近的平均值，减少拟合线底部失真影响。
 STANLEY_LATERAL_AVG_HALF_WINDOW = 5.0
 # 横向误差增益 k，控制 atan(k * e / (v_s + soft)) 的纠偏力度。
-STANLEY_LATERAL_GAIN = 0.5
+STANLEY_LATERAL_GAIN = 0.6
+# 横向 D 系数 Kd，作用在 EMA 后横向误差的帧间变化量 de 上。
+# 默认关闭；想试 B+d 时先从很小值开始，例如 0.0005 ~ 0.003。
+STANLEY_LATERAL_D_GAIN = 0.020
+# D 项使用前先对 e 做 EMA 平滑。数值越大越稳，但 D 项反应越慢。
+STANLEY_LATERAL_D_EMA_ALPHA = 0.0
 # 航向误差增益 g_psi。
-STANLEY_HEADING_GAIN = 0.35
+STANLEY_HEADING_GAIN = 0.20
 # 曲率前馈增益 g_ff。图像坐标曲率不是物理曲率，第一版默认关闭。
-STANLEY_CURVATURE_FF_GAIN = 0.1
+STANLEY_CURVATURE_FF_GAIN = 0.0
 # 轴距 L，单位 m。当前只用于曲率前馈；若 g_ff=0 则不影响输出。
 STANLEY_WHEELBASE_M = 0.20
-# 速度估计 v_s。真实编码器速度未换算前，先当调参量使用。
+# 速度估计 v_s。当前仅算法 B 使用。
 STANLEY_SPEED_ESTIMATE = CONTROL_MAX_SPEED
-# 横向误差软化常数，放在 atan(k * lateral_error / soft) 的分母里。
-# 增大：横向修正更温和，抑制抖动。
-# 减小：横向修正更敏感，适合舵机反应慢或车速低但可能更抖。
-STANLEY_SOFT = 50.0
+# 横向误差软化常数。当前仅算法 B 使用。
+STANLEY_SOFT = 60.0
 # Stanley 两项相加后的整体输出缩放。
 # 它决定最终 steer_signal 的量级，再由 STANLEY_PWM_GAIN 映射成 PWM。
 # 增大：整体舵机幅度变大；减小：整体舵机幅度变小。
 STANLEY_SIGNAL_SCALE = 10000.0
 
-# 拟合至少需要的路径点数；不足时自动回退 weighted_slope。
+# 拟合至少需要的路径点数；不足时当前算法输出 0，不切换到其它控制器。
 STANLEY_MIN_FIT_POINTS = 3
 
 
 # ---------------------------------------------------------------------------
-# 转向模式增益与控制取样窗口
+# 转向算法 C: 线性 PD + 航向抑制参数
 # ---------------------------------------------------------------------------
-# 无金币/无车时，控制只看中下部这一段，底部最靠下 30 行不参与。
-# 这两个值是分割图坐标里的 y 行号；当前 10~120 表示取远处到中下部路径。
-# 如果中线最上端低于 ROW_MIN，会额外补一个 ROW_MIN 行的点，x 使用最上端点。
-STEER_SIGNAL_NO_TARGET_ROW_MIN = 10.0
-STEER_SIGNAL_NO_TARGET_ROW_MAX = 120.0
+# C 算法是你现在要调的“中线误差 PD - 航向抑制”控制器。
+#
+# 计算流程:
+# 1. 在 CONTROL_C_LOOKAHEAD_Y 附近取拟合前中心点的平均 x，得到横向误差 e。
+#    e = 路径中心 x - 图像/车身中心 x，单位 pixel。
+# 2. 对 e 做 EMA 平滑，得到 e_filtered。
+# 3. de = 本帧 e_filtered - 上一帧 e_filtered。
+# 4. 在 CONTROL_C_HEADING_LOOKAHEAD_Y 处从拟合线切线算航向误差 psi，单位 rad。
+# 5. 输出:
+#      steer_signal = Kp * e_filtered + Kd * de - Kyaw * psi
+#      servo_pwm = SERVO_CENTER - steer_signal * CONTROL_C_PWM_GAIN
+#
+# 正负号说明:
+# - e > 0 表示路径中心在图像右侧，控制量按当前符号约定增大。
+# - psi 是拟合线航向误差；这里用 -Kyaw * psi，当作航向抑制项，不让横向 P/D 一直追过头。
+#
+# 调参优先级建议（当前 SERVO_CENTER=750 已确认机械中直，不把它当控制参数来调）:
+# 1. 只调 CONTROL_C_LATERAL_GAIN，让车能回到中线。
+# 2. 再加 CONTROL_C_LATERAL_D_GAIN，压住过冲和慢摆。
+# 3. 最后小幅加 CONTROL_C_HEADING_GAIN，只做抑制，不要让它变成主控制。
+
+# C 算法专用 PWM 映射增益，只影响最终舵机幅度，不改变 control 内部比例。
+# 调大：同样 steer_signal 下舵机打得更大；调小：舵机更温和。
+CONTROL_C_PWM_GAIN = 1.0
+
+# 横向误差 e 的取样行，SEG_SIZE 坐标系里 y 越小表示看得越远。
+# 取小一点：提前看弯，反应更早，但可能更抖/更受远处误差影响。
+# 取大一点：看近处，贴近车前实际位置，但高速和大弯可能反应慢。
+CONTROL_C_LOOKAHEAD_Y = 120.0
+
+# 航向误差 psi 的取样行，通常先和 CONTROL_C_LOOKAHEAD_Y 保持一致。
+# 如果想让航向项更像“提前抑制大弯”，可以比横向行更远一些，也就是 y 更小。
+CONTROL_C_HEADING_LOOKAHEAD_Y = 35.0
+
+# 横向误差 e 不是直接取拟合曲线，而是在 CONTROL_C_LOOKAHEAD_Y 附近取拟合前中心点平均。
+# 这里是半窗口高度，5 表示取 y±5 行内的中心点平均。
+# 调大：e 更稳，但会变钝；调小：e 更灵敏，但更容易抖。
+CONTROL_C_LATERAL_AVG_HALF_WINDOW = 5.0
+
+# 横向 P 系数 Kp，单位约为 steer_signal/pixel，决定“离中线越远，打角越大”的力度。
+# 调大：回中更快、大弯更能拉回来；过大容易左右摆、贴边后反打过猛。
+# 调小：更稳；过小会回正慢、一直偏在一侧。
+CONTROL_C_LATERAL_GAIN = 0.4
+
+# 横向 D 系数 Kd，作用在 de 上，主要压过冲和慢摆。
+# 调大：更能刹住横向误差变化，出弯回正更利落；过大容易细碎抖。
+# 调小：舵机动作更柔；过小会像纯 P，一偏一拉，来回慢摆。
+CONTROL_C_LATERAL_D_GAIN = 0.0
+
+# D 项使用前先对 e 做 EMA 平滑。数值越大，越相信上一帧，de 越平滑。
+# 调大：D 项更稳、更不抖，但反应更慢。
+# 调小：D 项更灵敏，但更容易把图像/路径微小变化放成舵机抖动。
+CONTROL_C_LATERAL_D_EMA_ALPHA = 0.0
+
+# 航向抑制系数 Kyaw，对应公式里的 -Kyaw * psi。
+# 它应该是辅助阻尼，不建议一上来调大。
+# 调大：能压直线小幅打角和出弯拖尾；过大会和横向 P/D 打架，导致弯里转不过或回正奇怪。
+# 调小：更少干预横向控制；如果为 0，就是纯横向 PD。
+CONTROL_C_HEADING_GAIN = 0.0
+
+# 拟合线至少需要的路径点数；不足时 control_c 输出 0，不会自动切到其它控制器。
+CONTROL_C_MIN_FIT_POINTS = 3
+
+
+# ---------------------------------------------------------------------------
+# 转向模式增益
+# ---------------------------------------------------------------------------
 # 无目标控制增益：只在没有金币、没有避障车时乘到 steer_signal 上。
 # 可用于补偿无目标控制行段变短、归一化后转向偏软等情况。
 STEER_SIGNAL_NO_TARGET_GAIN = 1.0
@@ -960,7 +1038,7 @@ SERIAL_PACKET_TAIL = (0x0D, 0x0A)
 # - 太小: 更灵敏，但更吃 CPU
 # - 太大: 更省资源，但会更“顿”
 # 串口控制线程循环间隔。
-CONTROL_LOOP_SLEEP = 0.01
+CONTROL_LOOP_SLEEP = 0.025
 # 共享内存无新帧时的轮询间隔。
 SHM_FRAME_POLL_SLEEP = 0.002
 # 共享内存连接失败后的重试间隔。

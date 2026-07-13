@@ -28,15 +28,17 @@
 ```text
 .
 ├── config.py              # 核心参数、模型路径、调参说明
-├── main.py                # 主入口，线程调度、共享内存拉流、串口控制、网页推流
+├── main.py                # 主入口，线程调度、共享内存拉流、串口控制、网页推流入口
 ├── models/
 │   ├── det/               # 目标检测 RKNN 模型
 │   ├── ocr/               # OCR det / rec 模型与字典
 │   └── seg/               # 分割 RKNN 模型
 ├── modules/
+│   ├── debug_tools.py     # 网页预览、终端日志、性能打印和调试画面叠加
 │   ├── detector.py        # PP-YOLOE 检测封装与后处理
 │   ├── ocr_system.py      # OCR det + rec 封装
-│   └── segmentor.py       # 分割、路径搜索、金币规划、避车状态机与控制量计算
+│   ├── path_controller.py # 图像路径点到 steer_signal 的 A/B/C 控制器
+│   └── segmentor.py       # 分割、路径搜索、金币规划、避车状态机
 └── utils/
     └── image_proc.py      # OCR 文字框透视拉正工具
 ```
@@ -295,7 +297,8 @@
 15. 对最终路径做多项式拟合
 16. 对拟合系数做 EMA 平滑
 17. 结合金币规划和避车状态机选择控制路径或控制中心偏移
-18. 按 `STEER_CONTROL_MODE` 将路径转换成单一 `steer_signal`，并渲染调试图
+18. 调用 `modules/path_controller.py`，按 `STEER_CONTROL_MODE` 将路径转换成单一 `steer_signal`
+19. 调用 `modules/debug_tools.py` 渲染调试画线、文字和网页预览相关输出
 
 当前输出：
 
@@ -304,13 +307,18 @@
 - `ai_view`
   调试渲染图，后续会被放大回 `TARGET_RES`
 
-转向控制器目前有两种：
+转向控制器目前有三种，三套控制器互相独立，不会自动切换或回退：
 
 - `weighted_slope`
-  原始稳定模式。对控制路径点计算“路径点到底部中点连线斜率”，再按行号做远近加权平均。这个模式简单、抗噪，仍然作为默认配置。
+  算法 A。对控制路径点计算“路径点到底部中点连线斜率”，再按行号做远近加权平均。这个模式简单、抗噪，适合作为基线对照。
 - `stanley_band`
-  试验模式。使用 `SEG_SIZE` 路径平面里的路径段做 Stanley 风格控制：
-  `y=20~130` 拟合整体路径方向，得到航向误差；`y=90~130` 对近处路径中心做加权平均，得到横向误差。两项合成 `steer_signal`。如果路径点不足或拟合失败，会自动回退到 `weighted_slope`。
+  算法 B。按前视行 Stanley 公式计算：
+  `atan(k * e / (v_s + soft)) + g_psi * psi + g_ff * atan(L * kappa)`。
+  横向误差、航向误差和曲率前馈可以使用不同的前视行。
+- `control_c`
+  算法 C。当前默认模式。线性 PD + 航向抑制：
+  `control = Kp * e + Kd * (e - e_last) - Kyaw * psi`。
+  横向误差优先使用拟合前中心点在前视行附近的平均值，航向来自拟合线切线。
 
 补充说明：
 
@@ -620,25 +628,37 @@ target_speed = 0                                # 若红/黄灯停车或行人�
 | **公共舵机输出** |  |
 | `SERVO_CENTER` | 舵机中位 PWM |
 | `SERVO_MIN` / `SERVO_MAX` | 舵机 PWM 安全上下限 |
-| `STEER_CONTROL_MODE` | 转向控制器模式，`weighted_slope` 为算法 A，`stanley_band` 为算法 B |
+| `STEER_CONTROL_MODE` | 转向控制器模式，`weighted_slope` 为算法 A，`stanley_band` 为算法 B，`control_c` 为算法 C |
 | **算法 A: `weighted_slope`** | 原始稳定算法，把路径点到底部中点的斜率做远近加权平均 |
-| `STEER_SIGNAL_PWM_GAIN` | `weighted_slope` 的 steer_signal 转舵机 PWM 增益；`stanley_band` 回退时也会用这套算法 |
+| `STEER_SIGNAL_PWM_GAIN` | `weighted_slope` 的 steer_signal 转舵机 PWM 增益 |
 | `STEER_SIGNAL_MIN_DY` | 斜率计算最小纵向距离 |
 | `STEER_SIGNAL_ROW_WEIGHT_GAMMA` | 路径点远近权重指数 |
 | `STEER_SIGNAL_NORMALIZED_SCALE` | 归一化 steer_signal 的整体放大系数 |
-| **算法 B: `stanley_band`** | 前轮/Stanley-band 算法，把控制拆成航向误差和横向误差 |
-| `STANLEY_PWM_GAIN` | `stanley_band` 专用 PWM 映射增益；只想调新控制器舵机幅度时优先改它 |
-| `STANLEY_BAND_Y_MIN` / `STANLEY_BAND_Y_MAX` | Stanley-band 航向拟合区间；默认 `20~130`，用这段路径估计整体方向 |
-| `STANLEY_LATERAL_Y_MIN` / `STANLEY_LATERAL_Y_MAX` | Stanley-band 横向误差区间；默认 `90~130`，用近处路径估计偏离中心线多少 |
-| `STANLEY_HEADING_GAIN` | 航向误差增益；越大越提前入弯，过大可能摆动或过冲 |
-| `STANLEY_LATERAL_GAIN` | 横向误差增益；越大越快回中，过大容易蛇形 |
-| `STANLEY_SOFT` | 横向误差软化常数；越大越稳，越小越敏感 |
-| `STANLEY_SIGNAL_SCALE` | Stanley-band 输出整体缩放；越大舵机幅度越大 |
-| `STANLEY_ROW_WEIGHT_GAMMA` | Stanley-band 横向误差行权重；越大越重视靠近车身的点 |
-| `STANLEY_MIN_HEADING_POINTS` | Stanley-band 航向拟合最低点数；不足时回退原控制器 |
-| `STANLEY_MIN_LATERAL_POINTS` | Stanley-band 横向误差最低点数；不足时回退原控制器 |
-| **模式增益与取样窗口** | 普通巡线、coin、car 等模式对最终控制量的额外修正 |
-| `STEER_SIGNAL_NO_TARGET_ROW_MIN` / `STEER_SIGNAL_NO_TARGET_ROW_MAX` | 无 coin/无 car 时控制只看这段 y 范围 |
+| `WEIGHTED_SLOPE_SAMPLE_ROW_MIN` / `WEIGHTED_SLOPE_SAMPLE_ROW_MAX` | `weighted_slope` 普通巡线时使用的独立 y 行取样范围 |
+| **算法 B: `stanley_band`** | 前视行 Stanley 公式：横向误差 + 航向误差 + 曲率前馈 |
+| `STANLEY_PWM_GAIN` | `stanley_band` 专用 PWM 映射增益 |
+| `STANLEY_LOOKAHEAD_Y` | 算横向误差 `e` 的前视行，`SEG_SIZE` 坐标系里 y 越小看得越远 |
+| `STANLEY_HEADING_LOOKAHEAD_Y` | 算航向误差 `psi` 的前视行 |
+| `STANLEY_CURVATURE_LOOKAHEAD_Y` | 算曲率前馈 `kappa` 的前视行 |
+| `STANLEY_LATERAL_AVG_HALF_WINDOW` | 横向误差取拟合前中心点平均时的半窗口高度 |
+| `STANLEY_LATERAL_GAIN` | Stanley 横向误差增益 |
+| `STANLEY_HEADING_GAIN` | Stanley 航向误差增益 |
+| `STANLEY_CURVATURE_FF_GAIN` | Stanley 曲率前馈增益 |
+| `STANLEY_WHEELBASE_M` | 轴距，当前配置为 `0.20m` |
+| `STANLEY_SPEED_ESTIMATE` / `STANLEY_SOFT` | Stanley 横向项分母里的速度估计和软化常数 |
+| `STANLEY_SIGNAL_SCALE` | Stanley 输出整体缩放；越大舵机幅度越大 |
+| `STANLEY_MIN_FIT_POINTS` | Stanley 拟合最低点数；不足时当前模式输出 0，不切换到其它控制器 |
+| **算法 C: `control_c`** | 线性 PD + 航向抑制：`Kp*e + Kd*de - Kyaw*psi` |
+| `CONTROL_C_PWM_GAIN` | `control_c` 专用 PWM 映射增益；只影响最终舵机幅度，不改变 C 内部 P/D/航向比例 |
+| `CONTROL_C_LOOKAHEAD_Y` | 横向误差 `e` 的取样行；y 越小看得越远，反应更早但可能更抖 |
+| `CONTROL_C_HEADING_LOOKAHEAD_Y` | 航向误差 `psi` 的取样行；通常先和横向行一致，想提前抑制大弯可取更远 |
+| `CONTROL_C_LATERAL_AVG_HALF_WINDOW` | 横向误差取拟合前中心点平均时的半窗口高度；越大越稳但越钝 |
+| `CONTROL_C_LATERAL_GAIN` | 横向 P 系数 `Kp`；调大回中更快，过大容易左右摆 |
+| `CONTROL_C_LATERAL_D_GAIN` | 横向 D 系数 `Kd`；调大压过冲/慢摆，过大容易细碎抖 |
+| `CONTROL_C_LATERAL_D_EMA_ALPHA` | D 项前的横向误差 EMA 平滑；越大越稳但反应更慢 |
+| `CONTROL_C_HEADING_GAIN` | 航向抑制系数 `Kyaw`，以 `-Kyaw*psi` 使用；只做阻尼，过大会和横向项打架 |
+| `CONTROL_C_MIN_FIT_POINTS` | C 算法拟合最低点数；不足时当前模式输出 0，不切换到其它控制器 |
+| **模式增益** | 普通巡线、coin、car 等模式对最终控制量的额外修正 |
 | `STEER_SIGNAL_NO_TARGET_GAIN` | 普通巡线模式控制增益 |
 | `STEER_SIGNAL_COIN_GAIN` | coin 路径 active 时控制增益 |
 | `STEER_SIGNAL_CAR_GAIN` | car 避障 active 时控制增益 |
@@ -890,32 +910,32 @@ target_speed = 0                                # 若红/黄灯停车或行人�
 - `STEER_CONTROL_MODE`
 - `STEER_SIGNAL_PWM_GAIN`
 - `STANLEY_PWM_GAIN`
+- `CONTROL_C_PWM_GAIN`
 - `STEER_SIGNAL_SPEED_GAIN`
-- `STANLEY_HEADING_GAIN`
-- `STANLEY_LATERAL_GAIN`
-- `STANLEY_SOFT`
-- `STANLEY_SIGNAL_SCALE`
+- `CONTROL_C_LATERAL_GAIN`
+- `CONTROL_C_LATERAL_D_GAIN`
+- `CONTROL_C_HEADING_GAIN`
 - `CONTROL_MIN_SPEED / CONTROL_MAX_SPEED`
 - `ZEBRA_STOPLINE_TRIGGER_DIST`
 
 调参建议：
 
-- 想试 Stanley-band 控制器
-  先只把 `STEER_CONTROL_MODE` 从 `weighted_slope` 改成 `stanley_band`，其它参数保持默认；确认方向没有打反后，再开始调增益
+- 想切换控制器
+  直接改 `STEER_CONTROL_MODE` 为 `weighted_slope`、`stanley_band` 或 `control_c`。三套控制器互相独立，不会自动回退到其它模式。
 - 车总是自然偏向一侧
-  优先校准 `SERVO_CENTER`
+  如果舵机中直还没确认，才检查 `SERVO_CENTER`；当前已确认 `750` 中直时，不要靠改中位修控制问题
 - 舵机转向不够积极，明显拐不过弯
-  如果当前是 `stanley_band`，优先增大 `STANLEY_PWM_GAIN`；如果是 `weighted_slope`，增大 `STEER_SIGNAL_PWM_GAIN`
+  先按当前模式增大对应 PWM 映射增益：A 用 `STEER_SIGNAL_PWM_GAIN`，B 用 `STANLEY_PWM_GAIN`，C 用 `CONTROL_C_PWM_GAIN`
 - 转向一激烈就容易抖或打满
-  如果当前是 `stanley_band`，优先减小 `STANLEY_PWM_GAIN`；如果是 `weighted_slope`，减小 `STEER_SIGNAL_PWM_GAIN`
-- Stanley-band 入弯晚、弯道转不过
-  优先增大 `STANLEY_HEADING_GAIN`，例如 `0.85 -> 1.1`
-- Stanley-band 贴边回不来
-  适当增大 `STANLEY_LATERAL_GAIN`，例如 `0.028 -> 0.035`
-- Stanley-band 直道左右蛇形
-  先增大 `STANLEY_SOFT`，例如 `24 -> 30`；如果还抖，再降低 `STANLEY_LATERAL_GAIN`
-- Stanley-band 整体舵机幅度太小或太大
-  先调 `STANLEY_PWM_GAIN`；如果 `Ctrl` 本身太小，再调 `STANLEY_SIGNAL_SCALE`
+  先按当前模式减小对应 PWM 映射增益：A 用 `STEER_SIGNAL_PWM_GAIN`，B 用 `STANLEY_PWM_GAIN`，C 用 `CONTROL_C_PWM_GAIN`
+- `control_c` 拉不回中线
+  优先增大 `CONTROL_C_LATERAL_GAIN`
+- `control_c` 慢慢过冲、左右摆
+  优先增大 `CONTROL_C_LATERAL_D_GAIN`；如果变成细碎抖，再减小 D 或增大 `CONTROL_C_LATERAL_D_EMA_ALPHA`
+- `control_c` 直线小幅打角抖动或出弯不丝滑
+  小幅调 `CONTROL_C_HEADING_GAIN`，它以 `-Kyaw*psi` 形式抑制打角
+- `control_c` 整体控制量太小或太大
+  如果只是舵机幅度不合适，调 `CONTROL_C_PWM_GAIN`；如果页面 `Ctrl` 本身量级不合适，按现象调 `CONTROL_C_LATERAL_GAIN / CONTROL_C_LATERAL_D_GAIN / CONTROL_C_HEADING_GAIN`
 - 弯道时车速降得不够
   增大 `STEER_SIGNAL_SPEED_GAIN`
 - 整体跑得太慢或太快
@@ -956,7 +976,7 @@ seg_queue -> infer_mask() -> mask_queue -> postprocess_mask() -> steer_signal / 
 
 - `infer_mask()` 只做 RKNN 分割推理，输出二值 `mask`
 - `mask_queue` 只保留最新一帧，旧 mask 会被丢掉
-- `postprocess_mask()` 做路径搜索、拟合、控制量计算和调试渲染
+- `postprocess_mask()` 做路径搜索、拟合，调用 `PathController` 计算控制量并渲染调试图
 - `SegProfile total` 是单帧端到端耗时，不等同于页面 `Seg FPS`
 
 历史串行模式和流水线模式的现场对比如下：

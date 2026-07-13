@@ -10,13 +10,12 @@
    再把识别结果按中心点回匹配到 sign 检测框。
 5. seg_worker 读取当前最新的检测结果与 turn_intent，生成控制量和预览图。
 6. serial_control_thread 将控制量打包后发给下位机。
-7. Flask 将 global_preview_frame 编码成 MJPEG 提供网页预览。
+7. Flask 读取 global_preview_frame，并调用 debug_tools 编码成 MJPEG 提供网页预览。
 """
 
 import time
 import struct
 import copy
-import socket
 import numpy as np
 import cv2
 import threading
@@ -26,6 +25,14 @@ from multiprocessing import Process, Queue as MPQueue, shared_memory, resource_t
 from flask import Flask, Response, render_template_string
 
 import config
+from modules.debug_tools import (
+    DebugLogger,
+    draw_preview_status_panel,
+    draw_yolo_boxes,
+    encode_mjpeg_frame,
+    get_preview_host,
+    preview_index_html,
+)
 from modules.segmentor import RoadSegmentor
 from modules.detector import YOLODetector
 from modules.ocr_system import OCRRecognizer
@@ -58,7 +65,7 @@ fps_stats = copy.deepcopy(config.DEFAULT_FPS_STATS)
 
 frame_lock = threading.Lock()
 data_lock = threading.Lock()
-log_lock = threading.Lock()
+debug_logger = DebugLogger()
 
 # 三条工作队列:
 # - seg_queues: 每个 Seg worker 一条最新帧分割输入队列
@@ -80,8 +87,6 @@ llm_result_queue = MPQueue(maxsize=2)
 # 当前最新一帧的检测结果。
 global_yolo_boxes = []
 global_yolo_frame_id = -1
-log_cache = {}
-profile_cache = {}
 
 
 def remove_shm_from_resource_tracker():
@@ -94,88 +99,17 @@ def remove_shm_from_resource_tracker():
 
 def throttled_log(key, message, state=None, min_interval=None):
     """按状态变化或最小时间间隔打印日志，避免终端刷屏."""
-    now = time.time()
-    if min_interval is None:
-        min_interval = config.LOG_INTERVAL_DEFAULT
-    with log_lock:
-        prev = log_cache.get(key)
-        should_print = False
-        if prev is None:
-            should_print = True
-        else:
-            prev_state = prev.get("state")
-            prev_time = prev.get("time", 0.0)
-            if state is not None and state != prev_state:
-                should_print = True
-            elif now - prev_time >= float(min_interval):
-                should_print = True
-
-        if should_print:
-            print(message, flush=True)
-            log_cache[key] = {"time": now, "state": state}
+    debug_logger.throttled_log(key, message, state=state, min_interval=min_interval)
 
 
 def log_once(key, message):
     """同一类错误只打印一次，避免异常反复刷屏。"""
-    with log_lock:
-        if key in log_cache:
-            return
-        print(message, flush=True)
-        log_cache[key] = {"time": time.time(), "state": "__once__"}
+    debug_logger.log_once(key, message)
 
 
 def profile_log(key, label, metrics, min_interval=None):
     """用 EMA 节流打印主流程耗时，数值单位统一按毫秒展示."""
-    if not bool(getattr(config, "MAIN_PROFILE_LOG_ENABLED", False)):
-        return
-
-    now = time.time()
-    if min_interval is None:
-        min_interval = float(getattr(config, "MAIN_PROFILE_LOG_INTERVAL", 2.0))
-
-    with log_lock:
-        item = profile_cache.get(key)
-        if item is None:
-            ema = {name: float(value) for name, value in metrics.items()}
-            item = {"ema": ema, "time": 0.0}
-            profile_cache[key] = item
-        else:
-            alpha = 0.85
-            ema = item["ema"]
-            for name, value in metrics.items():
-                ema[name] = alpha * float(ema.get(name, 0.0)) + (1.0 - alpha) * float(value)
-
-        if now - float(item.get("time", 0.0)) < min_interval:
-            return
-        item["time"] = now
-
-        parts = []
-        for name, value in item["ema"].items():
-            value = float(value)
-            if name.endswith("_fps"):
-                parts.append(f"{name}={value:.1f}")
-            else:
-                parts.append(f"{name}={value * 1000.0:.1f}ms")
-        print(f"{label} " + " ".join(parts), flush=True)
-
-
-def get_preview_host():
-    """返回适合局域网浏览器访问的预览主机地址."""
-    bind_host = str(config.FLASK_HOST)
-    if bind_host and bind_host not in ("0.0.0.0", "::"):
-        return bind_host
-
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        sock.connect(("8.8.8.8", 80))
-        return sock.getsockname()[0]
-    except Exception:
-        try:
-            return socket.gethostbyname(socket.gethostname())
-        except Exception:
-            return "127.0.0.1"
-    finally:
-        sock.close()
+    debug_logger.profile_log(key, label, metrics, min_interval=min_interval)
 
 
 def print_preview_url():
@@ -246,89 +180,6 @@ def unpack_seg_item(item):
     if isinstance(item, tuple) and len(item) == 2:
         return item
     return item, None
-
-
-# ==============================================================================
-# YOLO框绘制
-# ==============================================================================
-def draw_yolo_boxes(image, boxes):
-    """在最终显示图上叠加检测框和文字标签.
-
-    说明:
-    - 检测框统一按照 TARGET_RES 坐标系保存；
-    - 如果当前显示图尺寸不是 TARGET_RES，这里会做一次比例映射。
-    """
-    if image is None or len(boxes) == 0:
-        return image
-
-    img_h, img_w = image.shape[:2]
-    src_w, src_h = config.TARGET_RES  # (960, 720)
-
-    scale_x = img_w / float(src_w)
-    scale_y = img_h / float(src_h)
-
-    for obj in boxes:
-        rect = obj.get("rect", [0, 0, 0, 0])
-        if len(rect) != 4:
-            continue
-
-        x, y, w, h = rect
-        cls_id = obj.get("class_id", -1)
-        cls_name = obj.get("class_name", str(cls_id))
-        score = obj.get("score", 0.0)
-        text = obj.get("text", "")
-
-        x1 = int(np.clip(round(x * scale_x), 0, img_w - 1))
-        y1 = int(np.clip(round(y * scale_y), 0, img_h - 1))
-        x2 = int(np.clip(round((x + w) * scale_x), 0, img_w - 1))
-        y2 = int(np.clip(round((y + h) * scale_y), 0, img_h - 1))
-
-        if x2 <= x1 or y2 <= y1:
-            continue
-
-        color = config.YOLO_DEFAULT_BOX_COLOR
-        if cls_id == config.SIGN_CLASS_ID:
-            color = config.YOLO_SIGN_BOX_COLOR
-
-        # 在主预览图上把检测框画粗一点，方便快速确认检测是否生效。
-        cv2.rectangle(image, (x1, y1), (x2, y2), color, config.YOLO_BOX_THICKNESS)
-
-        label = f"{cls_name}:{score:.2f}"
-        if text:
-            label += f" [{text}]"
-
-        text_y = (
-            y1 - config.YOLO_LABEL_TOP_OFFSET
-            if y1 > config.YOLO_LABEL_TOP_MARGIN
-            else y1 + config.YOLO_LABEL_BOTTOM_OFFSET
-        )
-        cv2.putText(
-            image,
-            label,
-            (x1, text_y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            config.YOLO_LABEL_FONT_SCALE,
-            color,
-            config.YOLO_LABEL_THICKNESS,
-            cv2.LINE_AA
-        )
-
-    return image
-
-
-def summarize_yolo_boxes(boxes):
-    """生成一行简短检测摘要，便于在预览页直接确认 YOLO 是否有输出。"""
-    if not boxes:
-        return "YOLO:0"
-
-    parts = [f"YOLO:{len(boxes)}"]
-    for obj in boxes[:config.YOLO_SUMMARY_MAX_ITEMS]:
-        cls_name = obj.get("class_name", "?")
-        score = float(obj.get("score", 0.0))
-        parts.append(f"{cls_name}:{score:.2f}")
-    if len(boxes) > config.YOLO_SUMMARY_MAX_ITEMS:
-        parts.append("...")
-    return " | ".join(parts)
 
 
 def extract_person_stop_candidate(boxes, frame_id):
@@ -1542,101 +1393,21 @@ def seg_worker(core_id, worker_id=0):
             current_yolo_fps = fps_stats["yolo_fps"]
 
         if rendered_img is not None:
-            cv2.rectangle(
+            draw_preview_status_panel(
                 rendered_img,
-                config.PREVIEW_STATUS_PANEL_TOP_LEFT,
-                config.PREVIEW_STATUS_PANEL_BOTTOM_RIGHT,
-                config.PREVIEW_PANEL_BG_COLOR,
-                -1,
-            )
-            cv2.rectangle(
-                rendered_img,
-                config.PREVIEW_STATUS_PANEL_TOP_LEFT,
-                config.PREVIEW_STATUS_PANEL_BOTTOM_RIGHT,
-                config.PREVIEW_PANEL_BORDER_COLOR,
-                config.PREVIEW_TEXT_THICKNESS,
-            )
-
-            cv2.putText(
-                rendered_img,
-                f"Seg:{current_seg_fps:.1f} YOL:{current_yolo_fps:.1f}",
-                config.PREVIEW_TEXT_POS_FPS,
-                cv2.FONT_HERSHEY_SIMPLEX,
-                config.PREVIEW_TEXT_FONT_SCALE,
-                config.PREVIEW_TEXT_COLOR,
-                config.PREVIEW_TEXT_THICKNESS,
-                cv2.LINE_AA
-            )
-            cv2.putText(
-                rendered_img,
-                f"Ctrl:{steer_signal:.1f} Srv:{actual_servo}",
-                config.PREVIEW_TEXT_POS_CTRL,
-                cv2.FONT_HERSHEY_SIMPLEX,
-                config.PREVIEW_TEXT_FONT_SCALE,
-                config.PREVIEW_TEXT_COLOR,
-                config.PREVIEW_TEXT_THICKNESS,
-                cv2.LINE_AA
-            )
-            cv2.putText(
-                rendered_img,
-                f"Target Spd:{actual_speed}",
-                config.PREVIEW_TEXT_POS_SPEED,
-                cv2.FONT_HERSHEY_SIMPLEX,
-                config.PREVIEW_TEXT_FONT_SCALE,
-                config.PREVIEW_TEXT_ACCENT_COLOR,
-                config.PREVIEW_TEXT_THICKNESS,
-                cv2.LINE_AA
-            )
-            stop_text = ""
-            if sign_llm_waiting_result:
-                stop_text = "SIGN_LLM_WAIT"
-            elif sign_llm_stop_active:
-                stop_text = "SIGN_LLM_OCR"
-            elif person_stop_active:
-                stop_text = "STOP_BY_PERSON"
-            elif person_avoid_active:
-                person_avoid_bias_x = float(global_control_data.get("person_avoid_bias_x", 0.0))
-                stop_text = "AVOID_PERSON_L" if person_avoid_bias_x >= 0.0 else "AVOID_PERSON_R"
-            if stop_text:
-                cv2.putText(
-                    rendered_img,
-                    stop_text,
-                    config.PREVIEW_TEXT_POS_STOP,
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    config.PREVIEW_TEXT_FONT_SCALE,
-                    config.PREVIEW_TEXT_STOP_COLOR,
-                    config.PREVIEW_TEXT_THICKNESS,
-                    cv2.LINE_AA
-                )
-            if route_state not in ("IDLE",):
-                route_choice_text = "R" if route_choice == 1 else ("L" if route_choice == -1 else "-")
-                cv2.putText(
-                    rendered_img,
-                    f"Route:{route_state} {route_choice_text}",
-                    (config.PREVIEW_TEXT_POS_STOP[0], config.PREVIEW_TEXT_POS_STOP[1] + 22),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    config.PREVIEW_TEXT_FONT_SCALE,
-                    config.PREVIEW_TEXT_ACCENT_COLOR,
-                    config.PREVIEW_TEXT_THICKNESS,
-                    cv2.LINE_AA
-                )
-
-            cv2.rectangle(
-                rendered_img,
-                config.PREVIEW_YOLO_PANEL_TOP_LEFT,
-                config.PREVIEW_YOLO_PANEL_BOTTOM_RIGHT,
-                config.PREVIEW_PANEL_BG_COLOR,
-                -1,
-            )
-            cv2.putText(
-                rendered_img,
-                summarize_yolo_boxes(current_yolo_boxes),
-                config.PREVIEW_TEXT_POS_YOLO_SUMMARY,
-                cv2.FONT_HERSHEY_SIMPLEX,
-                config.PREVIEW_TEXT_FONT_SCALE,
-                config.PREVIEW_TEXT_ACCENT_COLOR,
-                config.PREVIEW_TEXT_THICKNESS,
-                cv2.LINE_AA
+                current_seg_fps=current_seg_fps,
+                current_yolo_fps=current_yolo_fps,
+                steer_signal=steer_signal,
+                actual_servo=actual_servo,
+                actual_speed=actual_speed,
+                sign_llm_waiting_result=sign_llm_waiting_result,
+                sign_llm_stop_active=sign_llm_stop_active,
+                person_stop_active=person_stop_active,
+                person_avoid_active=person_avoid_active,
+                person_avoid_bias_x=float(global_control_data.get("person_avoid_bias_x", 0.0)),
+                route_state=route_state,
+                route_choice=route_choice,
+                yolo_boxes=current_yolo_boxes,
             )
 
         with frame_lock:
@@ -1901,8 +1672,11 @@ def serial_control_thread():
                 target_speed = int(last_output_speed)
 
             pwm_gain = float(config.STEER_SIGNAL_PWM_GAIN)
-            if str(getattr(config, "STEER_CONTROL_MODE", "weighted_slope")).lower() == "stanley_band":
-                pwm_gain = float(getattr(config, "STANLEY_PWM_GAIN", config.STEER_SIGNAL_PWM_GAIN))
+            control_mode = str(getattr(config, "STEER_CONTROL_MODE", "weighted_slope")).lower()
+            if control_mode == "stanley_band":
+                pwm_gain = float(getattr(config, "STANLEY_PWM_GAIN", 0.012))
+            elif control_mode == "control_c":
+                pwm_gain = float(getattr(config, "CONTROL_C_PWM_GAIN", 12.0))
             raw_pwm = (
                 config.SERVO_CENTER
                 - steer_signal * pwm_gain
@@ -2142,13 +1916,7 @@ def ai_producer_thread():
 # ==============================================================================
 @app.route('/')
 def index():
-    return render_template_string('''
-    <html>
-    <body style="background:#000;text-align:center;margin:0;">
-        <img src="/video_feed" style="max-width:100%; height:100vh; image-rendering: pixelated;">
-    </body>
-    </html>
-    ''')
+    return render_template_string(preview_index_html())
 
 
 @app.route('/video_feed')
@@ -2164,17 +1932,12 @@ def video_feed():
                 continue
 
             t_encode_start = time.perf_counter()
-            ret, buffer = cv2.imencode(
-                '.jpg',
-                current_frame,
-                [int(cv2.IMWRITE_JPEG_QUALITY), config.JPEG_QUALITY]
-            )
+            chunk = encode_mjpeg_frame(current_frame)
             t_encode_end = time.perf_counter()
-            if not ret:
+            if chunk is None:
                 continue
 
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+            yield chunk
             t_yield_end = time.perf_counter()
             profile_log(
                 "video_feed_loop",
