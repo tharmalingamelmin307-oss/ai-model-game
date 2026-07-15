@@ -1,14 +1,187 @@
 # modules/debug_tools.py
 """网页预览、终端日志和画面叠加等调试工具."""
 
+import atexit
+import select
 import socket
+import sys
+import termios
 import threading
 import time
+import tty
 
 import cv2
 import numpy as np
 
 import config
+
+
+class DebugDriveKeyboardControl:
+    """用终端键盘做调试发车/停车控制."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._thread = None
+        self._fd = None
+        self._old_termios = None
+        self.enabled = bool(getattr(config, "DEBUG_DRIVE_CONTROL_ENABLED", True))
+        self.listening = False
+        self.manual_stop_active = bool(getattr(
+            config,
+            "DEBUG_DRIVE_INITIAL_STOPPED",
+            getattr(config, "DEBUG_KEYBOARD_DRIVE_INITIAL_STOPPED", True),
+        ))
+        self.last_key = ""
+        self.last_event_at = None
+        self.message = "未启动"
+
+    def start(self):
+        if not bool(getattr(config, "DEBUG_DRIVE_CONTROL_ENABLED", True)):
+            with self._lock:
+                self.enabled = False
+                self.listening = False
+                self.manual_stop_active = False
+                self.message = "调试发车/停车已关闭"
+            return self
+
+        with self._lock:
+            self.enabled = True
+            if not self.message or self.message == "未启动":
+                self.message = "等待B发车" if self.manual_stop_active else "运行中"
+
+        if not bool(getattr(config, "DEBUG_KEYBOARD_DRIVE_ENABLED", True)):
+            with self._lock:
+                self.listening = False
+                self.message = "网页B/E控制，终端监听关闭"
+            print("调试发车/停车已启用: 网页预览页面按 B 发车，按 E 停车；终端键盘监听关闭", flush=True)
+            return self
+
+        with self._lock:
+            if self._thread is not None:
+                return self
+
+        if not sys.stdin or not sys.stdin.isatty():
+            with self._lock:
+                self.enabled = True
+                self.listening = False
+                self.message = "stdin不是TTY，键盘发车/停车未启用"
+            print("调试键盘控制未启用: stdin不是TTY", flush=True)
+            return self
+
+        try:
+            self._fd = sys.stdin.fileno()
+            self._old_termios = termios.tcgetattr(self._fd)
+            tty.setcbreak(self._fd)
+            atexit.register(self.restore_terminal)
+        except Exception as e:
+            with self._lock:
+                self.enabled = True
+                self.listening = False
+                self.message = f"TTY初始化失败: {e}"
+            print(f"调试键盘控制启动失败: {e}", flush=True)
+            return self
+
+        with self._lock:
+            self.enabled = True
+            self.listening = True
+            self.message = "等待B发车" if self.manual_stop_active else "运行中"
+
+        self._thread = threading.Thread(
+            target=self._listen_loop,
+            name="debug-drive-keyboard",
+            daemon=True,
+        )
+        self._thread.start()
+
+        start_key = str(getattr(config, "DEBUG_KEYBOARD_DRIVE_START_KEY", "b")).lower()
+        stop_key = str(getattr(config, "DEBUG_KEYBOARD_DRIVE_STOP_KEY", "e")).lower()
+        initial = "停车" if self.manual_stop_active else "运行"
+        print(
+            f"调试键盘控制已启动: 按 {start_key.upper()} 发车，按 {stop_key.upper()} 停车，当前={initial}",
+            flush=True,
+        )
+        return self
+
+    def restore_terminal(self):
+        if self._fd is None or self._old_termios is None:
+            return
+        try:
+            termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old_termios)
+        except Exception:
+            pass
+        self._old_termios = None
+
+    def _listen_loop(self):
+        start_key = str(getattr(config, "DEBUG_KEYBOARD_DRIVE_START_KEY", "b")).lower()
+        stop_key = str(getattr(config, "DEBUG_KEYBOARD_DRIVE_STOP_KEY", "e")).lower()
+        poll_interval = float(getattr(config, "DEBUG_KEYBOARD_DRIVE_POLL_INTERVAL", 0.05))
+
+        while True:
+            try:
+                readable, _, _ = select.select([sys.stdin], [], [], poll_interval)
+                if not readable:
+                    continue
+                ch = sys.stdin.read(1)
+            except Exception as e:
+                with self._lock:
+                    self.enabled = False
+                    self.listening = False
+                    self.manual_stop_active = False
+                    self.message = f"监听异常: {e}"
+                print(f"调试键盘控制停止: {e}", flush=True)
+                return
+
+            key = str(ch).lower()
+            if key == start_key:
+                self.set_manual_stop(False, key, "发车")
+            elif key == stop_key:
+                self.set_manual_stop(True, key, "停车")
+
+    def set_manual_stop(self, active, key="", label=None):
+        if label is None:
+            label = "停车" if active else "发车"
+        with self._lock:
+            changed = bool(self.manual_stop_active) != bool(active)
+            self.manual_stop_active = bool(active)
+            self.last_key = str(key)
+            self.last_event_at = time.time()
+            self.message = str(label)
+        if changed:
+            print(f">>> 调试键盘: {label}", flush=True)
+
+    def snapshot(self):
+        with self._lock:
+            return {
+                "enabled": bool(self.enabled),
+                "listening": bool(self.listening),
+                "manual_stop_active": bool(self.enabled and self.manual_stop_active),
+                "last_key": self.last_key,
+                "last_event_at": self.last_event_at,
+                "message": self.message,
+            }
+
+    def is_manual_stop_active(self):
+        with self._lock:
+            return bool(self.enabled and self.manual_stop_active)
+
+
+_debug_drive_keyboard_control = DebugDriveKeyboardControl()
+
+
+def start_debug_drive_keyboard_control():
+    """启动调试键盘发车/停车监听线程."""
+    return _debug_drive_keyboard_control.start()
+
+
+def get_debug_drive_keyboard_state():
+    """返回调试键盘控制状态快照."""
+    return _debug_drive_keyboard_control.snapshot()
+
+
+def set_debug_drive_manual_stop(active, key="", label=None):
+    """设置调试发车/停车状态，供网页按钮或键盘事件调用."""
+    _debug_drive_keyboard_control.set_manual_stop(active, key=key, label=label)
+    return _debug_drive_keyboard_control.snapshot()
 
 
 class DebugLogger:
@@ -461,6 +634,7 @@ def draw_preview_status_panel(
     person_stop_active,
     person_avoid_active,
     person_avoid_bias_x,
+    debug_keyboard_stop_active=False,
     route_state,
     route_choice,
     yolo_boxes,
@@ -516,7 +690,9 @@ def draw_preview_status_panel(
     )
 
     stop_text = ""
-    if sign_llm_waiting_result:
+    if debug_keyboard_stop_active:
+        stop_text = "STOP_BY_KEY"
+    elif sign_llm_waiting_result:
         stop_text = "SIGN_LLM_WAIT"
     elif sign_llm_stop_active:
         stop_text = "SIGN_LLM_OCR"
@@ -591,8 +767,19 @@ def get_preview_host():
 def preview_index_html():
     return '''
     <html>
-    <body style="background:#000;text-align:center;margin:0;">
+    <body style="background:#000;text-align:center;margin:0;" tabindex="0">
         <img src="/video_feed" style="max-width:100%; height:100vh; image-rendering: pixelated;">
+        <script>
+        document.body.focus();
+        document.addEventListener('keydown', function (event) {
+            const key = String(event.key || '').toLowerCase();
+            if (key === 'b') {
+                fetch('/debug_drive/start', { method: 'POST' });
+            } else if (key === 'e') {
+                fetch('/debug_drive/stop', { method: 'POST' });
+            }
+        });
+        </script>
     </body>
     </html>
     '''

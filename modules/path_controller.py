@@ -11,17 +11,23 @@ class PathController:
 
     def __init__(self):
         self.last_weighted_slope_signal = None
+        self.last_weighted_slope_heading_ff = None
         self.last_stanley_lateral_error = None
+        self.last_stanley_heading_error = None
         self.last_control_c_lateral_error = None
+        self.last_control_c_heading_error = None
 
     def reset_weighted_slope(self):
         self.last_weighted_slope_signal = None
+        self.last_weighted_slope_heading_ff = None
 
     def reset_stanley_band(self):
         self.last_stanley_lateral_error = None
+        self.last_stanley_heading_error = None
 
     def reset_control_c(self):
         self.last_control_c_lateral_error = None
+        self.last_control_c_heading_error = None
 
     def reset(self):
         self.reset_weighted_slope()
@@ -118,6 +124,7 @@ class PathController:
     def _compute_weighted_steer_signal(self, path_points, img_w, img_h, center_bias_x=0.0):
         """算法 A: 路径点到底部中点连线斜率的加权平均."""
         if path_points is None or len(path_points) == 0:
+            self.reset_weighted_slope()
             return 0.0
 
         pts = np.array(path_points, dtype=np.float32).reshape((-1, 2))
@@ -131,6 +138,7 @@ class PathController:
         row_weights = np.power(np.clip(pts[:, 1], 0.0, bottom_y), row_gamma)
         weight_sum = float(np.sum(row_weights))
         if weight_sum <= 1e-6:
+            self.reset_weighted_slope()
             return 0.0
         slope_signal = float(np.sum(slopes * row_weights) / weight_sum)
         slope_signal *= float(getattr(config, "STEER_SIGNAL_NORMALIZED_SCALE", 1.0))
@@ -149,7 +157,47 @@ class PathController:
         self.last_weighted_slope_signal = float(filtered_signal)
 
         d_gain = float(getattr(config, "STEER_SIGNAL_D_GAIN", 0.0))
-        return slope_signal + d_gain * signal_delta
+        heading_ff = self._compute_weighted_slope_heading_ff(pts, img_h)
+        return slope_signal + d_gain * signal_delta + heading_ff
+
+    def _compute_weighted_slope_heading_ff(self, path_points, img_h):
+        """算法 A 的小航向前馈：用远/近两行路径方向提前给舵."""
+        ff_gain = float(getattr(config, "STEER_SIGNAL_HEADING_FF_GAIN", 0.0))
+        if abs(ff_gain) <= 1e-9:
+            self.last_weighted_slope_heading_ff = None
+            return 0.0
+
+        far_y = float(getattr(config, "STEER_SIGNAL_HEADING_FF_FAR_Y", 35.0))
+        near_y = float(getattr(config, "STEER_SIGNAL_HEADING_FF_NEAR_Y", 85.0))
+        far_y = float(np.clip(far_y, 0.0, float(img_h) - 1.0))
+        near_y = float(np.clip(near_y, 0.0, float(img_h) - 1.0))
+        dy = near_y - far_y
+        if abs(dy) < 1e-6:
+            self.last_weighted_slope_heading_ff = None
+            return 0.0
+
+        far_x = self._path_x_at_y_points(path_points, far_y)
+        near_x = self._path_x_at_y_points(path_points, near_y)
+        if far_x is None or near_x is None:
+            self.last_weighted_slope_heading_ff = None
+            return 0.0
+
+        heading_slope = (float(far_x) - float(near_x)) / dy
+        heading_slope = float(np.clip(heading_slope, -2.0, 2.0))
+        scale = float(getattr(config, "STEER_SIGNAL_NORMALIZED_SCALE", 1.0))
+        raw_ff = heading_slope * scale * ff_gain
+
+        ema_alpha = float(getattr(config, "STEER_SIGNAL_HEADING_FF_EMA_ALPHA", 0.5))
+        ema_alpha = float(np.clip(ema_alpha, 0.0, 0.98))
+        if self.last_weighted_slope_heading_ff is None:
+            filtered_ff = float(raw_ff)
+        else:
+            filtered_ff = (
+                ema_alpha * float(self.last_weighted_slope_heading_ff) +
+                (1.0 - ema_alpha) * float(raw_ff)
+            )
+        self.last_weighted_slope_heading_ff = float(filtered_ff)
+        return float(filtered_ff)
 
     def _compute_path_control_geometry(
         self,
@@ -201,6 +249,14 @@ class PathController:
 
         a = float(poly_coeffs[0])
         b = float(poly_coeffs[1])
+        linear_heading_enabled = bool(getattr(config, "PATH_HEADING_LINEAR_FIT_ENABLED", True))
+        linear_heading_dx_dy = None
+        if linear_heading_enabled:
+            try:
+                linear_coeffs = np.polyfit(pts[:, 1], pts[:, 0], 1)
+                linear_heading_dx_dy = float(linear_coeffs[0])
+            except Exception:
+                linear_heading_dx_dy = None
         if heading_y is None:
             heading_y = lookahead_y
         if curvature_y is None:
@@ -208,7 +264,9 @@ class PathController:
         heading_y = float(np.clip(float(heading_y), 0.0, bottom_y))
         curvature_y = float(np.clip(float(curvature_y), 0.0, bottom_y))
 
-        heading_dx_dy = 2.0 * a * heading_y + b
+        heading_dx_dy = linear_heading_dx_dy
+        if heading_dx_dy is None:
+            heading_dx_dy = 2.0 * a * heading_y + b
         curvature_dx_dy = 2.0 * a * curvature_y + b
         heading_error = float(np.arctan(-heading_dx_dy))
         curvature = float((2.0 * a) / np.power(1.0 + curvature_dx_dy * curvature_dx_dy, 1.5))
@@ -234,6 +292,7 @@ class PathController:
             min_fit_points=int(getattr(config, "STANLEY_MIN_FIT_POINTS", 3)),
         )
         if geom is None:
+            self.reset_stanley_band()
             return None
 
         lateral_error = geom["lateral_error"]
@@ -262,9 +321,20 @@ class PathController:
             error_delta = filtered_error - float(self.last_stanley_lateral_error)
         self.last_stanley_lateral_error = float(filtered_error)
 
+        heading_ema_alpha = float(getattr(config, "STANLEY_HEADING_EMA_ALPHA", 0.5))
+        heading_ema_alpha = float(np.clip(heading_ema_alpha, 0.0, 0.98))
+        if self.last_stanley_heading_error is None:
+            filtered_heading_error = float(heading_error)
+        else:
+            filtered_heading_error = (
+                heading_ema_alpha * float(self.last_stanley_heading_error) +
+                (1.0 - heading_ema_alpha) * float(heading_error)
+            )
+        self.last_stanley_heading_error = float(filtered_heading_error)
+
         lateral_term = float(np.arctan(lateral_gain * lateral_error / (speed_estimate + soft)))
         d_term = d_gain * error_delta
-        heading_term = heading_gain * heading_error
+        heading_term = heading_gain * filtered_heading_error
         curvature_term = curvature_gain * float(np.arctan(wheelbase_m * curvature))
         return (lateral_term + d_term + heading_term + curvature_term) * signal_scale
 
@@ -283,6 +353,7 @@ class PathController:
             min_fit_points=int(getattr(config, "CONTROL_C_MIN_FIT_POINTS", 3)),
         )
         if geom is None:
+            self.reset_control_c()
             return None
 
         lateral_error = geom["lateral_error"]
@@ -304,10 +375,21 @@ class PathController:
             error_delta = filtered_error - float(self.last_control_c_lateral_error)
         self.last_control_c_lateral_error = float(filtered_error)
 
+        heading_ema_alpha = float(getattr(config, "CONTROL_C_HEADING_EMA_ALPHA", 0.5))
+        heading_ema_alpha = float(np.clip(heading_ema_alpha, 0.0, 0.98))
+        if self.last_control_c_heading_error is None:
+            filtered_heading_error = float(heading_error)
+        else:
+            filtered_heading_error = (
+                heading_ema_alpha * float(self.last_control_c_heading_error) +
+                (1.0 - heading_ema_alpha) * float(heading_error)
+            )
+        self.last_control_c_heading_error = float(filtered_heading_error)
+
         lateral_term = lateral_gain * filtered_error
         d_gain = float(getattr(config, "CONTROL_C_LATERAL_D_GAIN", 0.18))
         d_term = d_gain * error_delta
-        heading_term = -heading_gain * heading_error
+        heading_term = -heading_gain * filtered_heading_error
         return lateral_term + d_term + heading_term
 
     def _select_weighted_slope_control_points(self, path_points, img_h):

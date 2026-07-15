@@ -30,8 +30,11 @@ from modules.debug_tools import (
     draw_preview_status_panel,
     draw_yolo_boxes,
     encode_mjpeg_frame,
+    get_debug_drive_keyboard_state,
     get_preview_host,
     preview_index_html,
+    set_debug_drive_manual_stop,
+    start_debug_drive_keyboard_control,
 )
 from modules.segmentor import RoadSegmentor
 from modules.detector import YOLODetector
@@ -1376,6 +1379,7 @@ def seg_worker(core_id, worker_id=0):
             sign_llm_stop_active = global_control_data.get("sign_llm_stop_active", False)
             sign_llm_waiting_result = global_control_data.get("sign_llm_waiting_result", False)
             person_avoid_active = bool(global_control_data.get("person_avoid_active", False))
+            debug_keyboard_stop_active = bool(global_control_data.get("debug_keyboard_stop_active", False))
             update_sign_route_after_seg(global_control_data, bool(y_fork_active))
             route_state = str(global_control_data.get("sign_route_state", "IDLE"))
             route_choice = int(global_control_data.get("sign_route_choice", 0))
@@ -1405,6 +1409,7 @@ def seg_worker(core_id, worker_id=0):
                 person_stop_active=person_stop_active,
                 person_avoid_active=person_avoid_active,
                 person_avoid_bias_x=float(global_control_data.get("person_avoid_bias_x", 0.0)),
+                debug_keyboard_stop_active=debug_keyboard_stop_active,
                 route_state=route_state,
                 route_choice=route_choice,
                 yolo_boxes=current_yolo_boxes,
@@ -1611,6 +1616,8 @@ def serial_control_thread():
             person_bottom_right_x = global_control_data.get("person_bottom_right_x")
             person_clear_frames = int(global_control_data.get("person_clear_frames", 0))
             person_stop_event = str(global_control_data.get("person_stop_event", ""))
+        debug_keyboard_state = get_debug_drive_keyboard_state()
+        debug_keyboard_stop_active = bool(debug_keyboard_state.get("manual_stop_active", False))
 
         try:
             if sign_llm_collecting:
@@ -1650,6 +1657,8 @@ def serial_control_thread():
             if sign_llm_stop_active:
                 target_speed = 0
             if person_stop_active:
+                target_speed = 0
+            if debug_keyboard_stop_active:
                 target_speed = 0
 
             limit_applied = False
@@ -1698,7 +1707,11 @@ def serial_control_thread():
             person_clear_frames = 0
             person_stop_event = ""
             person_avoid_active = False
+            debug_keyboard_state = get_debug_drive_keyboard_state()
+            debug_keyboard_stop_active = bool(debug_keyboard_state.get("manual_stop_active", False))
             if sign_llm_stop_active or person_stop_active:
+                target_speed = 0
+            if debug_keyboard_stop_active:
                 target_speed = 0
 
         with data_lock:
@@ -1708,6 +1721,9 @@ def serial_control_thread():
                 global_control_data["person_avoid_bias_x"] = 0.0
             global_control_data["actual_servo_pwm"] = servo_pwm
             global_control_data["target_speed"] = target_speed
+            global_control_data["debug_keyboard_enabled"] = bool(debug_keyboard_state.get("enabled", False))
+            global_control_data["debug_keyboard_stop_active"] = bool(debug_keyboard_stop_active)
+            global_control_data["debug_keyboard_message"] = str(debug_keyboard_state.get("message", ""))
             if person_stop_event:
                 global_control_data["person_stop_event"] = ""
 
@@ -1919,6 +1935,26 @@ def index():
     return render_template_string(preview_index_html())
 
 
+@app.route('/debug_drive/start', methods=['POST'])
+def debug_drive_start():
+    state = set_debug_drive_manual_stop(False, key="b", label="发车")
+    return {
+        "ok": True,
+        "manual_stop_active": bool(state.get("manual_stop_active", False)),
+        "message": str(state.get("message", "")),
+    }
+
+
+@app.route('/debug_drive/stop', methods=['POST'])
+def debug_drive_stop():
+    state = set_debug_drive_manual_stop(True, key="e", label="停车")
+    return {
+        "ok": True,
+        "manual_stop_active": bool(state.get("manual_stop_active", False)),
+        "message": str(state.get("message", "")),
+    }
+
+
 @app.route('/video_feed')
 def video_feed():
     """MJPEG 推流接口."""
@@ -1956,6 +1992,7 @@ def video_feed():
 if __name__ == "__main__":
     """按模块顺序启动所有线程和 Flask 服务."""
     install_rknn_warning_filter()
+    start_debug_drive_keyboard_control()
     print_preview_url()
     print_runtime_config_summary()
 

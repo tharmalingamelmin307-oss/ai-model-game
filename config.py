@@ -166,12 +166,12 @@ SIGN_CLASS_ID = 9
 # - 但远距离误判风险会上升
 # detv3 输入从 detv2 的 768x576 换到 512x384，面积类门槛按输入面积比例缩放。
 # 50 * 100 * (512 * 384) / (768 * 576) = 2222。
-OCR_MIN_SIGN_BOX_AREA = 4200
+OCR_MIN_SIGN_BOX_AREA = 3600
 
 # sign 在进入 OCR 前，四周需要保留的最小边距比例。
 # 例如 0.03 表示检测框四边都要距离画面边界至少 3% 的宽/高。
 # 这样可以尽量避开“框看起来够大，但其实有一部分已经贴边截断”的情况。
-OCR_SIGN_EDGE_MARGIN_RATIO = 0.03
+OCR_SIGN_EDGE_MARGIN_RATIO = 0.01
 
 # 语义路牌停车触发比普通 OCR 更严格：框离边缘太近时不停车，避免牌子被截断还触发采样。
 SIGN_LLM_TRIGGER_EDGE_MARGIN_RATIO = 0.05
@@ -556,8 +556,8 @@ BAUD_RATE = 115200
 # 当前并不是直接发电机 PWM，而是发一个速度档位：
 # - CONTROL_MIN_SPEED: 常规最低巡航速度
 # - CONTROL_MAX_SPEED: 直道或轻弯时允许的最高速度
-CONTROL_MIN_SPEED = 40
-CONTROL_MAX_SPEED = 40
+CONTROL_MIN_SPEED = 50
+CONTROL_MAX_SPEED = 55
 
 # 用单一转向控制量做动态降速时的增益。
 # 控制量绝对值越大，说明当前横向偏差/路径趋势越强，目标速度会随之降低。
@@ -583,6 +583,15 @@ SERVO_CENTER = 750
 # 舵机安全最小/最大 PWM。
 # 用于硬限制输出，避免控制算法在极端情况下打到危险位置。
 SERVO_MIN, SERVO_MAX = 590, 910
+
+# 舵机输出低通滤波。作用在最终 servo_pwm 上，专门压车跑起来时的小幅高频抖动。
+# - EMA_ALPHA 越大越稳，但响应越慢；0 表示不滤波，0.35~0.65 常用。
+# - DEADBAND_PWM 表示新旧 PWM 差值小于该值时不更新，避免舵机追 1~2 个 PWM 的噪声。
+# - MAX_STEP 表示每个串口周期最多变化多少 PWM，0 表示不限制。
+SERVO_OUTPUT_FILTER_ENABLED = True
+SERVO_OUTPUT_EMA_ALPHA = 0.15
+SERVO_OUTPUT_DEADBAND_PWM = 2
+SERVO_OUTPUT_MAX_STEP = 8
 
 # 当前启用的转向控制器。
 # - "weighted_slope": 算法 A，原始稳定算法。把路径点到底部中点的斜率做远近加权平均。
@@ -620,15 +629,24 @@ STEER_SIGNAL_PWM_GAIN = 0.02
 STEER_SIGNAL_MIN_DY = 8.0
 # 远近权重指数。越大，越强调靠近图像底部/车身近处的路径点；
 # 越小，远处路径点占比越高。归一化不会抹掉远近信息，主要由这个指数保留远近差异。
-STEER_SIGNAL_ROW_WEIGHT_GAMMA = 1.3
+STEER_SIGNAL_ROW_WEIGHT_GAMMA = 1.2
 # 归一化控制量缩放。归一化后原始 steer_signal 常为个位数，
 # 这里把它放大到更接近旧版累计控制量的显示和 PWM 调参量级。
-STEER_SIGNAL_NORMALIZED_SCALE = 3000.0
+STEER_SIGNAL_NORMALIZED_SCALE = 3300.0
 # A 算法输出端 D 系数，作用在 EMA 后 steer_signal 的帧间变化量上。
 # 默认关闭；想试 A+PD 时先从 0.05 ~ 0.25 小步加。
-STEER_SIGNAL_D_GAIN = 0.5
+STEER_SIGNAL_D_GAIN = 6
 # D 项使用前先对 A 的 steer_signal 做 EMA 平滑。数值越大越稳，但 D 项反应越慢。
-STEER_SIGNAL_D_EMA_ALPHA = 0.3
+STEER_SIGNAL_D_EMA_ALPHA = 0.2
+# A 算法航向角前馈。用路径远/近两行的 x 差估计路径朝向，提前给一点舵。
+# 这项只做小前馈，不替代 P/D；太大会让直道受远处线噪声影响而左右飘。
+STEER_SIGNAL_HEADING_FF_GAIN = 0.12
+# 航向前馈自己的 EMA 平滑。越大越稳但更慢；0 表示不平滑。
+STEER_SIGNAL_HEADING_FF_EMA_ALPHA = 0.5
+# 航向前馈取样行，SEG_SIZE 坐标里 y 越小表示看得越远。
+# far 看弯道趋势，near 看车前路径；两者 x 差 / y 差得到近似航向斜率。
+STEER_SIGNAL_HEADING_FF_FAR_Y = 35.0
+STEER_SIGNAL_HEADING_FF_NEAR_Y = 85.0
 # A 算法普通巡线时只使用这段 y 行范围内的路径点。
 # 这两个值是 SEG_SIZE 坐标里的 y 行号；y 越小表示看得越远。
 # 如果中线最上端低于 SAMPLE_ROW_MIN，会额外补一个 SAMPLE_ROW_MIN 行的点，x 使用最上端点。
@@ -648,7 +666,7 @@ WEIGHTED_SLOPE_SAMPLE_ROW_MAX = 90.0
 # - kappa: 拟合路径在 STANLEY_CURVATURE_LOOKAHEAD_Y 这一行的图像曲率，单位近似为 1/pixel
 # 因为速度暂时只有编码器档位，v_s 先用 STANLEY_SPEED_ESTIMATE 这个调参量。
 # B 算法专用 PWM 映射增益。这里写成独立数值，不引用 A 的 STEER_SIGNAL_PWM_GAIN。
-STANLEY_PWM_GAIN = 0.015
+STANLEY_PWM_GAIN = 0.017
 
 # 横向误差前视行，SEG_SIZE 坐标系。图像 y 越小表示看得越远。
 STANLEY_LOOKAHEAD_Y = 100.0
@@ -657,16 +675,19 @@ STANLEY_HEADING_LOOKAHEAD_Y = 70.0
 # 曲率前馈前视行，选得比横向/航向更远，用来提前感知大弯。
 STANLEY_CURVATURE_LOOKAHEAD_Y = 30.0
 # 横向误差优先使用拟合前中心点在前视行附近的平均值，减少拟合线底部失真影响。
-STANLEY_LATERAL_AVG_HALF_WINDOW = 5.0
+STANLEY_LATERAL_AVG_HALF_WINDOW = 10.0
 # 横向误差增益 k，控制 atan(k * e / (v_s + soft)) 的纠偏力度。
-STANLEY_LATERAL_GAIN = 0.5
+STANLEY_LATERAL_GAIN = 0.38
 # 横向 D 系数 Kd，作用在 EMA 后横向误差的帧间变化量 de 上。
 # 默认关闭；想试 B+d 时先从很小值开始，例如 0.0005 ~ 0.003。
-STANLEY_LATERAL_D_GAIN = 0.020
+STANLEY_LATERAL_D_GAIN = 0.02
 # D 项使用前先对 e 做 EMA 平滑。数值越大越稳，但 D 项反应越慢。
-STANLEY_LATERAL_D_EMA_ALPHA = 0.0
+STANLEY_LATERAL_D_EMA_ALPHA = 0.5
 # 航向误差增益 g_psi。
-STANLEY_HEADING_GAIN = 0.20
+STANLEY_HEADING_GAIN = 0.30
+# 航向误差 psi 的 EMA 平滑。只影响 STANLEY_HEADING_GAIN 非 0 时的航向项。
+# 调大：航向项更稳、更不追拟合线小抖；过大则航向抑制反应变慢。
+STANLEY_HEADING_EMA_ALPHA = 0.5
 # 曲率前馈增益 g_ff。图像坐标曲率不是物理曲率，第一版默认关闭。
 STANLEY_CURVATURE_FF_GAIN = 0.0
 # 轴距 L，单位 m。当前只用于曲率前馈；若 g_ff=0 则不影响输出。
@@ -674,7 +695,7 @@ STANLEY_WHEELBASE_M = 0.20
 # 速度估计 v_s。当前仅算法 B 使用。
 STANLEY_SPEED_ESTIMATE = CONTROL_MAX_SPEED
 # 横向误差软化常数。当前仅算法 B 使用。
-STANLEY_SOFT = 60.0
+STANLEY_SOFT = 80.0
 # Stanley 两项相加后的整体输出缩放。
 # 它决定最终 steer_signal 的量级，再由 STANLEY_PWM_GAIN 映射成 PWM。
 # 增大：整体舵机幅度变大；减小：整体舵机幅度变小。
@@ -687,6 +708,10 @@ STANLEY_MIN_FIT_POINTS = 3
 # ---------------------------------------------------------------------------
 # 转向算法 C: 线性 PD + 航向抑制参数
 # ---------------------------------------------------------------------------
+# B/C 航向角计算方式。True 时用最小二乘直线 x=a*y+b 的斜率 a 算航向；
+# False 时用二次拟合曲线在 HEADING_LOOKAHEAD_Y 的局部切线算航向。
+PATH_HEADING_LINEAR_FIT_ENABLED = True
+
 # C 算法是你现在要调的“中线误差 PD - 航向抑制”控制器。
 #
 # 计算流程:
@@ -724,28 +749,32 @@ CONTROL_C_HEADING_LOOKAHEAD_Y = 35.0
 # 横向误差 e 不是直接取拟合曲线，而是在 CONTROL_C_LOOKAHEAD_Y 附近取拟合前中心点平均。
 # 这里是半窗口高度，5 表示取 y±5 行内的中心点平均。
 # 调大：e 更稳，但会变钝；调小：e 更灵敏，但更容易抖。
-CONTROL_C_LATERAL_AVG_HALF_WINDOW = 5.0
+CONTROL_C_LATERAL_AVG_HALF_WINDOW = 8.0
 
 # 横向 P 系数 Kp，单位约为 steer_signal/pixel，决定“离中线越远，打角越大”的力度。
 # 调大：回中更快、大弯更能拉回来；过大容易左右摆、贴边后反打过猛。
 # 调小：更稳；过小会回正慢、一直偏在一侧。
-CONTROL_C_LATERAL_GAIN = 0.4
+CONTROL_C_LATERAL_GAIN = 0.5
 
 # 横向 D 系数 Kd，作用在 de 上，主要压过冲和慢摆。
 # 调大：更能刹住横向误差变化，出弯回正更利落；过大容易细碎抖。
 # 调小：舵机动作更柔；过小会像纯 P，一偏一拉，来回慢摆。
-CONTROL_C_LATERAL_D_GAIN = 0.0
+CONTROL_C_LATERAL_D_GAIN = 0.2
 
 # D 项使用前先对 e 做 EMA 平滑。数值越大，越相信上一帧，de 越平滑。
 # 调大：D 项更稳、更不抖，但反应更慢。
 # 调小：D 项更灵敏，但更容易把图像/路径微小变化放成舵机抖动。
-CONTROL_C_LATERAL_D_EMA_ALPHA = 0.0
+CONTROL_C_LATERAL_D_EMA_ALPHA = 0.5
 
 # 航向抑制系数 Kyaw，对应公式里的 -Kyaw * psi。
 # 它应该是辅助阻尼，不建议一上来调大。
 # 调大：能压直线小幅打角和出弯拖尾；过大会和横向 P/D 打架，导致弯里转不过或回正奇怪。
 # 调小：更少干预横向控制；如果为 0，就是纯横向 PD。
 CONTROL_C_HEADING_GAIN = 0.0
+
+# 航向误差 psi 的 EMA 平滑。只影响 CONTROL_C_HEADING_GAIN 非 0 时的航向项。
+# 调大：航向项更稳、更不追拟合线小抖；过大则航向抑制反应变慢。
+CONTROL_C_HEADING_EMA_ALPHA = 0.5
 
 # 拟合线至少需要的路径点数；不足时 control_c 输出 0，不会自动切到其它控制器。
 CONTROL_C_MIN_FIT_POINTS = 3
@@ -779,8 +808,22 @@ STEER_SIGNAL_CAR_GAIN = 1.0
 # - sign_llm_*: 大面积语义路牌停车、多次 OCR、千帆判定状态
 # - person_stop_active: 当前是否已经进入“行人强制停车”状态
 # - person_*: 行人停车/放行判定用的最近状态
+# - debug_keyboard_*: 终端键盘调试发车/停车状态
 # - actual_servo_pwm: 当前串口线程真正准备下发的舵机 PWM
 # - target_speed: 当前串口线程真正准备下发的目标速度档位
+
+# 调试发车/停车总开关。默认先停车，避免程序一启动就直接给速度。
+DEBUG_DRIVE_CONTROL_ENABLED = True
+DEBUG_DRIVE_INITIAL_STOPPED = True
+
+# 终端键盘监听开关。VSCode Remote 终端 + AI 插件在板端内存紧张时不稳定，
+# 默认关闭终端 raw keyboard，优先使用网页预览页面的 B/E 按键控制。
+DEBUG_KEYBOARD_DRIVE_ENABLED = False
+DEBUG_KEYBOARD_DRIVE_INITIAL_STOPPED = True
+DEBUG_KEYBOARD_DRIVE_START_KEY = "b"
+DEBUG_KEYBOARD_DRIVE_STOP_KEY = "e"
+DEBUG_KEYBOARD_DRIVE_POLL_INTERVAL = 0.05
+
 DEFAULT_CONTROL_DATA = {
     "steer_signal": 0.0,
     "turn_intent": -1,
@@ -825,6 +868,9 @@ DEFAULT_CONTROL_DATA = {
     "person_miss_frames": 0,
     "person_last_frame_id": -1,
     "person_last_bottom_center_x": None,
+    "debug_keyboard_enabled": False,
+    "debug_keyboard_stop_active": False,
+    "debug_keyboard_message": "",
     "actual_servo_pwm": SERVO_CENTER,
     "target_speed": 10,
 }
@@ -931,7 +977,7 @@ PERSON_CLASS_ID_FALLBACK = 2
 # 触发不做路径 ROI 过滤；person 框底边足够靠近画面底部后停车观察。
 # 当前策略: 先停车观察；确认行人连续横向移动，且框底部中点进入画面中线附近后，再按移动方向绕行。
 # 行人框底边距离画面底部小于该值才触发停车，单位 TARGET_RES 像素。
-PERSON_STOP_TRIGGER_DIST = 320
+PERSON_STOP_TRIGGER_DIST = 240
 # 行人连续向左/向右移动多少帧后，才允许从停车切到绕行。
 PERSON_CLEAR_MOVE_FRAMES = 2
 # 判定“行人横向移动”的最小底部中心 x 增量。
@@ -1038,7 +1084,7 @@ SERIAL_PACKET_TAIL = (0x0D, 0x0A)
 # - 太小: 更灵敏，但更吃 CPU
 # - 太大: 更省资源，但会更“顿”
 # 串口控制线程循环间隔。
-CONTROL_LOOP_SLEEP = 0.025
+CONTROL_LOOP_SLEEP = 0.015
 # 共享内存无新帧时的轮询间隔。
 SHM_FRAME_POLL_SLEEP = 0.002
 # 共享内存连接失败后的重试间隔。
@@ -1252,7 +1298,7 @@ CAR_AVOIDANCE_ENABLED = True
 # 固定分段偏移：检测框底部离画面底部 150 行内开始左偏 60，
 # 80 行内左偏 90。贴右下角且高度较矮时单独固定左偏 50。
 # car 框底部进入底部多少行内后，开始触发普通左偏。
-CAR_AVOIDANCE_START_OFFSET_ROWS = 150.0
+CAR_AVOIDANCE_START_OFFSET_ROWS = 200.0
 # 普通避障阶段的左偏基准量。
 CAR_AVOIDANCE_START_LEFT_OFFSET = 80.0
 # car 更靠近车身时使用的近距离阈值。
