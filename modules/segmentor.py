@@ -89,6 +89,7 @@ class RoadSegmentor:
         self.car_avoidance_state = "FOLLOW_LANE"
         self.car_clearing_frames = 0
         self.car_last_avoid_path = None
+        self.car_last_avoid_path_is_boundary = False
         self.car_last_blocked_y_range = None
         self.car_last_center_bias_sign = 1.0
         self.locked_coin = None
@@ -2039,19 +2040,19 @@ class RoadSegmentor:
         base = np.array(base_path, dtype=np.float32).reshape((-1, 2))
         if len(base) < 2:
             return base, 0.0
+        avoid = np.array(avoid_path, dtype=np.float32).reshape((-1, 2))
+        if len(avoid) != len(base):
+            avoid = base.copy()
 
         miss_frames = max(1, int(getattr(config, "CAR_AVOIDANCE_CLEARING_MISS_FRAMES", 2)))
         decay_frames = max(1, int(getattr(config, "CAR_AVOIDANCE_CLEARING_DECAY_FRAMES", 8)))
         residual_keep = float(getattr(config, "CAR_AVOIDANCE_CLEARING_RESIDUAL_KEEP", 0.35))
         residual_done = float(getattr(config, "CAR_AVOIDANCE_CLEARING_DONE_RESIDUAL", 0.06))
-        max_left_bias = float(getattr(config, "CAR_AVOIDANCE_CLEARING_LEFT_BIAS_MAX", 10.0))
 
         # 只有车框贴右、贴底且高度较小时，才直接固定左偏。
         if fixed_bias_ready:
-            left_bias = float(getattr(config, "CAR_AVOIDANCE_FIXED_LEFT_BIAS_VALUE", 70.0))
             bias_ratio = 1.0
         else:
-            left_bias = max(0.0, max_left_bias)
             if clear_frames <= miss_frames:
                 bias_ratio = 1.0
             else:
@@ -2059,9 +2060,30 @@ class RoadSegmentor:
                 bias_ratio = residual_keep + (residual_done - residual_keep) * t
             bias_ratio = float(np.clip(bias_ratio, 0.0, 1.0))
 
-        mixed = base.copy()
-        mixed[:, 0] = np.clip(mixed[:, 0] - left_bias * bias_ratio, 0.0, float(config.SEG_SIZE[0] - 1))
+        mixed = self._blend_paths(base, avoid, bias_ratio)
+        mixed[:, 0] = np.clip(mixed[:, 0], 0.0, float(config.SEG_SIZE[0] - 1))
         return mixed, bias_ratio
+
+    def _build_car_left_boundary_path(self, base_path, left_boundary, inset_x, w_seg):
+        """把绕车控制基准切到左边界向中线内收后的路径."""
+        base = np.array(base_path, dtype=np.float32).reshape((-1, 2))
+        if len(base) < 2 or left_boundary is None:
+            return base, False
+
+        left_xs = self._interp_path_xs(left_boundary, base[:, 1])
+        if left_xs is None or len(left_xs) != len(base):
+            return base, False
+
+        inset = max(0.0, float(inset_x))
+        to_center = base[:, 0] - left_xs
+        direction = np.sign(to_center)
+        direction[direction == 0.0] = 1.0
+        step = np.minimum(np.abs(to_center), inset)
+
+        planned = base.copy()
+        planned[:, 0] = left_xs + direction * step
+        planned[:, 0] = np.clip(planned[:, 0], 0.0, float(w_seg - 1))
+        return planned.astype(np.float32), True
 
     def _car_fixed_left_bias_ready(self, locked_car, w_seg, h_seg):
         """车框贴右下且高度较小时，使用基础巡线固定左偏。"""
@@ -2611,18 +2633,20 @@ class RoadSegmentor:
         # 目标在路径左边则向右偏，目标在路径右边则向左偏。
         return -1.0 if float(best["bottom_center_x"]) < float(path_x) else 1.0
 
-    def _update_car_avoidance_center_bias(self, base_path, planning_items, w_seg, h_seg):
-        """检测到 car 时，先锁定同一辆车，再输出控制基准偏移量."""
+    def _update_car_avoidance_center_bias(self, base_path, planning_items, w_seg, h_seg, left_boundary=None):
+        """检测到 car 时，先锁定同一辆车，再输出绕车基准线."""
         debug = {
             "blocked_y_range": None,
             "center_bias_x": 0.0,
+            "boundary_inset_x": 0.0,
+            "boundary_path_active": False,
             "state": self.car_avoidance_state,
             "clear_frames": int(self.car_clearing_frames),
             "active": False,
         }
         base = np.array(base_path, dtype=np.float32).reshape((-1, 2))
         if len(base) < 2 or not bool(getattr(config, "CAR_AVOIDANCE_ENABLED", True)):
-            return 0.0, debug
+            return 0.0, debug, None
 
         measurements = []
         for item in planning_items:
@@ -2652,10 +2676,11 @@ class RoadSegmentor:
                     self.car_avoidance_state = "FOLLOW_LANE"
                     self.car_clearing_frames = 0
                     self.car_last_avoid_path = None
+                    self.car_last_avoid_path_is_boundary = False
                     self.car_last_blocked_y_range = None
                     debug["state"] = self.car_avoidance_state
                     debug["clear_frames"] = 0
-                    return 0.0, debug
+                    return 0.0, debug, None
                 miss_bias = (
                     float(getattr(config, "CAR_AVOIDANCE_CLEARING_LEFT_BIAS_MAX", 30.0)) *
                     float(avoid_weight) *
@@ -2664,42 +2689,61 @@ class RoadSegmentor:
                 debug["state"] = self.car_avoidance_state
                 debug["clear_frames"] = int(self.car_clearing_frames)
                 debug["center_bias_x"] = float(miss_bias)
+                debug["boundary_path_active"] = bool(self.car_last_avoid_path_is_boundary)
                 debug["active"] = True
-                return float(miss_bias), debug
-            return 0.0, debug
+                return (
+                    float(miss_bias),
+                    debug,
+                    _clearing_path if self.car_last_avoid_path_is_boundary else None,
+                )
+            return 0.0, debug, None
 
         if self._car_fixed_left_bias_ready(locked_car, w_seg, h_seg):
             self.car_avoidance_state = "CLEARING"
             self.car_clearing_frames = 0
             bias = float(getattr(config, "CAR_AVOIDANCE_FIXED_LEFT_BIAS_VALUE", 50.0))
+            inset = float(getattr(config, "CAR_AVOIDANCE_NEAR_LEFT_BOUNDARY_INSET", 30.0))
+            avoid_path, path_ok = self._build_car_left_boundary_path(base, left_boundary, inset, w_seg)
             self.car_last_center_bias_sign = 1.0
-            self.car_last_avoid_path = base.copy()
+            self.car_last_avoid_path = avoid_path.copy() if path_ok else base.copy()
+            self.car_last_avoid_path_is_boundary = bool(path_ok)
             debug["state"] = self.car_avoidance_state
             debug["clear_frames"] = 0
             debug["fixed_left_bias"] = True
             debug["center_bias_x"] = float(bias)
+            debug["boundary_inset_x"] = float(inset)
+            debug["boundary_path_active"] = bool(path_ok)
             debug["active"] = True
-            return float(bias), debug
+            return float(bias), debug, avoid_path if path_ok else None
 
         bias, y_range = self._car_avoidance_center_bias(locked_car, base, w_seg, h_seg)
 
         if abs(float(bias)) <= 0.0:
             self.locked_car = None
             self.locked_car_miss_frames = 0
-            return 0.0, debug
+            return 0.0, debug, None
 
         if y_range is not None:
             debug["blocked_y_range"] = (float(y_range[0]), float(y_range[1]))
+        near_bias = max(0.0, float(getattr(config, "CAR_AVOIDANCE_NEAR_LEFT_OFFSET", 70.0)))
+        if abs(float(bias)) >= near_bias:
+            inset = float(getattr(config, "CAR_AVOIDANCE_NEAR_LEFT_BOUNDARY_INSET", 30.0))
+        else:
+            inset = float(getattr(config, "CAR_AVOIDANCE_START_LEFT_BOUNDARY_INSET", 20.0))
+        avoid_path, path_ok = self._build_car_left_boundary_path(base, left_boundary, inset, w_seg)
         self.car_last_center_bias_sign = 1.0 if float(bias) >= 0.0 else -1.0
         self.car_avoidance_state = "AVOIDING"
         self.car_clearing_frames = 0
-        self.car_last_avoid_path = base.copy()
+        self.car_last_avoid_path = avoid_path.copy() if path_ok else base.copy()
+        self.car_last_avoid_path_is_boundary = bool(path_ok)
         self.car_last_blocked_y_range = debug["blocked_y_range"]
         debug["state"] = self.car_avoidance_state
         debug["clear_frames"] = 0
         debug["center_bias_x"] = float(bias)
+        debug["boundary_inset_x"] = float(inset)
+        debug["boundary_path_active"] = bool(path_ok)
         debug["active"] = True
-        return float(bias), debug
+        return float(bias), debug, avoid_path if path_ok else None
 
     def infer_mask(self, blob_rgb_320):
         """只执行分割模型推理，返回二值 mask 和推理耗时."""
@@ -2814,6 +2858,7 @@ class RoadSegmentor:
         stone_branch_side = 0
         coin_path_debug = None
         car_path_debug = None
+        car_avoid_path = None
         car_active = False
         car_center_bias_x = 0.0
         external_left_bias_x = float(external_left_bias_x)
@@ -2966,11 +3011,12 @@ class RoadSegmentor:
                 raw_lateral_x = np.clip(raw_lateral_x, 0, w_seg - 1)
                 lateral_path_points = np.vstack((raw_lateral_x, dense_y)).astype(np.float32).T
             base_path_points = path_points_orig.copy()
-            car_center_bias_x, car_path_debug = self._update_car_avoidance_center_bias(
+            car_center_bias_x, car_path_debug, car_avoid_path = self._update_car_avoidance_center_bias(
                 path_points_orig,
                 planning_items,
                 w_seg,
                 h_seg,
+                left_boundary=left_boundary_pts,
             )
             car_active = car_path_debug is not None and car_path_debug.get("active")
             external_left_bias_x = float(external_left_bias_x)
@@ -2982,6 +3028,7 @@ class RoadSegmentor:
                 if abs(float(external_bias_x)) > abs(float(avoid_center_bias_x)):
                     avoid_center_bias_x = external_bias_x
                     avoid_bias_source = "external_car_dir" if car_active else "external"
+                    car_avoid_path = None
             car_state = "FOLLOW_LANE"
             if car_path_debug is not None:
                 car_state = str(car_path_debug.get("state", "FOLLOW_LANE"))
@@ -3018,6 +3065,12 @@ class RoadSegmentor:
                         coin_path_debug["control_coin"] = tuple(map(float, merged_path[0]))
 
             coin_active = coin_path_debug is not None and coin_path_debug.get("active")
+            car_boundary_path_active = (
+                car_active and
+                car_avoid_path is not None and
+                avoid_bias_source == "car" and
+                bool(car_path_debug.get("boundary_path_active", False))
+            )
             bypass_frame_jump = (
                 (coin_active or car_active or external_bias_active) and
                 bool(getattr(config, "COIN_PATH_BYPASS_FRAME_JUMP", True))
@@ -3037,12 +3090,29 @@ class RoadSegmentor:
             self.missing_path_frames = 0
             control_path_points = path_points_orig
             lateral_control_points = lateral_path_points
+            control_mode = str(getattr(config, "STEER_CONTROL_MODE", "weighted_slope")).lower()
+            if (
+                control_mode in ("stanley_band", "control_c") and
+                bool(getattr(config, "PATH_LATERAL_USE_FILTERED_PATH", True))
+            ):
+                lateral_control_points = control_path_points
             if coin_path_debug is not None and coin_path_debug.get("active"):
                 if coin_path_debug.get("control_points") is not None:
                     control_path_points = coin_path_debug["control_points"]
                     lateral_control_points = coin_path_debug["control_points"]
+            elif car_boundary_path_active:
+                control_path_points = car_avoid_path
+                lateral_control_points = car_avoid_path
+                if control_mode == "weighted_slope":
+                    weighted_points = self.path_controller.select_control_points(
+                        control_mode,
+                        car_avoid_path,
+                        h_seg,
+                    )
+                    if weighted_points is not None:
+                        control_path_points = weighted_points
+                        lateral_control_points = weighted_points
             else:
-                control_mode = str(getattr(config, "STEER_CONTROL_MODE", "weighted_slope")).lower()
                 if control_mode == "weighted_slope":
                     weighted_points = self.path_controller.select_control_points(
                         control_mode,
@@ -3056,7 +3126,11 @@ class RoadSegmentor:
                 control_path_points,
                 w_seg,
                 h_seg,
-                center_bias_x=avoid_center_bias_x if (car_active or external_bias_active) else 0.0,
+                center_bias_x=(
+                    0.0 if car_boundary_path_active
+                    else avoid_center_bias_x if (car_active or external_bias_active)
+                    else 0.0
+                ),
                 lateral_points=lateral_control_points,
             )
             if coin_path_debug is not None and coin_path_debug.get("active"):
@@ -3117,6 +3191,8 @@ class RoadSegmentor:
             "merge_state_exit_frames": int(self.merge_state_exit_frames),
             "car_active": bool(car_active),
             "car_center_bias_x": float(car_center_bias_x if car_active else 0.0),
+            "car_boundary_inset_x": float(car_path_debug.get("boundary_inset_x", 0.0)) if car_path_debug is not None else 0.0,
+            "car_boundary_path_active": bool(car_path_debug.get("boundary_path_active", False)) if car_path_debug is not None else False,
             "external_left_bias_x": float(external_left_bias_x),
             "avoid_center_bias_x": float(avoid_center_bias_x if (car_active or external_bias_active) else 0.0),
             "avoid_bias_source": avoid_bias_source,
