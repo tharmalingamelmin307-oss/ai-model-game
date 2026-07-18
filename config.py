@@ -193,7 +193,7 @@ SIGN_LLM_ENABLED = True
 SIGN_LLM_TRIGGER_AREA = 3600
 # 停车后希望采集的有效 OCR 样本数量。
 # 收满后会提交给千帆；如果超时，也可能提前提交已有样本。
-SIGN_LLM_OCR_SAMPLES = 10
+SIGN_LLM_OCR_SAMPLES = 6
 # 最少有效样本数。当前主流程仍倾向收满 SIGN_LLM_OCR_SAMPLES；
 # 这个值保留给采集失败/策略调整时作为下限参考。
 SIGN_LLM_MIN_VALID_SAMPLES = 3
@@ -205,7 +205,7 @@ SIGN_LLM_COLLECT_TIMEOUT = 3.0
 SIGN_LLM_API_TIMEOUT = 10.0
 # 千帆结果允许回写的最大帧龄。
 # 如果结果返回时视觉帧已经过去太久，就丢弃，避免旧路牌影响新路口。
-SIGN_LLM_RESULT_MAX_AGE_FRAMES = 60
+SIGN_LLM_RESULT_MAX_AGE_FRAMES = 200
 # 语义路线完成后，连续看到多少帧单路特征才释放 WAIT_SIGN_GONE/路线锁定。
 SIGN_ROUTE_SINGLE_ROAD_EXIT_FRAMES = 20
 # 按语义路牌选定方向后，进入岔路区域至少保持方向的时间，单位秒。
@@ -425,7 +425,7 @@ MERGE_GUIDE_LINE_MIN_GAP = 13.0
 MERGE_GUIDE_LINE_THICKNESS = 2
 # 汇合状态机：连续命中若干帧才进入补线；进入后等底部赛道宽度稳定恢复再退出。
 # 汇合特征连续命中多少帧才正式进入补线状态。
-MERGE_STATE_CONFIRM_FRAMES = 3
+MERGE_STATE_CONFIRM_FRAMES = 2
 # 汇合特征命中统计窗口，单位秒；窗口内累计命中 CONFIRM_FRAMES 次即确认。
 MERGE_STATE_CONFIRM_WINDOW_SECONDS = 0.5
 # 汇合确认过程中允许偶发漏检多少帧，避免 1/0/1/1 这种抖动把确认计数清零。
@@ -433,7 +433,7 @@ MERGE_STATE_MISS_TOLERANCE_FRAMES = 2
 # 退出补线时检查底部多少行的总白区宽度。
 MERGE_STATE_EXIT_BOTTOM_ROWS = 5
 # 汇合补线进入后至少保持多久，单位秒；在这之前即使满足退出条件也不退出。
-MERGE_STATE_MIN_HOLD_SECONDS = 2.0
+MERGE_STATE_MIN_HOLD_SECONDS = 3.0
 # 底部总白区宽度低于该阈值时，认为更像恢复成单路。
 MERGE_STATE_EXIT_WIDTH_THRESH = 340.0
 # 退出条件连续满足多少帧才真正退出补线状态。
@@ -588,10 +588,10 @@ SERVO_MIN, SERVO_MAX = 590, 910
 # - EMA_ALPHA 越大越稳，但响应越慢；0 表示不滤波，0.35~0.65 常用。
 # - DEADBAND_PWM 表示新旧 PWM 差值小于该值时不更新，避免舵机追 1~2 个 PWM 的噪声。
 # - MAX_STEP 表示每个串口周期最多变化多少 PWM，0 表示不限制。
-SERVO_OUTPUT_FILTER_ENABLED = True
-SERVO_OUTPUT_EMA_ALPHA = 0.15
-SERVO_OUTPUT_DEADBAND_PWM = 2
-SERVO_OUTPUT_MAX_STEP = 8
+SERVO_OUTPUT_FILTER_ENABLED = False
+SERVO_OUTPUT_EMA_ALPHA = 0.0
+SERVO_OUTPUT_DEADBAND_PWM = 0
+SERVO_OUTPUT_MAX_STEP = 0
 
 # 当前启用的转向控制器。
 # - "weighted_slope": 算法 A，原始稳定算法。把路径点到底部中点的斜率做远近加权平均。
@@ -677,17 +677,17 @@ STANLEY_CURVATURE_LOOKAHEAD_Y = 30.0
 # 横向误差优先使用拟合前中心点在前视行附近的平均值，减少拟合线底部失真影响。
 STANLEY_LATERAL_AVG_HALF_WINDOW = 10.0
 # 横向误差增益 k，控制 atan(k * e / (v_s + soft)) 的纠偏力度。
-STANLEY_LATERAL_GAIN = 0.37
+STANLEY_LATERAL_GAIN = 0.35
 # 横向 D 系数 Kd，作用在 EMA 后横向误差的帧间变化量 de 上。
 # 默认关闭；想试 B+d 时先从很小值开始，例如 0.0005 ~ 0.003。
 STANLEY_LATERAL_D_GAIN = 0.029
 # D 项使用前先对 e 做 EMA 平滑。数值越大越稳，但 D 项反应越慢。
 STANLEY_LATERAL_D_EMA_ALPHA = 0.5
 # 航向误差增益 g_psi。
-STANLEY_HEADING_GAIN = 0.29
+STANLEY_HEADING_GAIN = 0.35
 # 航向误差 psi 的 EMA 平滑。只影响 STANLEY_HEADING_GAIN 非 0 时的航向项。
 # 调大：航向项更稳、更不追拟合线小抖；过大则航向抑制反应变慢。
-STANLEY_HEADING_EMA_ALPHA = 0.4
+STANLEY_HEADING_EMA_ALPHA = 0.3
 # 曲率前馈增益 g_ff。图像坐标曲率不是物理曲率，第一版默认关闭。
 STANLEY_CURVATURE_FF_GAIN = 0.1
 # 轴距 L，单位 m。当前只用于曲率前馈；若 g_ff=0 则不影响输出。
@@ -987,7 +987,7 @@ PERSON_CLASS_ID_FALLBACK = 2
 # 行人框底边距离画面底部小于该值才触发停车，单位 TARGET_RES 像素。
 PERSON_STOP_TRIGGER_DIST = 340
 # 行人框面积至少达到该值，才允许触发行人停车，单位 TARGET_RES 像素面积。
-PERSON_STOP_MIN_AREA = 3000
+PERSON_STOP_MIN_AREA = 8000
 # 行人朝目标侧连续移动多少帧后，才允许从停车切到绕行。
 PERSON_CLEAR_MOVE_FRAMES = 2
 # 判定“行人横向移动”的最小底部中心 x 增量。
@@ -1105,7 +1105,7 @@ SERIAL_PACKET_TAIL = (0x0D, 0x0A)
 # - 太小: 更灵敏，但更吃 CPU
 # - 太大: 更省资源，但会更“顿”
 # 串口控制线程循环间隔。
-CONTROL_LOOP_SLEEP = 0.015
+CONTROL_LOOP_SLEEP = 0.01
 # 共享内存无新帧时的轮询间隔。
 SHM_FRAME_POLL_SLEEP = 0.002
 # 共享内存连接失败后的重试间隔。

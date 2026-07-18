@@ -296,7 +296,7 @@
 14. 如果没有明确石头干预，则使用语义路牌状态机写入的 `turn_intent`；没有有效结果时默认偏向左支
 15. 对最终路径做多项式拟合
 16. 对拟合系数做 EMA 平滑
-17. 结合金币规划和避车状态机选择控制路径或控制中心偏移
+17. 结合金币规划和避车状态机选择控制路径或避车基准线
 18. 调用 `modules/path_controller.py`，按 `STEER_CONTROL_MODE` 将路径转换成单一 `steer_signal`
 19. 调用 `modules/debug_tools.py` 渲染调试画线、文字和网页预览相关输出
 
@@ -336,10 +336,10 @@
 当前避障不是“检测到车就一路加大左偏，丢车就立刻回正”，而是一个轻量状态机：
 
 1. 先锁定同一辆车，锁定依据主要看车框底部中心点连续性
-2. 进入避障后，不重画绕车路径，而是输出 `center_bias_x`
-3. 控制计算时临时偏移车身对齐基准，让车辆绕开障碍车
+2. 进入避障后，把控制基准线切到左边界向中线内收后的路径
+3. 普通阶段使用 `CAR_AVOIDANCE_LEFT_BOUNDARY_INSET`，近距离使用 `CAR_AVOIDANCE_NEAR_LEFT_BOUNDARY_INSET`
 4. 如果绕行途中车框短暂丢失，不立即回正，而是先进入 `CLEARING`
-5. `CLEARING` 会保留一段残余偏置，再按帧数逐渐回到普通巡线中心
+5. `CLEARING` 会保留上一条绕车基准线，再按帧数逐渐回到普通巡线中心
 
 这套做法的目的很直接：
 
@@ -369,15 +369,18 @@
 1. YOLO 检测 `person`
 2. 取最靠近车身的行人框，也就是底边 `y` 最大的那个框
 3. 如果行人框底边到画面底部距离小于 `PERSON_STOP_TRIGGER_DIST`
-4. 先进入 `person_stop_active`，串口速度强制置零
-5. 停车期间持续观察行人框底部中心点
-6. 当行人底部中心连续向左移动 `PERSON_CLEAR_MOVE_FRAMES` 帧，并且越过由 `PERSON_CLEAR_LANE_RATIO` 定义的当前车道放行线，解除行人停车
-7. 如果行人连续丢失 `PERSON_STOP_MISS_RELEASE_FRAMES` 帧，也解除行人停车
+4. 再检查行人框面积是否大于 `PERSON_STOP_MIN_AREA`
+5. 两个条件都满足才进入 `person_stop_active`，串口速度强制置零
+6. 停车期间持续观察行人框底部中心点
+7. 若 `PERSON_AVOID_ENABLED=True`，则当行人底部中心连续朝目标方向移动 `PERSON_CLEAR_MOVE_FRAMES` 帧，且进入中线附近 50px 带，解除停车并进入绕行
+8. 绕行时控制基准线切到边界向中线内收，默认使用左边界 `PERSON_AVOID_LEFT_BOUNDARY_INSET`
+9. 若 `PERSON_AVOID_USE_CAR_SIDE=True`，则 car 在左时用右边界内收，car 在右或未判定时用左边界内收
+10. 绕行期间行人连续漏检并保持 `PERSON_AVOID_EXIT_HOLD_FRAMES` 帧后结束绕行
 
 关键点：
 
 - 触发停车只看“底部是否靠近”，不先要求行人在路径 ROI 内
-- 放行才看当前选中路径的左边界，岔路和汇合时跟随当前选择的那条路
+- 绕行使用当前选中路径的左边界，岔路和汇合时跟随当前选择的那条路
 - 同一帧 YOLO 结果不会被流水线重复计入“连续左移帧”
 - 页面上会显示 `STOP_BY_PERSON`，终端会打印行人底边距离、底边右端、左边界和连续左移放行帧数
 
@@ -628,6 +631,10 @@ target_speed = 0                                # 若红/黄灯停车或行人�
 | **公共舵机输出** |  |
 | `SERVO_CENTER` | 舵机中位 PWM |
 | `SERVO_MIN` / `SERVO_MAX` | 舵机 PWM 安全上下限 |
+| `SERVO_OUTPUT_FILTER_ENABLED` | 是否启用最终舵机 PWM 输出滤波 |
+| `SERVO_OUTPUT_EMA_ALPHA` | 舵机输出 EMA 平滑系数，0 表示不滤波 |
+| `SERVO_OUTPUT_DEADBAND_PWM` | 舵机输出死区，小于该 PWM 差值时不更新 |
+| `SERVO_OUTPUT_MAX_STEP` | 舵机每个控制周期最大 PWM 步长，0 表示不限制 |
 | `STEER_CONTROL_MODE` | 转向控制器模式，`weighted_slope` 为算法 A，`stanley_band` 为算法 B，`control_c` 为算法 C |
 | **算法 A: `weighted_slope`** | 原始稳定算法，把路径点到底部中点的斜率做远近加权平均 |
 | `STEER_SIGNAL_PWM_GAIN` | `weighted_slope` 的 steer_signal 转舵机 PWM 增益 |
@@ -704,10 +711,16 @@ target_speed = 0                                # 若红/黄灯停车或行人�
 | `ZEBRA_CROSSING_CLASS_ID_FALLBACK` / `PERSON_CLASS_ID_FALLBACK` | 类别名查找失败时的回退 id |
 | `TRAFFIC_LIGHT_RED_CLASS_ID_FALLBACK` / `TRAFFIC_LIGHT_GREEN_CLASS_ID_FALLBACK` / `TRAFFIC_LIGHT_YELLOW_CLASS_ID_FALLBACK` | 交通灯回退 id |
 | `PERSON_STOP_TRIGGER_DIST` | 行人底边距画面底部多近时触发停车 |
-| `PERSON_CLEAR_MOVE_FRAMES` | 行人连续左移多少帧才允许放行 |
-| `PERSON_CLEAR_MIN_LEFT_DX` | 单帧左移最小像素量 |
-| `PERSON_CLEAR_LANE_RATIO` | 行人放行线在当前车道左右边界间的位置 |
-| `PERSON_STOP_MISS_RELEASE_FRAMES` | 行人连续丢失多少帧后解除停车 |
+| `PERSON_STOP_MIN_AREA` | 行人框面积至少多大才允许触发停车 |
+| `PERSON_STOP_MAX_SECONDS` | 行人停车状态最长保持多少秒 |
+| `PERSON_AVOID_ENABLED` | 是否启用行人绕行分支 |
+| `PERSON_CLEAR_MOVE_FRAMES` | 行人朝目标侧连续移动多少帧才允许进入绕行 |
+| `PERSON_CLEAR_MIN_MOVE_DX` | 单帧横移最小像素量 |
+| `PERSON_CLEAR_CENTER_WINDOW_X` | 进入绕行前必须落入的中线侧向窗口宽度 |
+| `PERSON_AVOID_USE_CAR_SIDE` | 是否按 car 左右动态选择行人绕行边界 |
+| `PERSON_AVOID_DEFAULT_BOUNDARY_SIDE` | 关闭动态选择时的默认绕行边界 |
+| `PERSON_AVOID_LEFT_BOUNDARY_INSET` / `PERSON_AVOID_RIGHT_BOUNDARY_INSET` | 行人绕行时左/右边界向中线内收量 |
+| `PERSON_AVOID_EXIT_MISSING_FRAMES` / `PERSON_AVOID_EXIT_HOLD_FRAMES` | 行人绕行退出漏检与保持帧数 |
 | `LIMIT_SIGN_EFFECTIVE_SPEED_OFFSET` | 限速牌识别值生效前扣掉的保守余量 |
 | `OCR_MATCH_INIT_DIST` | OCR 文本框匹配检测框时的初始最大距离 |
 | `OCR_DET_INPUT_SIZE` | OCR det 输入尺寸 |
@@ -763,8 +776,8 @@ target_speed = 0                                # 若红/黄灯停车或行人�
 | 参数 | 用途 |
 |---|---|
 | `CAR_AVOIDANCE_ENABLED` | 是否启用 car 避障状态机 |
-| `CAR_AVOIDANCE_START_OFFSET_ROWS` / `CAR_AVOIDANCE_START_LEFT_OFFSET` | car 进入远距离避障窗口和对应中心偏移 |
-| `CAR_AVOIDANCE_NEAR_OFFSET_ROWS` / `CAR_AVOIDANCE_NEAR_LEFT_OFFSET` | car 进入近距离窗口和对应中心偏移 |
+| `CAR_AVOIDANCE_LEFT_BOUNDARY_INSET` | 锁定 car 后，左边界向中线内收的普通绕车基准 |
+| `CAR_AVOIDANCE_NEAR_BOUNDARY_ROWS` / `CAR_AVOIDANCE_NEAR_LEFT_BOUNDARY_INSET` | 近距离判定窗口和对应左边界内收量 |
 | `CAR_AVOIDANCE_LOCK_HIT_FRAMES` | car 连续命中多少帧才确认锁定 |
 | `CAR_AVOIDANCE_SEARCH_RADIUS` | car 跟踪匹配搜索半径 |
 | `CAR_AVOIDANCE_SEARCH_RADIUS_MISS_GAIN` | car 漏检时搜索半径扩大增益 |
@@ -772,14 +785,12 @@ target_speed = 0                                # 若红/黄灯停车或行人�
 | `CAR_AVOIDANCE_MISS_FRAMES` | car 锁定后允许连续漏检帧数 |
 | `CAR_AVOIDANCE_MIN_SCORE` | car 避障最低置信度 |
 | `CAR_AVOIDANCE_MAX_AREA` | car 最大面积过滤，0 表示关闭 |
-| `CAR_AVOIDANCE_CLEARING_MISS_FRAMES` | CLEARING 起步时保持残余偏置的帧数 |
-| `CAR_AVOIDANCE_CLEARING_DECAY_FRAMES` | CLEARING 偏置衰减帧数 |
-| `CAR_AVOIDANCE_CLEARING_RESIDUAL_KEEP` | CLEARING 初期残余偏置比例 |
+| `CAR_AVOIDANCE_CLEARING_MISS_FRAMES` | CLEARING 起步时保持绕车基准线的帧数 |
+| `CAR_AVOIDANCE_CLEARING_DECAY_FRAMES` | CLEARING 绕车基准线衰减帧数 |
+| `CAR_AVOIDANCE_CLEARING_RESIDUAL_KEEP` | CLEARING 初期绕车基准线保留比例 |
 | `CAR_AVOIDANCE_CLEARING_DONE_RESIDUAL` | CLEARING 结束残余比例门槛 |
-| `CAR_AVOIDANCE_CLEARING_LEFT_BIAS_MAX` | car 丢失后最大残余中心偏移 |
-| `CAR_AVOIDANCE_FIXED_LEFT_BIAS_HEIGHT_THRESH` | 触发贴右下固定左偏的车框高度阈值 |
-| `CAR_AVOIDANCE_FIXED_LEFT_BIAS_RIGHT_MARGIN` / `CAR_AVOIDANCE_FIXED_LEFT_BIAS_BOTTOM_MARGIN` | 贴右/贴底判定边距 |
-| `CAR_AVOIDANCE_FIXED_LEFT_BIAS_VALUE` | 贴右下特殊情况固定中心偏移 |
+| `CAR_AVOIDANCE_FIXED_BOUNDARY_HEIGHT_THRESH` | 触发贴右下近距离边界基准的车框高度阈值 |
+| `CAR_AVOIDANCE_FIXED_BOUNDARY_RIGHT_MARGIN` / `CAR_AVOIDANCE_FIXED_BOUNDARY_BOTTOM_MARGIN` | 贴右/贴底判定边距 |
 | `CAR_AVOIDANCE_COIN_ALLOW_BOTTOM_ROWS` | AVOIDING 时允许 coin 位于车辆阻挡区底部附近的行数 |
 | `CAR_AVOIDANCE_CLEARING_COIN_SAFE_ROWS` | CLEARING 时 coin 必须靠底的安全行数 |
 | `COIN_PATH_ENABLED` | 是否启用 coin 分段路径规划 |
