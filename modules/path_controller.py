@@ -97,13 +97,23 @@ class PathController:
                 float(getattr(config, "STANLEY_LOOKAHEAD_Y", 70.0)),
                 float(getattr(
                     config,
-                    "STANLEY_HEADING_LOOKAHEAD_Y",
-                    getattr(config, "STANLEY_LOOKAHEAD_Y", 70.0),
+                    "STANLEY_HEADING_Y_TOP",
+                    getattr(config, "STANLEY_HEADING_FAR_Y", getattr(config, "STANLEY_HEADING_LOOKAHEAD_Y", 70.0)),
                 )),
                 float(getattr(
                     config,
-                    "STANLEY_CURVATURE_LOOKAHEAD_Y",
-                    getattr(config, "STANLEY_HEADING_LOOKAHEAD_Y", 70.0),
+                    "STANLEY_HEADING_Y_BOTTOM",
+                    getattr(config, "STANLEY_HEADING_NEAR_Y", getattr(config, "STANLEY_LOOKAHEAD_Y", 70.0)),
+                )),
+                float(getattr(
+                    config,
+                    "STANLEY_FF_Y_TOP",
+                    getattr(config, "STANLEY_FF_FAR_Y", getattr(config, "STANLEY_CURVATURE_LOOKAHEAD_Y", 30.0)),
+                )),
+                float(getattr(
+                    config,
+                    "STANLEY_FF_Y_BOTTOM",
+                    getattr(config, "STANLEY_FF_NEAR_Y", getattr(config, "STANLEY_HEADING_LOOKAHEAD_Y", 70.0)),
                 )),
             ]
             return self._rows_to_band(sample_rows, img_h)
@@ -213,7 +223,7 @@ class PathController:
         lateral_half_window=5.0,
         min_fit_points=3,
     ):
-        """提取前视横向误差、拟合线航向和曲率，供 B/C 控制器复用."""
+        """提取前视横向误差、拟合线航向和曲率，供 C 控制器复用."""
         if path_points is None or len(path_points) == 0:
             return None
 
@@ -277,17 +287,91 @@ class PathController:
             "curvature": float(curvature),
         }
 
+    def _compute_stanley_point_geometry(
+        self,
+        path_points,
+        img_w,
+        img_h,
+        *,
+        center_bias_x=0.0,
+        lateral_points=None,
+        lookahead_y=70.0,
+        heading_y_top=80.0,
+        heading_y_bottom=120.0,
+        ff_y_top=25.0,
+        ff_y_bottom=60.0,
+        lateral_half_window=5.0,
+        min_fit_points=3,
+    ):
+        """提取 Stanley 用的横向误差、两点航向角和两点前馈角."""
+        if path_points is None or len(path_points) == 0:
+            return None
+
+        pts = np.array(path_points, dtype=np.float32).reshape((-1, 2))
+        min_fit_points = max(2, int(min_fit_points))
+        if len(pts) < min_fit_points:
+            return None
+
+        bottom_mid_x = float(img_w) / 2.0 + float(center_bias_x)
+        bottom_y = float(img_h) - 1.0
+        lookahead_y = float(np.clip(lookahead_y, 0.0, bottom_y))
+
+        control_pts = pts
+
+        path_x = None
+        half_window = max(0.0, float(lateral_half_window))
+        lateral_mask = np.abs(control_pts[:, 1] - lookahead_y) <= half_window
+        window_pts = control_pts[lateral_mask]
+        if len(window_pts) > 0:
+            path_x = float(np.mean(window_pts[:, 0]))
+        if path_x is None:
+            path_x = self._path_x_at_y_points(control_pts, lookahead_y)
+        if path_x is None:
+            return None
+
+        heading_error = self._path_angle_between_rows(pts, heading_y_top, heading_y_bottom, bottom_y)
+        if heading_error is None:
+            return None
+        ff_heading_error = self._path_angle_between_rows(pts, ff_y_top, ff_y_bottom, bottom_y)
+        if ff_heading_error is None:
+            ff_heading_error = heading_error
+
+        return {
+            "lateral_error": float(path_x) - bottom_mid_x,
+            "heading_error": float(heading_error),
+            "ff_heading_error": float(ff_heading_error),
+        }
+
+    def _path_angle_between_rows(self, path_points, y_top, y_bottom, bottom_y):
+        """用两条 y 行上的路径点估计相对图像竖直方向的角度."""
+        y_top = float(np.clip(float(y_top), 0.0, bottom_y))
+        y_bottom = float(np.clip(float(y_bottom), 0.0, bottom_y))
+        dy = y_bottom - y_top
+        if abs(dy) < 1e-6:
+            return None
+
+        top_x = self._path_x_at_y_points(path_points, y_top)
+        bottom_x = self._path_x_at_y_points(path_points, y_bottom)
+        if top_x is None or bottom_x is None:
+            return None
+
+        dx_dy = (float(bottom_x) - float(top_x)) / dy
+        dx_dy = float(np.clip(dx_dy, -2.0, 2.0))
+        return float(np.arctan(-dx_dy))
+
     def _compute_stanley_band_steer_signal(self, path_points, img_w, img_h, center_bias_x=0.0, lateral_points=None):
         """算法 B: 按前视行 Stanley 公式计算转向量."""
-        geom = self._compute_path_control_geometry(
+        geom = self._compute_stanley_point_geometry(
             path_points,
             img_w,
             img_h,
             center_bias_x=center_bias_x,
             lateral_points=lateral_points,
             lookahead_y=float(getattr(config, "STANLEY_LOOKAHEAD_Y", 70.0)),
-            heading_y=float(getattr(config, "STANLEY_HEADING_LOOKAHEAD_Y", getattr(config, "STANLEY_LOOKAHEAD_Y", 70.0))),
-            curvature_y=float(getattr(config, "STANLEY_CURVATURE_LOOKAHEAD_Y", getattr(config, "STANLEY_HEADING_LOOKAHEAD_Y", 70.0))),
+            heading_y_top=float(getattr(config, "STANLEY_HEADING_Y_TOP", getattr(config, "STANLEY_HEADING_FAR_Y", getattr(config, "STANLEY_HEADING_LOOKAHEAD_Y", 70.0)))),
+            heading_y_bottom=float(getattr(config, "STANLEY_HEADING_Y_BOTTOM", getattr(config, "STANLEY_HEADING_NEAR_Y", getattr(config, "STANLEY_LOOKAHEAD_Y", 70.0)))),
+            ff_y_top=float(getattr(config, "STANLEY_FF_Y_TOP", getattr(config, "STANLEY_FF_FAR_Y", getattr(config, "STANLEY_CURVATURE_LOOKAHEAD_Y", 30.0)))),
+            ff_y_bottom=float(getattr(config, "STANLEY_FF_Y_BOTTOM", getattr(config, "STANLEY_FF_NEAR_Y", getattr(config, "STANLEY_HEADING_LOOKAHEAD_Y", 70.0)))),
             lateral_half_window=float(getattr(config, "STANLEY_LATERAL_AVG_HALF_WINDOW", 5.0)),
             min_fit_points=int(getattr(config, "STANLEY_MIN_FIT_POINTS", 3)),
         )
@@ -297,7 +381,7 @@ class PathController:
 
         lateral_error = geom["lateral_error"]
         heading_error = geom["heading_error"]
-        curvature = geom["curvature"]
+        ff_heading_error = geom["ff_heading_error"]
 
         soft = max(1e-6, float(getattr(config, "STANLEY_SOFT", 24.0)))
         speed_estimate = max(0.0, float(getattr(config, "STANLEY_SPEED_ESTIMATE", 0.0)))
@@ -305,7 +389,6 @@ class PathController:
         heading_gain = float(getattr(config, "STANLEY_HEADING_GAIN", 0.85))
         d_gain = float(getattr(config, "STANLEY_LATERAL_D_GAIN", 0.0))
         curvature_gain = float(getattr(config, "STANLEY_CURVATURE_FF_GAIN", 0.0))
-        wheelbase_m = float(getattr(config, "STANLEY_WHEELBASE_M", 0.20))
         signal_scale = float(getattr(config, "STANLEY_SIGNAL_SCALE", 10000.0))
 
         ema_alpha = float(getattr(config, "STANLEY_LATERAL_D_EMA_ALPHA", 0.65))
@@ -335,8 +418,9 @@ class PathController:
         lateral_term = float(np.arctan(lateral_gain * lateral_error / (speed_estimate + soft)))
         d_term = d_gain * error_delta
         heading_term = heading_gain * filtered_heading_error
-        curvature_term = curvature_gain * float(np.arctan(wheelbase_m * curvature))
-        return (lateral_term + d_term + heading_term + curvature_term) * signal_scale
+        curvature_term = curvature_gain * float(ff_heading_error)
+        output_sign = float(getattr(config, "STANLEY_OUTPUT_SIGN", 1.0))
+        return output_sign * (lateral_term + d_term + heading_term + curvature_term) * signal_scale
 
     def _compute_control_c_steer_signal(self, path_points, img_w, img_h, center_bias_x=0.0, lateral_points=None):
         """算法 C: Kp*e + Kd*de - Kyaw*psi."""

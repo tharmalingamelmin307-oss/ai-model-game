@@ -262,7 +262,7 @@ def has_car_on_left(boxes, left_boundary_x=None, right_boundary_x=None):
 
 
 def update_person_stop_state(state, person_info, left_boundary_x, right_boundary_x, yolo_frame_id, car_on_left=False):
-    """行人靠近时先停车；确认连续横移且到达中线附近后，切边界内收基准线绕行."""
+    """行人靠近时先停车；确认其沿当前方向越过放行线后，再释放或切边界内收基准线绕行."""
     active = bool(state.get("person_stop_active", False))
     avoid_active = bool(state.get("person_avoid_active", False))
     prev_active = active
@@ -283,6 +283,7 @@ def update_person_stop_state(state, person_info, left_boundary_x, right_boundary
     stop_started_at = state.get("person_stop_started_at")
     max_released = bool(state.get("person_stop_max_released", False))
     now = time.monotonic()
+    released_by_line = False
 
     if person_info is None:
         miss_frames += 1
@@ -314,7 +315,10 @@ def update_person_stop_state(state, person_info, left_boundary_x, right_boundary
         state["person_car_on_left"] = False
         state["person_left_boundary_x"] = None
         state["person_right_boundary_x"] = None
+        state["person_road_center_x"] = None
         state["person_clear_line_x"] = None
+        state["person_clear_line_side"] = ""
+        state["person_stop_cutoff_y"] = None
         state["person_miss_frames"] = miss_frames
         state["person_clear_frames"] = clear_frames
         state["person_avoid_hold_frames"] = avoid_hold_frames
@@ -355,8 +359,12 @@ def update_person_stop_state(state, person_info, left_boundary_x, right_boundary
     elif dx <= -min_move_dx:
         current_direction = -1
 
-    target_center_x = float(config.TARGET_RES[0]) / 2.0
-    center_window_x = float(getattr(config, "PERSON_CLEAR_CENTER_WINDOW_X", 50.0))
+    image_center_x = float(config.TARGET_RES[0]) / 2.0
+    road_center_x = image_center_x
+    if left_boundary_x is not None and right_boundary_x is not None:
+        road_center_x = 0.5 * (float(left_boundary_x) + float(right_boundary_x))
+    target_h = float(config.TARGET_RES[1])
+    clear_line_offset_x = float(getattr(config, "PERSON_CLEAR_LINE_OFFSET_X", 18.0))
     avoid_enabled = bool(getattr(config, "PERSON_AVOID_ENABLED", True))
     if bool(getattr(config, "PERSON_AVOID_USE_CAR_SIDE", False)):
         pending_avoid_side = "right" if bool(car_on_left) else "left"
@@ -364,10 +372,8 @@ def update_person_stop_state(state, person_info, left_boundary_x, right_boundary
         pending_avoid_side = str(getattr(config, "PERSON_AVOID_DEFAULT_BOUNDARY_SIDE", "left")).lower()
     if pending_avoid_side not in ("left", "right"):
         pending_avoid_side = "left"
-    required_direction = 1 if pending_avoid_side == "left" else -1
-    clear_line_x = target_center_x
-    in_avoid_start_window = abs(bottom_center_x - target_center_x) <= center_window_x
     trigger_dist = float(config.PERSON_STOP_TRIGGER_DIST)
+    stop_cutoff_y = max(0.0, min(target_h - 1.0, target_h - trigger_dist))
     min_area = float(getattr(config, "PERSON_STOP_MIN_AREA", 0.0))
     near_bottom = dist_to_bottom <= trigger_dist
     enough_area = False
@@ -377,6 +383,16 @@ def update_person_stop_state(state, person_info, left_boundary_x, right_boundary
     missing_started_at = None
     if not near_bottom:
         max_released = False
+
+    release_direction = current_direction if current_direction != 0 else move_direction
+    clear_line_x = road_center_x
+    clear_line_side = ""
+    if release_direction > 0:
+        clear_line_x = road_center_x + clear_line_offset_x
+        clear_line_side = "right"
+    elif release_direction < 0:
+        clear_line_x = road_center_x - clear_line_offset_x
+        clear_line_side = "left"
 
     if near_bottom:
         if enough_area and not avoid_active and not max_released:
@@ -388,7 +404,13 @@ def update_person_stop_state(state, person_info, left_boundary_x, right_boundary
     miss_frames = 0
     avoid_hold_frames = 0
 
-    if avoid_enabled and active and in_avoid_start_window and current_direction == required_direction:
+    line_reached = False
+    if release_direction > 0:
+        line_reached = bottom_center_x >= clear_line_x
+    elif release_direction < 0:
+        line_reached = bottom_center_x <= clear_line_x
+
+    if active and line_reached and release_direction != 0:
         clear_frames += 1
     else:
         clear_frames = 0
@@ -397,21 +419,25 @@ def update_person_stop_state(state, person_info, left_boundary_x, right_boundary
         elif not active:
             move_direction = 0
 
-    if avoid_enabled and active and clear_frames >= int(config.PERSON_CLEAR_MOVE_FRAMES):
+    if active and clear_frames >= int(config.PERSON_CLEAR_MOVE_FRAMES):
         active = False
         clear_frames = 0
-        avoid_active = True
+        avoid_active = bool(avoid_enabled)
         avoid_hold_frames = 0
         stop_started_at = None
-        max_released = False
-        avoid_side = pending_avoid_side
-        inset_attr = (
-            "PERSON_AVOID_RIGHT_BOUNDARY_INSET"
-            if avoid_side == "right"
-            else "PERSON_AVOID_LEFT_BOUNDARY_INSET"
-        )
-        state["person_avoid_boundary_side"] = avoid_side
-        state["person_avoid_boundary_inset_x"] = float(getattr(config, inset_attr, 25.0))
+        max_released = True
+        if avoid_enabled:
+            avoid_side = pending_avoid_side
+            inset_attr = (
+                "PERSON_AVOID_RIGHT_BOUNDARY_INSET"
+                if avoid_side == "right"
+                else "PERSON_AVOID_LEFT_BOUNDARY_INSET"
+            )
+            state["person_avoid_boundary_side"] = avoid_side
+            state["person_avoid_boundary_inset_x"] = float(getattr(config, inset_attr, 25.0))
+        else:
+            max_released = True
+            released_by_line = True
     elif not avoid_enabled:
         avoid_active = False
         avoid_hold_frames = 0
@@ -447,7 +473,10 @@ def update_person_stop_state(state, person_info, left_boundary_x, right_boundary
     state["person_car_on_left"] = bool(car_on_left)
     state["person_left_boundary_x"] = left_boundary_x
     state["person_right_boundary_x"] = right_boundary_x
+    state["person_road_center_x"] = road_center_x
     state["person_clear_line_x"] = clear_line_x
+    state["person_clear_line_side"] = clear_line_side
+    state["person_stop_cutoff_y"] = stop_cutoff_y
     state["person_clear_frames"] = clear_frames
     state["person_miss_frames"] = miss_frames
     state["person_avoid_hold_frames"] = avoid_hold_frames
@@ -459,6 +488,8 @@ def update_person_stop_state(state, person_info, left_boundary_x, right_boundary
     state["person_last_bottom_center_x"] = bottom_center_x
     if not prev_active and active:
         state["person_stop_event"] = "stop"
+    elif prev_active and not active and released_by_line:
+        state["person_stop_event"] = "release_line"
     elif prev_active and not active and avoid_active:
         state["person_stop_event"] = "avoid_boundary"
     elif prev_active and not active:
@@ -1410,6 +1441,10 @@ def seg_worker(core_id, worker_id=0):
                 current_yolo_frame_id,
                 person_car_on_left,
             )
+            person_clear_line_x = global_control_data.get("person_clear_line_x")
+            person_clear_line_side = str(global_control_data.get("person_clear_line_side", ""))
+            person_stop_cutoff_y = global_control_data.get("person_stop_cutoff_y")
+            person_road_center_x = global_control_data.get("person_road_center_x")
 
             actual_servo = global_control_data.get("actual_servo_pwm", config.SERVO_CENTER)
             actual_speed = global_control_data.get("target_speed", config.CONTROL_MIN_SPEED)
@@ -1434,6 +1469,41 @@ def seg_worker(core_id, worker_id=0):
             current_yolo_fps = fps_stats["yolo_fps"]
 
         if rendered_img is not None:
+            if person_info is not None:
+                target_w, target_h = config.TARGET_RES
+                scale_y = rendered_img.shape[0] / float(target_h)
+                default_cutoff_y = float(target_h) - float(getattr(config, "PERSON_STOP_TRIGGER_DIST", 0.0))
+                cutoff_y = default_cutoff_y if person_stop_cutoff_y is None else float(person_stop_cutoff_y)
+                line_y = int(round(float(cutoff_y) * scale_y))
+                line_y = max(0, min(rendered_img.shape[0] - 1, line_y))
+                cv2.line(
+                    rendered_img,
+                    (0, line_y),
+                    (rendered_img.shape[1] - 1, line_y),
+                    getattr(config, "PERSON_STOP_CUTOFF_LINE_COLOR", (0, 255, 255)),
+                    max(1, int(getattr(config, "PERSON_STOP_CUTOFF_LINE_THICKNESS", 2))),
+                    cv2.LINE_AA,
+                )
+                if bool(getattr(config, "PERSON_DEBUG_DRAW_RELEASE_LINE", False)):
+                    scale_x = rendered_img.shape[1] / float(target_w)
+                    release_xs = []
+                    if person_clear_line_x is not None and person_clear_line_side in ("left", "right"):
+                        release_xs.append(float(person_clear_line_x))
+                    else:
+                        center_x = float(target_w) / 2.0 if person_road_center_x is None else float(person_road_center_x)
+                        offset_x = float(getattr(config, "PERSON_CLEAR_LINE_OFFSET_X", 18.0))
+                        release_xs.extend([center_x - offset_x, center_x + offset_x])
+                    for release_x in release_xs:
+                        line_x = int(round(float(release_x) * scale_x))
+                        line_x = max(0, min(rendered_img.shape[1] - 1, line_x))
+                        cv2.line(
+                            rendered_img,
+                            (line_x, 0),
+                            (line_x, rendered_img.shape[0] - 1),
+                            getattr(config, "PERSON_CLEAR_LINE_COLOR", (0, 255, 255)),
+                            max(1, int(getattr(config, "PERSON_CLEAR_LINE_THICKNESS", 2))),
+                            cv2.LINE_AA,
+                        )
             draw_preview_status_panel(
                 rendered_img,
                 current_seg_fps=current_seg_fps,
@@ -1655,7 +1725,10 @@ def serial_control_thread():
             person_area = global_control_data.get("person_bottom_area")
             person_left_boundary_x = global_control_data.get("person_left_boundary_x")
             person_right_boundary_x = global_control_data.get("person_right_boundary_x")
+            person_road_center_x = global_control_data.get("person_road_center_x")
             person_clear_line_x = global_control_data.get("person_clear_line_x")
+            person_clear_line_side = str(global_control_data.get("person_clear_line_side", ""))
+            person_stop_cutoff_y = global_control_data.get("person_stop_cutoff_y")
             person_bottom_center_x = global_control_data.get("person_bottom_center_x")
             person_bottom_right_x = global_control_data.get("person_bottom_right_x")
             person_clear_frames = int(global_control_data.get("person_clear_frames", 0))
@@ -1770,9 +1843,11 @@ def serial_control_thread():
             person_area = None
             person_left_boundary_x = None
             person_right_boundary_x = None
+            person_road_center_x = None
             person_clear_line_x = None
             person_bottom_center_x = None
             person_bottom_right_x = None
+            person_stop_cutoff_y = None
             person_clear_frames = 0
             person_stop_event = ""
             person_avoid_active = False
@@ -1803,7 +1878,9 @@ def serial_control_thread():
         person_dist_text = "无" if person_dist_to_bottom is None else f"{float(person_dist_to_bottom):.1f}"
         left_boundary_text = "无" if person_left_boundary_x is None else f"{float(person_left_boundary_x):.1f}"
         right_boundary_text = "无" if person_right_boundary_x is None else f"{float(person_right_boundary_x):.1f}"
+        road_center_text = "无" if person_road_center_x is None else f"{float(person_road_center_x):.1f}"
         clear_line_text = "无" if person_clear_line_x is None else f"{float(person_clear_line_x):.1f}"
+        cutoff_line_text = "无" if person_stop_cutoff_y is None else f"{float(person_stop_cutoff_y):.1f}"
         center_x_text = "无" if person_bottom_center_x is None else f"{float(person_bottom_center_x):.1f}"
         right_x_text = "无" if person_bottom_right_x is None else f"{float(person_bottom_right_x):.1f}"
         stop_text = "是" if person_stop_active else "否"
@@ -1830,6 +1907,14 @@ def serial_control_thread():
                 state=("release_missing",),
                 min_interval=0.0,
             )
+        elif person_stop_event == "release_line":
+            line_side_text = "右侧" if person_clear_line_side == "right" else "左侧"
+            throttled_log(
+                "person_stop_event",
+                f">>> 行人: 过线放行({line_side_text}) cutoff_y={cutoff_line_text}",
+                state=("release_line", person_clear_line_side, clear_line_text),
+                min_interval=0.0,
+            )
         elif person_stop_event == "release_timeout":
             throttled_log(
                 "person_stop_event",
@@ -1849,8 +1934,8 @@ def serial_control_thread():
             throttled_log(
                 "person_stop_detail",
                 (
-                    f">>> 行人: 停车待绕 area={person_area_text} "
-                    f"dist={person_dist_text} clear={person_clear_frames}"
+                f">>> 行人: 停车待绕 area={person_area_text} "
+                    f"dist={person_dist_text} center={road_center_text} clear={person_clear_frames} cutoff_y={cutoff_line_text}"
                 ),
                 state=(
                     "stop_wait_avoid",
