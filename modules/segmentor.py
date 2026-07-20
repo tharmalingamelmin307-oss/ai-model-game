@@ -1421,6 +1421,51 @@ class RoadSegmentor:
 
         return corrected_nodes
 
+    def _apply_fork_boundary_width(self, nodes, fork_side):
+        """Y 岔选定单侧后，用可信外边界按固定赛道宽度补另一侧边界."""
+        if fork_side not in ("left", "right") or not nodes:
+            return nodes
+
+        w_seg = float(config.SEG_SIZE[0] - 1)
+        min_gap = max(0.0, float(getattr(config, "MERGE_GUIDE_LINE_MIN_GAP", 0.0)))
+        corrected_nodes = []
+
+        for node in nodes:
+            y = float(node["pt"][1])
+            left_x = float(node["left_x"])
+            right_x = float(node["right_x"])
+            observed_width = max(0.0, right_x - left_x)
+            fixed_width = self._fixed_track_width_at_y(y, observed_width)
+            if fixed_width <= 0.0:
+                corrected_nodes.append(dict(node))
+                continue
+
+            if fork_side == "left":
+                trusted_x = left_x
+                left_x = trusted_x
+                right_x = max(trusted_x + fixed_width, trusted_x + min_gap)
+            else:
+                trusted_x = right_x
+                right_x = trusted_x
+                left_x = min(trusted_x - fixed_width, trusted_x - min_gap)
+
+            left_x = float(np.clip(left_x, 0.0, w_seg))
+            right_x = float(np.clip(right_x, 0.0, w_seg))
+            if right_x <= left_x:
+                corrected_nodes.append(dict(node))
+                continue
+
+            center_x = 0.5 * (left_x + right_x)
+            corrected = dict(node)
+            corrected["pt"] = (center_x, y)
+            corrected["left_x"] = left_x
+            corrected["right_x"] = right_x
+            corrected["width"] = max(0.0, right_x - left_x)
+            corrected["local_center"] = center_x
+            corrected_nodes.append(corrected)
+
+        return corrected_nodes
+
     def _search_active_paths(self, search_mask, edge_mask, max_active_paths=None):
         """在给定 mask 区域内做一次自底向上的多候选路径搜索."""
         h_seg, _ = search_mask.shape[:2]
@@ -2448,6 +2493,7 @@ class RoadSegmentor:
         current_yolo_boxes,
         turn_intent,
         fps_stats,
+        sign_route_choice=0,
         infer_s=0.0,
         total_start=None,
         preview_frame=None,
@@ -2461,6 +2507,7 @@ class RoadSegmentor:
         - mask: infer_mask 输出的二值赛道 mask
         - current_yolo_boxes: 当前最新一帧检测框，坐标在 TARGET_RES
         - turn_intent: OCR/LLM 给出的 LEFT / RIGHT 分叉意图；石头优先，无石头时参与分支选择
+        - sign_route_choice: 当前路牌路线任务确认的 LEFT / RIGHT；0 表示没有有效路牌任务
 
         输出:
         - steer_signal: 单一转向控制量，来自 PathController 当前选中的 A/B/C 控制器
@@ -2538,6 +2585,20 @@ class RoadSegmentor:
         fork_active = False
         best_path = None
         best_nodes = None
+        fork_selected_side = None
+        try:
+            route_choice_raw = int(sign_route_choice)
+        except (TypeError, ValueError):
+            route_choice_raw = 0
+        try:
+            turn_intent_raw = int(turn_intent)
+        except (TypeError, ValueError):
+            turn_intent_raw = -1
+        route_choice = route_choice_raw if route_choice_raw in (-1, 1) else 0
+        preferred_turn_default = route_choice if route_choice in (-1, 1) else turn_intent_raw
+        if preferred_turn_default not in (-1, 1):
+            preferred_turn_default = -1
+        route_boundary_side = None
         stone_branch_side = 0
         car_path_debug = None
         car_avoid_path = None
@@ -2598,8 +2659,9 @@ class RoadSegmentor:
                 )
                 if stone_branch_side == 0:
                     stone_branch_side = self._estimate_stone_branch_side(planning_items, candidate_pool)
-                preferred_turn = self._resolve_preferred_turn(stone_branch_side, turn_intent)
+                preferred_turn = self._resolve_preferred_turn(stone_branch_side, preferred_turn_default)
                 best_candidate = right_best if preferred_turn == 1 else left_best
+                fork_selected_side = "right" if preferred_turn == 1 else "left"
                 best_path = best_candidate["path"]
                 best_nodes = best_candidate["nodes"]
 
@@ -2641,23 +2703,54 @@ class RoadSegmentor:
                             valid_candidates,
                             branch_support_rows,
                         )
+                        choice_left = None
+                        choice_right = None
                         if fork_active:
-                            candidate_pool = [fork_left, fork_right]
+                            choice_left = fork_left
+                            choice_right = fork_right
+                        elif len(valid_candidates) >= 2:
+                            leftmost = min(valid_candidates, key=lambda c: float(c["avg_x"]))
+                            rightmost = max(valid_candidates, key=lambda c: float(c["avg_x"]))
+                            if (
+                                leftmost is not rightmost and
+                                float(rightmost["avg_x"]) - float(leftmost["avg_x"]) >= float(config.PATH_LOCK_FORK_MIN_SEP)
+                            ):
+                                choice_left = leftmost
+                                choice_right = rightmost
+
+                        if choice_left is not None and choice_right is not None:
+                            candidate_pool = [choice_left, choice_right]
                             stone_branch_side = self._estimate_stone_branch_side(planning_items, candidate_pool)
                             if stone_branch_side == -1:
-                                best_candidate = fork_right
+                                best_candidate = choice_right
+                                route_boundary_side = "right"
                             elif stone_branch_side == 1:
-                                best_candidate = fork_left
+                                best_candidate = choice_left
+                                route_boundary_side = "left"
+                            elif preferred_turn_default == -1:
+                                best_candidate = choice_left
+                                route_boundary_side = "left"
+                            elif preferred_turn_default == 1:
+                                best_candidate = choice_right
+                                route_boundary_side = "right"
 
-                    # 没有确认 Y 型分叉时，不再按 LEFT/RIGHT 去取最左/最右候选。
-                    # 只有检测到石头且普通候选能稳定分成左右两支时，才按石头所在侧选对侧避让；
-                    # 否则单路/汇合场景直接选路径搜索得分最高的候选。
+                    # 没有确认 Y 型分叉时，只有已经分出左右代表候选才按目标侧补线；
+                    # 普通单路保持原始左右边界，避免全程变成单边补线。
                     best_path = best_candidate["path"]
                     best_nodes = best_candidate["nodes"]
 
         if best_path is not None:
             guide_polyline = None if merge_guide_info is None else merge_guide_info.get("guide_polyline")
             fit_nodes = self._apply_merge_boundary_width(best_nodes, merge_side, guide_polyline)
+            if (
+                bool(getattr(config, "FORK_BOUNDARY_WIDTH_ENABLED", True)) and
+                merge_side not in ("left", "right") and
+                (fork_selected_side or route_boundary_side) in ("left", "right")
+            ):
+                fit_nodes = self._apply_fork_boundary_width(
+                    fit_nodes,
+                    fork_selected_side or route_boundary_side,
+                )
             fit_path = np.array([node["pt"] for node in fit_nodes], dtype=np.float32)
             node_x = fit_path[:, 0]
             node_y = fit_path[:, 1]
@@ -2956,6 +3049,7 @@ class RoadSegmentor:
         current_yolo_boxes,
         turn_intent,
         fps_stats,
+        sign_route_choice=0,
         external_boundary_inset_x=0.0,
         external_boundary_side="left",
     ):
@@ -2968,6 +3062,7 @@ class RoadSegmentor:
             current_yolo_boxes,
             turn_intent,
             fps_stats,
+            sign_route_choice=sign_route_choice,
             infer_s=infer_s,
             total_start=t_total_start,
             external_boundary_inset_x=external_boundary_inset_x,

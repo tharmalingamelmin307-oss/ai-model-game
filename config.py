@@ -365,6 +365,10 @@ FORK_TRUNK_SUPPORT_MIN_RATIO = 0.55
 FORK_TRUNK_SUPPORT_MAX_MISS_ROWS = 18
 # 公共主干至少检查多少行才认为这个验证有意义。
 FORK_TRUNK_SUPPORT_MIN_ROWS = 18
+# 岔路区域按当前目标方向的外侧可信边界 +/- 固定赛道宽度补出另一侧边界。
+# 右路用最右边界补左边，左路/默认左用最左边界补右边；
+# 只在 Y 岔确认或已经分出左右候选时启用，普通单路不补。
+FORK_BOUNDARY_WIDTH_ENABLED = True
 
 
 # ---------------------------------------------------------------------------

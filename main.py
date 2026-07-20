@@ -787,30 +787,50 @@ def sign_llm_worker():
             break
         frame_id = int(task.get("frame_id", -1))
         samples = list(task.get("samples", []))
+        created_at = float(task.get("created_at", time.time()))
         sample_text = [(s.get("text"), round(float(s.get("score", 0.0)), 3)) for s in samples]
-        print(f"千帆路牌任务开始: frame={frame_id} samples={sample_text}", flush=True)
+        worker_started_at = time.time()
+        queue_wait_s = max(0.0, worker_started_at - created_at)
+        print(f"千帆路牌任务开始: frame={frame_id} queue={queue_wait_s:.2f}s samples={sample_text}", flush=True)
         try:
+            api_started_at = time.time()
             result, raw = request_road_choice(
                 samples,
                 timeout=float(getattr(config, "SIGN_LLM_API_TIMEOUT", 3.0)),
             )
+            api_elapsed_s = max(0.0, time.time() - api_started_at)
+            total_elapsed_s = max(0.0, time.time() - created_at)
             payload = {
                 "frame_id": frame_id,
                 "result": result,
                 "raw": raw,
                 "error": "",
                 "samples": samples,
+                "created_at": created_at,
+                "queue_wait_s": queue_wait_s,
+                "api_elapsed_s": api_elapsed_s,
+                "total_elapsed_s": total_elapsed_s,
             }
-            print(f"{LOG_GREEN}千帆路牌任务返回: frame={frame_id} result={result} raw={raw}{LOG_RESET}", flush=True)
+            print(
+                f"{LOG_GREEN}千帆路牌任务返回: frame={frame_id} result={result} "
+                f"api={api_elapsed_s:.2f}s total={total_elapsed_s:.2f}s raw={raw}{LOG_RESET}",
+                flush=True,
+            )
         except Exception as e:
+            api_elapsed_s = max(0.0, time.time() - worker_started_at)
+            total_elapsed_s = max(0.0, time.time() - created_at)
             payload = {
                 "frame_id": frame_id,
                 "result": "",
                 "raw": "",
                 "error": str(e),
                 "samples": samples,
+                "created_at": created_at,
+                "queue_wait_s": queue_wait_s,
+                "api_elapsed_s": api_elapsed_s,
+                "total_elapsed_s": total_elapsed_s,
             }
-            print(f"千帆路牌任务异常: frame={frame_id} error={e}", flush=True)
+            print(f"千帆路牌任务异常: frame={frame_id} api={api_elapsed_s:.2f}s total={total_elapsed_s:.2f}s error={e}", flush=True)
         if llm_result_queue.full():
             try:
                 llm_result_queue.get_nowait()
@@ -830,6 +850,10 @@ def drain_sign_llm_results():
         result = str(item.get("result", "")).strip().upper()
         error = str(item.get("error", "")).strip()
         samples = list(item.get("samples", []))
+        created_at = float(item.get("created_at", time.time()))
+        queue_wait_s = max(0.0, float(item.get("queue_wait_s", 0.0)))
+        api_elapsed_s = max(0.0, float(item.get("api_elapsed_s", 0.0)))
+        total_elapsed_s = max(0.0, float(item.get("total_elapsed_s", time.time() - created_at)))
 
         with data_lock:
             waiting = bool(global_control_data.get("sign_llm_waiting_result", False))
@@ -868,9 +892,18 @@ def drain_sign_llm_results():
 
         if result in ("LEFT", "RIGHT"):
             sample_text = [(s.get("text"), round(float(s.get("score", 0.0)), 3)) for s in samples]
-            print(f"{LOG_GREEN}千帆路牌最终结果: {result} samples={sample_text}{LOG_RESET}", flush=True)
+            print(
+                f"{LOG_GREEN}千帆路牌最终结果: {result} "
+                f"耗时={total_elapsed_s:.2f}s API={api_elapsed_s:.2f}s 排队={queue_wait_s:.2f}s "
+                f"samples={sample_text}{LOG_RESET}",
+                flush=True,
+            )
         else:
-            print(f"千帆路牌识别失败，按石头优先/默认左路放行: {error}", flush=True)
+            print(
+                f"千帆路牌识别失败，按石头优先/默认左路放行: {error} "
+                f"耗时={total_elapsed_s:.2f}s API={api_elapsed_s:.2f}s 排队={queue_wait_s:.2f}s",
+                flush=True,
+            )
 
 
 # ==============================================================================
@@ -1483,6 +1516,7 @@ def seg_worker(core_id, worker_id=0):
                 current_yolo_boxes = [obj.copy() for obj in global_yolo_boxes]
                 current_yolo_frame_id = int(global_yolo_frame_id)
                 turn_intent = global_control_data.get("turn_intent", -1)
+                sign_route_choice = int(global_control_data.get("sign_route_choice", 0))
                 external_boundary_inset_x = 0.0
                 external_boundary_side = "left"
 
@@ -1492,6 +1526,7 @@ def seg_worker(core_id, worker_id=0):
                     current_yolo_boxes,
                     turn_intent,
                     fps_stats,
+                    sign_route_choice=sign_route_choice,
                     external_boundary_inset_x=external_boundary_inset_x,
                     external_boundary_side=external_boundary_side,
                 )
@@ -1523,7 +1558,7 @@ def seg_worker(core_id, worker_id=0):
             if item is None:
                 break
 
-            blob_rgb_320, preview_frame, mask, infer_s, total_start, current_yolo_boxes, current_yolo_frame_id, turn_intent, external_boundary_inset_x, external_boundary_side = item
+            blob_rgb_320, preview_frame, mask, infer_s, total_start, current_yolo_boxes, current_yolo_frame_id, turn_intent, sign_route_choice, external_boundary_inset_x, external_boundary_side = item
 
             try:
                 t_post_start = time.perf_counter()
@@ -1533,6 +1568,7 @@ def seg_worker(core_id, worker_id=0):
                     current_yolo_boxes,
                     turn_intent,
                     fps_stats,
+                    sign_route_choice=sign_route_choice,
                     infer_s=infer_s,
                     total_start=total_start,
                     preview_frame=preview_frame,
@@ -1584,6 +1620,7 @@ def seg_worker(core_id, worker_id=0):
             current_yolo_boxes = [obj.copy() for obj in global_yolo_boxes]
             current_yolo_frame_id = int(global_yolo_frame_id)
             turn_intent = global_control_data.get("turn_intent", -1)
+            sign_route_choice = int(global_control_data.get("sign_route_choice", 0))
             external_boundary_inset_x = 0.0
             external_boundary_side = "left"
         t_lock_end = time.perf_counter()
@@ -1608,7 +1645,7 @@ def seg_worker(core_id, worker_id=0):
             except:
                 pass
         t_put_start = time.perf_counter()
-        mask_queue.put((blob_rgb_320, preview_frame, mask, infer_s, total_start, current_yolo_boxes, current_yolo_frame_id, turn_intent, external_boundary_inset_x, external_boundary_side))
+        mask_queue.put((blob_rgb_320, preview_frame, mask, infer_s, total_start, current_yolo_boxes, current_yolo_frame_id, turn_intent, sign_route_choice, external_boundary_inset_x, external_boundary_side))
         t_put_end = time.perf_counter()
         profile_log(
             "seg_infer_loop",
