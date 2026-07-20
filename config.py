@@ -166,7 +166,7 @@ SIGN_CLASS_ID = 9
 # - 但远距离误判风险会上升
 # detv3 输入从 detv2 的 768x576 换到 512x384，面积类门槛按输入面积比例缩放。
 # 50 * 100 * (512 * 384) / (768 * 576) = 2222。
-OCR_MIN_SIGN_BOX_AREA = 3300
+OCR_MIN_SIGN_BOX_AREA = 6200
 
 # sign 在进入 OCR 前，四周需要保留的最小边距比例。
 # 例如 0.03 表示检测框四边都要距离画面边界至少 3% 的宽/高。
@@ -190,7 +190,7 @@ OCR_MIN_SCORE = 0.50
 SIGN_LLM_ENABLED = True
 # 触发语义路牌停车采样的 sign 框面积阈值，单位是 TARGET_RES 坐标系像素面积。
 # 它会和 SIGN_LLM_TRIGGER_EDGE_MARGIN_RATIO 同时满足后才停车。
-SIGN_LLM_TRIGGER_AREA = 4500
+SIGN_LLM_TRIGGER_AREA = 13000
 # 停车后希望采集的有效 OCR 样本数量。
 # 收满后会提交给千帆；如果超时，也可能提前提交已有样本。
 SIGN_LLM_OCR_SAMPLES = 5
@@ -554,7 +554,7 @@ BAUD_RATE = 115200
 # - CONTROL_MIN_SPEED: 常规最低巡航速度
 # - CONTROL_MAX_SPEED: 直道或轻弯时允许的最高速度
 CONTROL_MIN_SPEED = 60
-CONTROL_MAX_SPEED = 65
+CONTROL_MAX_SPEED = 60
 
 # 用单一转向控制量做动态降速时的增益。
 # 设为 0 表示关闭“打角越大就降速”的策略。
@@ -732,26 +732,27 @@ PATH_HEADING_LINEAR_FIT_ENABLED = True
 # False: e 优先使用拟合前原始中心点，反应更快但分叉后可能短暂取到不一致的路径。
 PATH_LATERAL_USE_FILTERED_PATH = True
 
-# C 算法是你现在要调的“中线误差 PD - 航向抑制”控制器。
+# C 算法: 小弯/大弯参数自动过渡控制器。
 #
-# 计算流程:
-# 1. 在 CONTROL_C_LOOKAHEAD_Y 附近取拟合前中心点的平均 x，得到横向误差 e。
-#    e = 路径中心 x - 图像/车身中心 x，单位 pixel。
-# 2. 对 e 做 EMA 平滑，得到 e_filtered。
-# 3. de = 本帧 e_filtered - 上一帧 e_filtered。
-# 4. 在 CONTROL_C_HEADING_LOOKAHEAD_Y 处从拟合线切线算航向误差 psi，单位 rad。
-# 5. 输出:
-#      steer_signal = Kp * e_filtered + Kd * de - Kyaw * psi
-#      servo_pwm = SERVO_CENTER - steer_signal * CONTROL_C_PWM_GAIN
+# 它不是硬切状态机，而是每帧算一个 curve_level:
+# - curve_level = 0: 完全用“小弯参数”
+# - curve_level = 1: 完全用“大弯参数”
+# - curve_level = 0.5: 小弯/大弯参数各取一半
+#
+# 线性插值公式:
+#   实际参数 = 小弯参数 + curve_level * (大弯参数 - 小弯参数)
+#
+# 控制输出:
+#   steer_signal = 横向纠偏 + 抗摆 + 近处顺弯 + 远处提前顺弯
 #
 # 正负号说明:
 # - e > 0 表示路径中心在图像右侧，控制量按当前符号约定增大。
-# - psi 是拟合线航向误差；这里用 -Kyaw * psi，当作航向抑制项，不让横向 P/D 一直追过头。
+# - psi / psi_ff 是路径相对图像竖直方向的航向角；符号和 Stanley B 保持一致。
 #
 # 调参优先级建议（当前 SERVO_CENTER=750 已确认机械中直，不把它当控制参数来调）:
-# 1. 只调 CONTROL_C_LATERAL_GAIN，让车能回到中线。
-# 2. 再加 CONTROL_C_LATERAL_D_GAIN，压住过冲和慢摆。
-# 3. 最后小幅加 CONTROL_C_HEADING_GAIN，只做抑制，不要让它变成主控制。
+# 1. 先只调 CONTROL_C_PWM_GAIN，让总体打角不过大也不过软。
+# 2. 再调下面“小弯参数/大弯参数”里的横向纠偏力度。
+# 3. 最后小幅调 HEADING/FF，负责弯里顺滑，不要让它们压过横向 e。
 
 # C 算法专用 PWM 映射增益，只影响最终舵机幅度，不改变 control 内部比例。
 # 调大：同样 steer_signal 下舵机打得更大；调小：舵机更温和。
@@ -760,44 +761,76 @@ CONTROL_C_PWM_GAIN = 1.0
 # 横向误差 e 的取样行，SEG_SIZE 坐标系里 y 越小表示看得越远。
 # 取小一点：提前看弯，反应更早，但可能更抖/更受远处误差影响。
 # 取大一点：看近处，贴近车前实际位置，但高速和大弯可能反应慢。
-CONTROL_C_LOOKAHEAD_Y = 120.0
+CONTROL_C_LOOKAHEAD_Y = 105.0
 
-# 航向误差 psi 的取样行，通常先和 CONTROL_C_LOOKAHEAD_Y 保持一致。
-# 如果想让航向项更像“提前抑制大弯”，可以比横向行更远一些，也就是 y 更小。
-CONTROL_C_HEADING_LOOKAHEAD_Y = 35.0
+# 航向误差 psi 的近中距离取样行。
+# TOP 更远，BOTTOM 更近；两点角度用于判断车头附近路径朝向。
+CONTROL_C_HEADING_Y_TOP = 55.0
+CONTROL_C_HEADING_Y_BOTTOM = 105.0
+# 前馈航向 psi_ff 的远处取样行，用来提前感知连续弯。
+CONTROL_C_FF_Y_TOP = 10.0
+CONTROL_C_FF_Y_BOTTOM = 35.0
+# 旧参数名保留给外部脚本兼容读取。
+CONTROL_C_HEADING_LOOKAHEAD_Y = CONTROL_C_HEADING_Y_TOP
 
 # 横向误差 e 不是直接取拟合曲线，而是在 CONTROL_C_LOOKAHEAD_Y 附近取拟合前中心点平均。
 # 这里是半窗口高度，5 表示取 y±5 行内的中心点平均。
 # 调大：e 更稳，但会变钝；调小：e 更灵敏，但更容易抖。
-CONTROL_C_LATERAL_AVG_HALF_WINDOW = 8.0
+CONTROL_C_LATERAL_AVG_HALF_WINDOW = 10.0
 
-# 横向 P 系数 Kp，单位约为 steer_signal/pixel，决定“离中线越远，打角越大”的力度。
-# 调大：回中更快、大弯更能拉回来；过大容易左右摆、贴边后反打过猛。
-# 调小：更稳；过小会回正慢、一直偏在一侧。
-CONTROL_C_LATERAL_GAIN = 0.5
+# 自动判断“小弯还是大弯”的灵敏度。
+# 调小：更容易进入大弯参数。
+# 调大：更不容易进入大弯参数。
+CONTROL_C_CURVE_FULL_HEADING_RAD = 1.10
+CONTROL_C_CURVE_FULL_DELTA_RAD = 0.85
+# curve_level 的平滑。越大越丝滑，但进入/退出大弯参数会慢一点。
+CONTROL_C_CURVE_LEVEL_EMA_ALPHA = 0.5
 
-# 横向 D 系数 Kd，作用在 de 上，主要压过冲和慢摆。
-# 调大：更能刹住横向误差变化，出弯回正更利落；过大容易细碎抖。
-# 调小：舵机动作更柔；过小会像纯 P，一偏一拉，来回慢摆。
-CONTROL_C_LATERAL_D_GAIN = 0.2
+# ---------------- C 小弯参数 ----------------
+# 小弯横向纠偏力度。车偏离中线时，负责拉回来。
+CONTROL_C_LATERAL_GAIN_STRAIGHT = 0.32
+# 小弯抗摆力度。主要压来回摆，太大会细碎抖。
+CONTROL_C_LATERAL_D_GAIN_STRAIGHT = 0.10
+# 小弯近处顺弯力度。看车前路径朝向，辅助转向。
+CONTROL_C_HEADING_GAIN_STRAIGHT = 1.5
+# 小弯远处提前顺弯力度。0 表示小弯时不提前抢方向。
+CONTROL_C_FF_GAIN_STRAIGHT = 0.0
+
+# ---------------- C 大弯参数 ----------------
+# 大弯横向纠偏力度。大弯里通常要比小弯更积极。
+CONTROL_C_LATERAL_GAIN_CURVE = 0.46
+# 大弯抗摆力度。大弯出弯时用来压过冲。
+CONTROL_C_LATERAL_D_GAIN_CURVE = 0.16
+# 大弯近处顺弯力度。大弯里帮车头顺着路径方向走。
+CONTROL_C_HEADING_GAIN_CURVE = 4.0
+# 大弯远处提前顺弯力度。负责提前看弯，太大容易提前拐过头。
+CONTROL_C_FF_GAIN_CURVE = 2.0
+
+# 旧参数名保留给外部脚本兼容读取。
+CONTROL_C_LATERAL_GAIN = CONTROL_C_LATERAL_GAIN_STRAIGHT
+CONTROL_C_LATERAL_D_GAIN = CONTROL_C_LATERAL_D_GAIN_STRAIGHT
+CONTROL_C_HEADING_GAIN = CONTROL_C_HEADING_GAIN_STRAIGHT
+CONTROL_C_FF_GAIN = CONTROL_C_FF_GAIN_STRAIGHT
 
 # D 项使用前先对 e 做 EMA 平滑。数值越大，越相信上一帧，de 越平滑。
 # 调大：D 项更稳、更不抖，但反应更慢。
 # 调小：D 项更灵敏，但更容易把图像/路径微小变化放成舵机抖动。
-CONTROL_C_LATERAL_D_EMA_ALPHA = 0.5
-
-# 航向抑制系数 Kyaw，对应公式里的 -Kyaw * psi。
-# 它应该是辅助阻尼，不建议一上来调大。
-# 调大：能压直线小幅打角和出弯拖尾；过大会和横向 P/D 打架，导致弯里转不过或回正奇怪。
-# 调小：更少干预横向控制；如果为 0，就是纯横向 PD。
-CONTROL_C_HEADING_GAIN = 0.0
+CONTROL_C_LATERAL_D_EMA_ALPHA = 0.55
 
 # 航向误差 psi 的 EMA 平滑。只影响 CONTROL_C_HEADING_GAIN 非 0 时的航向项。
 # 调大：航向项更稳、更不追拟合线小抖；过大则航向抑制反应变慢。
-CONTROL_C_HEADING_EMA_ALPHA = 0.5
+CONTROL_C_HEADING_EMA_ALPHA = 0.6
+
+# C 算法最终输出符号。若路径在右侧但车辆实际左打，设为 -1.0。
+CONTROL_C_OUTPUT_SIGN = 1.0
 
 # 拟合线至少需要的路径点数；不足时 control_c 输出 0，不会自动切到其它控制器。
 CONTROL_C_MIN_FIT_POINTS = 3
+
+# C 调参打印。试车时打开，终端会周期性输出:
+# pwm/steer/e/de/psi/psi_ff/curve_level/当前插值后的参数。
+CONTROL_C_DEBUG_LOG_ENABLED = True
+CONTROL_C_DEBUG_LOG_INTERVAL = 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -997,7 +1030,7 @@ PERSON_CLASS_ID_FALLBACK = 2
 # 画面上先画“停车截至横线”，它直接对应 PERSON_STOP_TRIGGER_DIST。
 # 竖向放行线后面再按调试需要打开。
 # 行人框底边距离画面底部小于该值才触发停车，单位 TARGET_RES 像素。
-PERSON_STOP_TRIGGER_DIST = 320
+PERSON_STOP_TRIGGER_DIST = 330
 # 行人框面积至少达到该值，才允许触发行人停车，单位 TARGET_RES 像素面积。
 PERSON_STOP_MIN_AREA = 7000
 # 行人朝目标侧连续移动多少帧后，才允许从停车切到绕行。
@@ -1008,7 +1041,7 @@ PERSON_CLEAR_MIN_MOVE_DX = 3.0
 PERSON_CLEAR_MIN_RIGHT_DX = PERSON_CLEAR_MIN_MOVE_DX
 # 行人横向放行线相对画面中线的偏移量，单位 TARGET_RES 像素。
 # 这条线先不默认绘制，留作后续调试用。
-PERSON_CLEAR_LINE_OFFSET_X = 25.0
+PERSON_CLEAR_LINE_OFFSET_X = 30.0
 # 行人横向放行线在预览图上的颜色和粗细。
 PERSON_CLEAR_LINE_COLOR = (0, 255, 255)
 PERSON_CLEAR_LINE_THICKNESS = 2
@@ -1315,9 +1348,9 @@ TRACK_WIDTH_LOG_INTERVAL = 1.5
 # ---------------------------------------------------------------------------
 CAR_AVOIDANCE_ENABLED = True
 # 锁定 car 后，普通避障实际循线基准: 左边界向中线方向内收多少像素。
-CAR_AVOIDANCE_LEFT_BOUNDARY_INSET = 25.0
+CAR_AVOIDANCE_LEFT_BOUNDARY_INSET = 20.0
 # car 底部中心距离画面底部超过这个行数时，不做内收，只保留跟踪锁定。
-CAR_AVOIDANCE_START_BOUNDARY_ROWS = 90.0
+CAR_AVOIDANCE_START_BOUNDARY_ROWS = 110.0
 # car 底部中心距离画面底部不超过这个行数时，切到近距离内收。
 CAR_AVOIDANCE_NEAR_BOUNDARY_ROWS = 60.0
 # 近距离内收量。

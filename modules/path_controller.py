@@ -16,6 +16,8 @@ class PathController:
         self.last_stanley_heading_error = None
         self.last_control_c_lateral_error = None
         self.last_control_c_heading_error = None
+        self.last_control_c_curve_level = None
+        self.last_control_c_debug = None
 
     def reset_weighted_slope(self):
         self.last_weighted_slope_signal = None
@@ -28,6 +30,8 @@ class PathController:
     def reset_control_c(self):
         self.last_control_c_lateral_error = None
         self.last_control_c_heading_error = None
+        self.last_control_c_curve_level = None
+        self.last_control_c_debug = None
 
     def reset(self):
         self.reset_weighted_slope()
@@ -86,9 +90,16 @@ class PathController:
                 float(getattr(config, "CONTROL_C_LOOKAHEAD_Y", 70.0)),
                 float(getattr(
                     config,
-                    "CONTROL_C_HEADING_LOOKAHEAD_Y",
+                    "CONTROL_C_HEADING_Y_TOP",
+                    getattr(config, "CONTROL_C_HEADING_LOOKAHEAD_Y", getattr(config, "CONTROL_C_LOOKAHEAD_Y", 70.0)),
+                )),
+                float(getattr(
+                    config,
+                    "CONTROL_C_HEADING_Y_BOTTOM",
                     getattr(config, "CONTROL_C_LOOKAHEAD_Y", 70.0),
                 )),
+                float(getattr(config, "CONTROL_C_FF_Y_TOP", 10.0)),
+                float(getattr(config, "CONTROL_C_FF_Y_BOTTOM", 35.0)),
             ]
             return self._rows_to_band(sample_rows, img_h)
 
@@ -208,84 +219,6 @@ class PathController:
             )
         self.last_weighted_slope_heading_ff = float(filtered_ff)
         return float(filtered_ff)
-
-    def _compute_path_control_geometry(
-        self,
-        path_points,
-        img_w,
-        img_h,
-        *,
-        center_bias_x=0.0,
-        lateral_points=None,
-        lookahead_y=70.0,
-        heading_y=None,
-        curvature_y=None,
-        lateral_half_window=5.0,
-        min_fit_points=3,
-    ):
-        """提取前视横向误差、拟合线航向和曲率，供 C 控制器复用."""
-        if path_points is None or len(path_points) == 0:
-            return None
-
-        pts = np.array(path_points, dtype=np.float32).reshape((-1, 2))
-        min_fit_points = max(2, int(min_fit_points))
-        if len(pts) < min_fit_points:
-            return None
-
-        bottom_mid_x = float(img_w) / 2.0 + float(center_bias_x)
-        bottom_y = float(img_h) - 1.0
-        lookahead_y = float(np.clip(lookahead_y, 0.0, bottom_y))
-
-        path_x = None
-        if lateral_points is not None and len(lateral_points) > 0:
-            lateral_pts = np.array(lateral_points, dtype=np.float32).reshape((-1, 2))
-            half_window = max(0.0, float(lateral_half_window))
-            lateral_mask = np.abs(lateral_pts[:, 1] - lookahead_y) <= half_window
-            window_pts = lateral_pts[lateral_mask]
-            if len(window_pts) > 0:
-                path_x = float(np.mean(window_pts[:, 0]))
-        if path_x is None:
-            path_x = self._path_x_at_y_points(pts, lookahead_y)
-        if path_x is None:
-            return None
-        lateral_error = float(path_x) - bottom_mid_x
-
-        try:
-            poly_coeffs = self._fit_path_poly_coeffs(pts[:, 1], pts[:, 0])
-        except Exception:
-            return None
-        if poly_coeffs is None or len(poly_coeffs) < 3:
-            return None
-
-        a = float(poly_coeffs[0])
-        b = float(poly_coeffs[1])
-        linear_heading_enabled = bool(getattr(config, "PATH_HEADING_LINEAR_FIT_ENABLED", True))
-        linear_heading_dx_dy = None
-        if linear_heading_enabled:
-            try:
-                linear_coeffs = np.polyfit(pts[:, 1], pts[:, 0], 1)
-                linear_heading_dx_dy = float(linear_coeffs[0])
-            except Exception:
-                linear_heading_dx_dy = None
-        if heading_y is None:
-            heading_y = lookahead_y
-        if curvature_y is None:
-            curvature_y = heading_y
-        heading_y = float(np.clip(float(heading_y), 0.0, bottom_y))
-        curvature_y = float(np.clip(float(curvature_y), 0.0, bottom_y))
-
-        heading_dx_dy = linear_heading_dx_dy
-        if heading_dx_dy is None:
-            heading_dx_dy = 2.0 * a * heading_y + b
-        curvature_dx_dy = 2.0 * a * curvature_y + b
-        heading_error = float(np.arctan(-heading_dx_dy))
-        curvature = float((2.0 * a) / np.power(1.0 + curvature_dx_dy * curvature_dx_dy, 1.5))
-
-        return {
-            "lateral_error": float(lateral_error),
-            "heading_error": float(heading_error),
-            "curvature": float(curvature),
-        }
 
     def _compute_stanley_point_geometry(
         self,
@@ -423,16 +356,26 @@ class PathController:
         return output_sign * (lateral_term + d_term + heading_term + curvature_term) * signal_scale
 
     def _compute_control_c_steer_signal(self, path_points, img_w, img_h, center_bias_x=0.0, lateral_points=None):
-        """算法 C: Kp*e + Kd*de - Kyaw*psi."""
-        geom = self._compute_path_control_geometry(
+        """算法 C: 连续曲率调度控制，e/de 纠偏，psi/psi_ff 顺弯."""
+        geom = self._compute_stanley_point_geometry(
             path_points,
             img_w,
             img_h,
             center_bias_x=center_bias_x,
             lateral_points=lateral_points,
             lookahead_y=float(getattr(config, "CONTROL_C_LOOKAHEAD_Y", 70.0)),
-            heading_y=float(getattr(config, "CONTROL_C_HEADING_LOOKAHEAD_Y", getattr(config, "CONTROL_C_LOOKAHEAD_Y", 70.0))),
-            curvature_y=None,
+            heading_y_top=float(getattr(
+                config,
+                "CONTROL_C_HEADING_Y_TOP",
+                getattr(config, "CONTROL_C_HEADING_LOOKAHEAD_Y", 60.0),
+            )),
+            heading_y_bottom=float(getattr(
+                config,
+                "CONTROL_C_HEADING_Y_BOTTOM",
+                getattr(config, "CONTROL_C_LOOKAHEAD_Y", 100.0),
+            )),
+            ff_y_top=float(getattr(config, "CONTROL_C_FF_Y_TOP", 10.0)),
+            ff_y_bottom=float(getattr(config, "CONTROL_C_FF_Y_BOTTOM", 35.0)),
             lateral_half_window=float(getattr(config, "CONTROL_C_LATERAL_AVG_HALF_WINDOW", 5.0)),
             min_fit_points=int(getattr(config, "CONTROL_C_MIN_FIT_POINTS", 3)),
         )
@@ -442,9 +385,7 @@ class PathController:
 
         lateral_error = geom["lateral_error"]
         heading_error = geom["heading_error"]
-
-        lateral_gain = float(getattr(config, "CONTROL_C_LATERAL_GAIN", 0.06))
-        heading_gain = float(getattr(config, "CONTROL_C_HEADING_GAIN", 0.5))
+        ff_heading_error = geom["ff_heading_error"]
 
         ema_alpha = float(getattr(config, "CONTROL_C_LATERAL_D_EMA_ALPHA", 0.65))
         ema_alpha = float(np.clip(ema_alpha, 0.0, 0.98))
@@ -470,11 +411,86 @@ class PathController:
             )
         self.last_control_c_heading_error = float(filtered_heading_error)
 
+        full_heading = max(1e-6, float(getattr(config, "CONTROL_C_CURVE_FULL_HEADING_RAD", 0.35)))
+        full_delta = max(1e-6, float(getattr(config, "CONTROL_C_CURVE_FULL_DELTA_RAD", 0.18)))
+        curve_from_heading = abs(float(ff_heading_error)) / full_heading
+        curve_from_delta = abs(float(ff_heading_error) - float(heading_error)) / full_delta
+        raw_curve_level = float(np.clip(max(curve_from_heading, curve_from_delta), 0.0, 1.0))
+        curve_alpha = float(getattr(config, "CONTROL_C_CURVE_LEVEL_EMA_ALPHA", 0.85))
+        curve_alpha = float(np.clip(curve_alpha, 0.0, 0.98))
+        if self.last_control_c_curve_level is None:
+            curve_level = raw_curve_level
+        else:
+            curve_level = (
+                curve_alpha * float(self.last_control_c_curve_level) +
+                (1.0 - curve_alpha) * raw_curve_level
+            )
+        self.last_control_c_curve_level = float(curve_level)
+
+        lateral_gain = self._lerp_config(
+            "CONTROL_C_LATERAL_GAIN_STRAIGHT",
+            "CONTROL_C_LATERAL_GAIN_CURVE",
+            float(getattr(config, "CONTROL_C_LATERAL_GAIN", 0.35)),
+            float(getattr(config, "CONTROL_C_LATERAL_GAIN", 0.35)),
+            curve_level,
+        )
+        d_gain = self._lerp_config(
+            "CONTROL_C_LATERAL_D_GAIN_STRAIGHT",
+            "CONTROL_C_LATERAL_D_GAIN_CURVE",
+            float(getattr(config, "CONTROL_C_LATERAL_D_GAIN", 0.12)),
+            float(getattr(config, "CONTROL_C_LATERAL_D_GAIN", 0.12)),
+            curve_level,
+        )
+        heading_gain = self._lerp_config(
+            "CONTROL_C_HEADING_GAIN_STRAIGHT",
+            "CONTROL_C_HEADING_GAIN_CURVE",
+            float(getattr(config, "CONTROL_C_HEADING_GAIN", 0.0)),
+            float(getattr(config, "CONTROL_C_HEADING_GAIN", 0.0)),
+            curve_level,
+        )
+        ff_gain = self._lerp_config(
+            "CONTROL_C_FF_GAIN_STRAIGHT",
+            "CONTROL_C_FF_GAIN_CURVE",
+            float(getattr(config, "CONTROL_C_FF_GAIN", 0.0)),
+            float(getattr(config, "CONTROL_C_FF_GAIN", 0.0)),
+            curve_level,
+        )
+
         lateral_term = lateral_gain * filtered_error
-        d_gain = float(getattr(config, "CONTROL_C_LATERAL_D_GAIN", 0.18))
         d_term = d_gain * error_delta
-        heading_term = -heading_gain * filtered_heading_error
-        return lateral_term + d_term + heading_term
+        heading_term = heading_gain * filtered_heading_error
+        ff_term = ff_gain * float(ff_heading_error)
+        output_sign = float(getattr(config, "CONTROL_C_OUTPUT_SIGN", 1.0))
+        signal = output_sign * (lateral_term + d_term + heading_term + ff_term)
+        self.last_control_c_debug = {
+            "lateral_error": float(lateral_error),
+            "filtered_error": float(filtered_error),
+            "error_delta": float(error_delta),
+            "heading_error": float(heading_error),
+            "filtered_heading_error": float(filtered_heading_error),
+            "ff_heading_error": float(ff_heading_error),
+            "curve_from_heading": float(curve_from_heading),
+            "curve_from_delta": float(curve_from_delta),
+            "raw_curve_level": float(raw_curve_level),
+            "curve_level": float(curve_level),
+            "lateral_gain": float(lateral_gain),
+            "d_gain": float(d_gain),
+            "heading_gain": float(heading_gain),
+            "ff_gain": float(ff_gain),
+            "lateral_term": float(lateral_term),
+            "d_term": float(d_term),
+            "heading_term": float(heading_term),
+            "ff_term": float(ff_term),
+            "signal": float(signal),
+        }
+        return signal
+
+    def _lerp_config(self, low_name, high_name, low_default, high_default, t):
+        """按 0~1 连续曲率等级在两组参数之间插值."""
+        low = float(getattr(config, low_name, low_default))
+        high = float(getattr(config, high_name, high_default))
+        t = float(np.clip(float(t), 0.0, 1.0))
+        return low + (high - low) * t
 
     def _select_weighted_slope_control_points(self, path_points, img_h):
         """算法 A 使用独立行段；若上边界缺失则用最上端点补齐."""

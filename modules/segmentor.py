@@ -94,6 +94,52 @@ class RoadSegmentor:
         self.car_last_blocked_y_range = None
         self.debug_overlay = SegDebugOverlay(tuple(config.SEG_SIZE))
         self.seg_profile_logger = SegProfileLogger()
+        self.last_control_c_debug_log_at = 0.0
+
+    def _log_control_c_debug(self, steer_signal, servo_pwm, car_active=False):
+        """低频打印 C 控制内部量，便于试车后反推小弯/大弯参数."""
+        if not bool(getattr(config, "CONTROL_C_DEBUG_LOG_ENABLED", False)):
+            return
+        if str(getattr(config, "STEER_CONTROL_MODE", "weighted_slope")).lower() != "control_c":
+            return
+
+        debug = getattr(self.path_controller, "last_control_c_debug", None)
+        if not debug:
+            return
+
+        now = time.monotonic()
+        interval = max(0.05, float(getattr(config, "CONTROL_C_DEBUG_LOG_INTERVAL", 0.5)))
+        if now - float(self.last_control_c_debug_log_at) < interval:
+            return
+        self.last_control_c_debug_log_at = now
+
+        heading_deg = float(np.degrees(debug.get("heading_error", 0.0)))
+        filtered_heading_deg = float(np.degrees(debug.get("filtered_heading_error", 0.0)))
+        ff_heading_deg = float(np.degrees(debug.get("ff_heading_error", 0.0)))
+        print(
+            "C调参: "
+            f"pwm={int(servo_pwm)} steer={float(steer_signal):.2f} "
+            f"e={float(debug.get('lateral_error', 0.0)):.1f}px "
+            f"e_f={float(debug.get('filtered_error', 0.0)):.1f}px "
+            f"de={float(debug.get('error_delta', 0.0)):.1f}px "
+            f"psi={heading_deg:.1f}deg "
+            f"psi_f={filtered_heading_deg:.1f}deg "
+            f"psi_ff={ff_heading_deg:.1f}deg "
+            f"level={float(debug.get('curve_level', 0.0)):.2f} "
+            f"raw={float(debug.get('raw_curve_level', 0.0)):.2f} "
+            f"h={float(debug.get('curve_from_heading', 0.0)):.2f} "
+            f"d={float(debug.get('curve_from_delta', 0.0)):.2f} "
+            f"Kp={float(debug.get('lateral_gain', 0.0)):.3f} "
+            f"Kd={float(debug.get('d_gain', 0.0)):.3f} "
+            f"Kyaw={float(debug.get('heading_gain', 0.0)):.2f} "
+            f"Kff={float(debug.get('ff_gain', 0.0)):.2f} "
+            f"terms=({float(debug.get('lateral_term', 0.0)):.2f},"
+            f"{float(debug.get('d_term', 0.0)):.2f},"
+            f"{float(debug.get('heading_term', 0.0)):.2f},"
+            f"{float(debug.get('ff_term', 0.0)):.2f}) "
+            f"car={int(bool(car_active))}",
+            flush=True,
+        )
 
     def selected_left_boundary_x_at_target_y(self, target_y):
         """返回当前选中路径左边界在 TARGET_RES 坐标系下的 x."""
@@ -2867,6 +2913,11 @@ class RoadSegmentor:
             - steer_signal * pwm_gain
         )
         servo_pwm = int(max(config.SERVO_MIN, min(config.SERVO_MAX, servo_pwm)))
+        self._log_control_c_debug(
+            steer_signal,
+            servo_pwm,
+            car_active=bool(car_active) if 'car_active' in locals() else False,
+        )
         draw_seg_status_text(
             ai_view,
             fps_stats=fps_stats,
