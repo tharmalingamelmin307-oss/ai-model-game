@@ -171,7 +171,7 @@ OCR_MIN_SIGN_BOX_AREA = 3300
 # sign 在进入 OCR 前，四周需要保留的最小边距比例。
 # 例如 0.03 表示检测框四边都要距离画面边界至少 3% 的宽/高。
 # 这样可以尽量避开“框看起来够大，但其实有一部分已经贴边截断”的情况。
-OCR_SIGN_EDGE_MARGIN_RATIO = 0.02
+OCR_SIGN_EDGE_MARGIN_RATIO = 0.05
 
 # 语义路牌停车触发比普通 OCR 更严格：框离边缘太近时不停车，避免牌子被截断还触发采样。
 SIGN_LLM_TRIGGER_EDGE_MARGIN_RATIO = 0.015
@@ -190,7 +190,7 @@ OCR_MIN_SCORE = 0.50
 SIGN_LLM_ENABLED = True
 # 触发语义路牌停车采样的 sign 框面积阈值，单位是 TARGET_RES 坐标系像素面积。
 # 它会和 SIGN_LLM_TRIGGER_EDGE_MARGIN_RATIO 同时满足后才停车。
-SIGN_LLM_TRIGGER_AREA = 3600
+SIGN_LLM_TRIGGER_AREA = 4500
 # 停车后希望采集的有效 OCR 样本数量。
 # 收满后会提交给千帆；如果超时，也可能提前提交已有样本。
 SIGN_LLM_OCR_SAMPLES = 5
@@ -209,7 +209,7 @@ SIGN_LLM_RESULT_MAX_AGE_FRAMES = 1500
 # 语义路线完成后，连续看到多少帧单路特征才释放 WAIT_SIGN_GONE/路线锁定。
 SIGN_ROUTE_SINGLE_ROAD_EXIT_FRAMES = 20
 # 按语义路牌选定方向后，进入岔路区域至少保持方向的时间，单位秒。
-SIGN_ROUTE_MIN_FORK_HOLD_SECONDS = 3.0
+SIGN_ROUTE_MIN_FORK_HOLD_SECONDS = 5.0
 # 按语义路牌选定方向后，最长保持该路线选择的时间，单位秒。
 # 超过后即使单路释放条件没完全满足，也会避免永久锁住。
 SIGN_ROUTE_MAX_DRIVE_HOLD_SECONDS = 10.0
@@ -556,12 +556,12 @@ BAUD_RATE = 115200
 # 当前并不是直接发电机 PWM，而是发一个速度档位：
 # - CONTROL_MIN_SPEED: 常规最低巡航速度
 # - CONTROL_MAX_SPEED: 直道或轻弯时允许的最高速度
-CONTROL_MIN_SPEED = 45
-CONTROL_MAX_SPEED = 45
+CONTROL_MIN_SPEED = 60
+CONTROL_MAX_SPEED = 65
 
 # 用单一转向控制量做动态降速时的增益。
-# 控制量绝对值越大，说明当前横向偏差/路径趋势越强，目标速度会随之降低。
-STEER_SIGNAL_SPEED_GAIN = 0.002
+# 设为 0 表示关闭“打角越大就降速”的策略。
+STEER_SIGNAL_SPEED_GAIN = 0.0
 
 # 是否启用速度档位平滑。
 CONTROL_SPEED_SMOOTH_ENABLED = True
@@ -578,12 +578,14 @@ CONTROL_SPEED_MAX_STEP_DOWN = 2
 # 舵机中心值。
 # 这是“车身理论正前方”对应的 PWM。
 # 当前 750 已确认机械中直；除非重新装舵机/连杆，否则不把它当控制参数来调。
-SERVO_CENTER = 736
+# SERVO_CENTER = 736
+SERVO_CENTER = 770
 
 # 舵机安全最小/最大 PWM。
 # 用于硬限制输出，避免控制算法在极端情况下打到危险位置。
 # SERVO_MIN, SERVO_MAX = 590, 910
-SERVO_MIN, SERVO_MAX = 596, 876
+# SERVO_MIN, SERVO_MAX = 596, 876
+SERVO_MIN, SERVO_MAX = 630, 910
 
 # 舵机输出低通滤波。作用在最终 servo_pwm 上，专门压车跑起来时的小幅高频抖动。
 # - EMA_ALPHA 越大越稳，但响应越慢；0 表示不滤波，0.35~0.65 常用。
@@ -634,15 +636,15 @@ STEER_SIGNAL_MIN_DY = 8.0
 STEER_SIGNAL_ROW_WEIGHT_GAMMA = 1.2
 # 归一化控制量缩放。归一化后原始 steer_signal 常为个位数，
 # 这里把它放大到更接近旧版累计控制量的显示和 PWM 调参量级。
-STEER_SIGNAL_NORMALIZED_SCALE = 3300.0
+STEER_SIGNAL_NORMALIZED_SCALE = 2800.0
 # A 算法输出端 D 系数，作用在 EMA 后 steer_signal 的帧间变化量上。
 # 默认关闭；想试 A+PD 时先从 0.05 ~ 0.25 小步加。
-STEER_SIGNAL_D_GAIN = 6
+STEER_SIGNAL_D_GAIN = 0
 # D 项使用前先对 A 的 steer_signal 做 EMA 平滑。数值越大越稳，但 D 项反应越慢。
 STEER_SIGNAL_D_EMA_ALPHA = 0.2
 # A 算法航向角前馈。用路径远/近两行的 x 差估计路径朝向，提前给一点舵。
 # 这项只做小前馈，不替代 P/D；太大会让直道受远处线噪声影响而左右飘。
-STEER_SIGNAL_HEADING_FF_GAIN = 0.12
+STEER_SIGNAL_HEADING_FF_GAIN = 0.0
 # 航向前馈自己的 EMA 平滑。越大越稳但更慢；0 表示不平滑。
 STEER_SIGNAL_HEADING_FF_EMA_ALPHA = 0.5
 # 航向前馈取样行，SEG_SIZE 坐标里 y 越小表示看得越远。
@@ -692,19 +694,19 @@ STANLEY_FF_NEAR_Y = STANLEY_FF_Y_BOTTOM
 # 横向误差优先使用拟合前中心点在前视行附近的平均值，减少拟合线底部失真影响。
 STANLEY_LATERAL_AVG_HALF_WINDOW = 10.0
 # 横向误差增益 k，控制 atan(k * e / (v_s + soft)) 的纠偏力度。
-STANLEY_LATERAL_GAIN = 0.35
+STANLEY_LATERAL_GAIN = 0.30
 # 横向 D 系数 Kd，作用在 EMA 后横向误差的帧间变化量 de 上。
 # 默认关闭；想试 B+d 时先从很小值开始，例如 0.040-0.045。
-STANLEY_LATERAL_D_GAIN = 0.05
+STANLEY_LATERAL_D_GAIN = 0.022
 # D 项使用前先对 e 做 EMA 平滑。数值越大越稳，但 D 项反应越慢。
 STANLEY_LATERAL_D_EMA_ALPHA = 0.1
 # 航向误差增益 g_psi。
-STANLEY_HEADING_GAIN = 0.35
+STANLEY_HEADING_GAIN = 0.25
 # 航向误差 psi 的 EMA 平滑。只影响 STANLEY_HEADING_GAIN 非 0 时的航向项。
 # 调大：航向项更稳、更不追拟合线小抖；过大则航向抑制反应变慢。
-STANLEY_HEADING_EMA_ALPHA = 0.0
+STANLEY_HEADING_EMA_ALPHA = 0.5
 # 两点角度前馈增益 g_ff。替代原来的曲率前馈，减少曲线拟合不稳定造成的左右飘。
-STANLEY_CURVATURE_FF_GAIN = 0.0
+STANLEY_CURVATURE_FF_GAIN = 0.01
 # 轴距 L，单位 m。保留兼容旧配置；当前两点角度前馈不再使用它。
 STANLEY_WHEELBASE_M = 0.2
 # 速度估计 v_s。当前仅算法 B 使用。
@@ -1005,7 +1007,7 @@ PERSON_CLASS_ID_FALLBACK = 2
 # 画面上先画“停车截至横线”，它直接对应 PERSON_STOP_TRIGGER_DIST。
 # 竖向放行线后面再按调试需要打开。
 # 行人框底边距离画面底部小于该值才触发停车，单位 TARGET_RES 像素。
-PERSON_STOP_TRIGGER_DIST = 350
+PERSON_STOP_TRIGGER_DIST = 320
 # 行人框面积至少达到该值，才允许触发行人停车，单位 TARGET_RES 像素面积。
 PERSON_STOP_MIN_AREA = 7000
 # 行人朝目标侧连续移动多少帧后，才允许从停车切到绕行。
@@ -1016,7 +1018,7 @@ PERSON_CLEAR_MIN_MOVE_DX = 3.0
 PERSON_CLEAR_MIN_RIGHT_DX = PERSON_CLEAR_MIN_MOVE_DX
 # 行人横向放行线相对画面中线的偏移量，单位 TARGET_RES 像素。
 # 这条线先不默认绘制，留作后续调试用。
-PERSON_CLEAR_LINE_OFFSET_X = 18.0
+PERSON_CLEAR_LINE_OFFSET_X = 25.0
 # 行人横向放行线在预览图上的颜色和粗细。
 PERSON_CLEAR_LINE_COLOR = (0, 255, 255)
 PERSON_CLEAR_LINE_THICKNESS = 2
@@ -1027,12 +1029,13 @@ PERSON_STOP_CUTOFF_LINE_THICKNESS = 2
 PERSON_DEBUG_DRAW_RELEASE_LINE = True
 # 兼容旧参数名，保留给外部脚本读取；当前主逻辑不再依赖中心带状窗口。
 PERSON_CLEAR_CENTER_WINDOW_X = 25.0
-# 停车但还没绕行时，连续看不见行人超过该时间就释放停车继续走。
+# 兼容旧参数名；当前普通停车不靠这个超时自动放行，
+# 主要靠放行线条件解除。
 PERSON_STOP_MISSING_TIMEOUT_SECONDS = 2.0
-# 停车但还没绕行时，普通行人停车最多保持多久。
+# 兼容保留字段；当前普通行人停车不再按时间自动释放。
 PERSON_STOP_MAX_SECONDS = 8.0
 # 行人停车后是否进入绕行分支。
-# 关闭后只保留停车观察，后续直接恢复原循线，不切换边界内收基准线。
+# 当前主逻辑已不再续写绕行，放行后直接恢复正常巡线。
 PERSON_AVOID_ENABLED = False
 # 是否根据 car 所在左右侧自动选择行人绕行基准线。
 # False 时固定使用 PERSON_AVOID_DEFAULT_BOUNDARY_SIDE；默认假设车在右边，行人从左边绕。
@@ -1047,7 +1050,7 @@ PERSON_AVOID_RIGHT_BOUNDARY_INSET = PERSON_AVOID_LEFT_BOUNDARY_INSET
 PERSON_AVOID_EXIT_MISSING_FRAMES = 3
 # 绕行退出候选需要保持多少帧才真正结束绕行。
 PERSON_AVOID_EXIT_HOLD_FRAMES = 10
-# 普通行人停车状态下的漏检帧数只用于状态显示；释放停车由 PERSON_STOP_MISSING_TIMEOUT_SECONDS 控制。
+# 普通行人停车状态下的漏检帧数只用于状态显示；短暂漏检仍保持停车锁。
 PERSON_STOP_MISS_RELEASE_FRAMES = 3
 
 # OCR 检测框与 OCR 文字框做“最近中心点匹配”时使用的初始最大距离。
@@ -1134,8 +1137,8 @@ SERIAL_PACKET_TAIL = (0x0D, 0x0A)
 # 这些值主要影响 CPU 占用、实时性和页面刷新感受：
 # - 太小: 更灵敏，但更吃 CPU
 # - 太大: 更省资源，但会更“顿”
-# 串口控制线程循环间隔。
-CONTROL_LOOP_SLEEP = 0.01
+# 串口控制线程循环间隔。0.003333 约等于 300Hz 下发频率。
+CONTROL_LOOP_SLEEP = 1.0 / 300.0
 # 共享内存无新帧时的轮询间隔。
 SHM_FRAME_POLL_SLEEP = 0.002
 # 共享内存连接失败后的重试间隔。
@@ -1220,7 +1223,7 @@ SEG_EMA_ALPHA = 0.6
 # 工作在 SEG_SIZE 路径平面里，用于抑制分割噪声或分叉候选切换导致的横跳。
 SEG_PATH_STABILITY_ENABLED = True
 # 最终输出路径每帧允许横向移动的最大像素量；设为 0 可关闭硬限幅。
-SEG_PATH_MAX_FRAME_X_JUMP = 29.0
+SEG_PATH_MAX_FRAME_X_JUMP = 0.0
 # 候选路径相对上一帧偏移越大，打分扣得越多。
 SEG_PATH_TEMPORAL_SCORE_GAIN = 5.0
 # 单点跳变量超过这个软阈值后，候选会受到额外重罚。
@@ -1347,9 +1350,9 @@ TRACK_WIDTH_LOG_INTERVAL = 1.5
 # ---------------------------------------------------------------------------
 CAR_AVOIDANCE_ENABLED = True
 # 锁定 car 后，普通避障实际循线基准: 左边界向中线方向内收多少像素。
-CAR_AVOIDANCE_LEFT_BOUNDARY_INSET = 30.0
+CAR_AVOIDANCE_LEFT_BOUNDARY_INSET = 25.0
 # car 更靠近车身时使用的近距离阈值，单位为离分割底部多少行。
-CAR_AVOIDANCE_NEAR_BOUNDARY_ROWS = 10.0
+CAR_AVOIDANCE_NEAR_BOUNDARY_ROWS = 2.0
 # 近距离避障实际循线基准: 左边界向中线方向内收多少像素。
 # 默认和普通避障保持一致，避免近距离时退回到不内收的空值。
 CAR_AVOIDANCE_NEAR_LEFT_BOUNDARY_INSET = CAR_AVOIDANCE_LEFT_BOUNDARY_INSET
@@ -1365,7 +1368,7 @@ CAR_AVOIDANCE_SEARCH_RADIUS_MISS_GAIN = 16.0
 CAR_AVOIDANCE_TRACK_EMA_ALPHA = 0.65
 # car 框短暂变小、被遮挡或漏检时，继续沿用最近一次锁定目标的帧数。
 # 调大可避免太早回正；过大会让已经绕过车后继续偏左太久。
-CAR_AVOIDANCE_MISS_FRAMES = 5
+CAR_AVOIDANCE_MISS_FRAMES = 6
 # car 检测最低置信度过滤；0 表示不额外过滤。
 CAR_AVOIDANCE_MIN_SCORE = 0.0
 # car 检测最大面积过滤；0 表示不额外过滤。
@@ -1377,7 +1380,7 @@ CAR_AVOIDANCE_MAX_AREA = 0.0
 # 进入 CLEARING 前需要连续漏检多少帧。
 CAR_AVOIDANCE_CLEARING_MISS_FRAMES = 3
 # CLEARING 状态里绕车基准线衰减到结束需要多少帧。
-CAR_AVOIDANCE_CLEARING_DECAY_FRAMES = 12
+CAR_AVOIDANCE_CLEARING_DECAY_FRAMES = 15
 # CLEARING 初期保留原绕车基准线的比例。
 CAR_AVOIDANCE_CLEARING_RESIDUAL_KEEP = 1.0
 # 衰减残余低于该比例时认为回正完成。

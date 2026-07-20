@@ -262,7 +262,7 @@ def has_car_on_left(boxes, left_boundary_x=None, right_boundary_x=None):
 
 
 def update_person_stop_state(state, person_info, left_boundary_x, right_boundary_x, yolo_frame_id, car_on_left=False):
-    """行人靠近时先停车；确认其沿当前方向越过放行线后，再释放或切边界内收基准线绕行."""
+    """行人靠近时先停车；确认其沿当前方向越过放行线后，直接恢复正常巡线."""
     active = bool(state.get("person_stop_active", False))
     avoid_active = bool(state.get("person_avoid_active", False))
     prev_active = active
@@ -287,24 +287,13 @@ def update_person_stop_state(state, person_info, left_boundary_x, right_boundary
 
     if person_info is None:
         miss_frames += 1
-        clear_frames = 0
-        if not bool(getattr(config, "PERSON_AVOID_ENABLED", True)):
-            avoid_active = False
-            avoid_hold_frames = 0
-        if avoid_active and miss_frames >= int(getattr(config, "PERSON_AVOID_EXIT_MISSING_FRAMES", 3)):
-            avoid_hold_frames += 1
-            if avoid_hold_frames >= int(getattr(config, "PERSON_AVOID_EXIT_HOLD_FRAMES", 20)):
-                avoid_active = False
-                avoid_hold_frames = 0
-        elif active:
+        avoid_active = False
+        avoid_hold_frames = 0
+        if active:
             if stop_started_at is None:
                 stop_started_at = now
             if missing_started_at is None:
                 missing_started_at = now
-            missing_timeout = max(0.0, float(getattr(config, "PERSON_STOP_MISSING_TIMEOUT_SECONDS", 2.0)))
-            if now - float(missing_started_at) >= missing_timeout:
-                active = False
-        max_released = False
         state["person_stop_active"] = active
         state["person_avoid_active"] = avoid_active
         state["person_bottom_y"] = None
@@ -322,20 +311,18 @@ def update_person_stop_state(state, person_info, left_boundary_x, right_boundary
         state["person_miss_frames"] = miss_frames
         state["person_clear_frames"] = clear_frames
         state["person_avoid_hold_frames"] = avoid_hold_frames
-        state["person_move_direction"] = 0
+        state["person_move_direction"] = move_direction if (active or avoid_active) else 0
         state["person_missing_started_at"] = missing_started_at if active else None
         state["person_stop_started_at"] = stop_started_at if active else None
         state["person_stop_max_released"] = max_released
-        if not avoid_active:
-            state["person_avoid_boundary_inset_x"] = 0.0
-            state["person_avoid_boundary_side"] = str(
-                getattr(config, "PERSON_AVOID_DEFAULT_BOUNDARY_SIDE", "left")
-            ).lower()
+        state["person_avoid_boundary_inset_x"] = 0.0
+        state["person_avoid_boundary_side"] = str(
+            getattr(config, "PERSON_AVOID_DEFAULT_BOUNDARY_SIDE", "left")
+        ).lower()
         state["person_last_frame_id"] = yolo_frame_id
-        state["person_last_bottom_center_x"] = None
-        if prev_avoid_active and not avoid_active:
-            state["person_stop_event"] = "avoid_done"
-        elif prev_active and not active:
+        if not active:
+            state["person_last_bottom_center_x"] = None
+        if prev_active and not active:
             state["person_stop_event"] = "release_timeout"
         else:
             state["person_stop_event"] = ""
@@ -365,13 +352,6 @@ def update_person_stop_state(state, person_info, left_boundary_x, right_boundary
         road_center_x = 0.5 * (float(left_boundary_x) + float(right_boundary_x))
     target_h = float(config.TARGET_RES[1])
     clear_line_offset_x = float(getattr(config, "PERSON_CLEAR_LINE_OFFSET_X", 18.0))
-    avoid_enabled = bool(getattr(config, "PERSON_AVOID_ENABLED", True))
-    if bool(getattr(config, "PERSON_AVOID_USE_CAR_SIDE", False)):
-        pending_avoid_side = "right" if bool(car_on_left) else "left"
-    else:
-        pending_avoid_side = str(getattr(config, "PERSON_AVOID_DEFAULT_BOUNDARY_SIDE", "left")).lower()
-    if pending_avoid_side not in ("left", "right"):
-        pending_avoid_side = "left"
     trigger_dist = float(config.PERSON_STOP_TRIGGER_DIST)
     stop_cutoff_y = max(0.0, min(target_h - 1.0, target_h - trigger_dist))
     min_area = float(getattr(config, "PERSON_STOP_MIN_AREA", 0.0))
@@ -410,7 +390,13 @@ def update_person_stop_state(state, person_info, left_boundary_x, right_boundary
     elif release_direction < 0:
         line_reached = bottom_center_x <= clear_line_x
 
-    if active and line_reached and release_direction != 0:
+    movement_confirmed = (
+        active and
+        current_direction != 0 and
+        release_direction != 0 and
+        current_direction == release_direction
+    )
+    if movement_confirmed and line_reached:
         clear_frames += 1
     else:
         clear_frames = 0
@@ -422,44 +408,20 @@ def update_person_stop_state(state, person_info, left_boundary_x, right_boundary
     if active and clear_frames >= int(config.PERSON_CLEAR_MOVE_FRAMES):
         active = False
         clear_frames = 0
-        avoid_active = bool(avoid_enabled)
+        avoid_active = False
         avoid_hold_frames = 0
         stop_started_at = None
         max_released = True
-        if avoid_enabled:
-            avoid_side = pending_avoid_side
-            inset_attr = (
-                "PERSON_AVOID_RIGHT_BOUNDARY_INSET"
-                if avoid_side == "right"
-                else "PERSON_AVOID_LEFT_BOUNDARY_INSET"
-            )
-            state["person_avoid_boundary_side"] = avoid_side
-            state["person_avoid_boundary_inset_x"] = float(getattr(config, inset_attr, 25.0))
-        else:
-            max_released = True
-            released_by_line = True
-    elif not avoid_enabled:
-        avoid_active = False
-        avoid_hold_frames = 0
-        state["person_avoid_boundary_inset_x"] = 0.0
-        state["person_avoid_boundary_side"] = str(
-            getattr(config, "PERSON_AVOID_DEFAULT_BOUNDARY_SIDE", "left")
-        ).lower()
-    elif not avoid_active:
-        state["person_avoid_boundary_inset_x"] = 0.0
-        state["person_avoid_boundary_side"] = str(
-            getattr(config, "PERSON_AVOID_DEFAULT_BOUNDARY_SIDE", "left")
-        ).lower()
+        released_by_line = True
+
+    state["person_avoid_boundary_inset_x"] = 0.0
+    state["person_avoid_boundary_side"] = str(
+        getattr(config, "PERSON_AVOID_DEFAULT_BOUNDARY_SIDE", "left")
+    ).lower()
 
     if active:
         if stop_started_at is None:
             stop_started_at = now
-        max_stop_seconds = max(0.0, float(getattr(config, "PERSON_STOP_MAX_SECONDS", 8.0)))
-        if now - float(stop_started_at) >= max_stop_seconds:
-            active = False
-            clear_frames = 0
-            max_released = True
-            stop_started_at = None
     elif not avoid_active and not near_bottom:
         stop_started_at = None
 
@@ -490,12 +452,8 @@ def update_person_stop_state(state, person_info, left_boundary_x, right_boundary
         state["person_stop_event"] = "stop"
     elif prev_active and not active and released_by_line:
         state["person_stop_event"] = "release_line"
-    elif prev_active and not active and avoid_active:
-        state["person_stop_event"] = "avoid_boundary"
     elif prev_active and not active:
         state["person_stop_event"] = "release_timeout"
-    elif prev_avoid_active and not avoid_active:
-        state["person_stop_event"] = "avoid_done"
     else:
         state["person_stop_event"] = ""
     return active
