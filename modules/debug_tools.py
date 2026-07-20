@@ -335,7 +335,6 @@ class SegDebugOverlay:
             "candidate_right": None,
             "merge_guide": None,
             "fork_point": None,
-            "coin_path": None,
             "control_band": None,
             "bottom_mid": (0.0, 0.0),
             "base_size": tuple(base_size),
@@ -352,7 +351,6 @@ class SegDebugOverlay:
         candidate_right_pts=None,
         merge_guide_pts=None,
         fork_point=None,
-        coin_path=None,
         control_band=None,
     ):
         self.overlay = {
@@ -363,7 +361,6 @@ class SegDebugOverlay:
             "candidate_right": None if candidate_right_pts is None else np.array(candidate_right_pts, dtype=np.float32).copy(),
             "merge_guide": None if merge_guide_pts is None else np.array(merge_guide_pts, dtype=np.float32).copy(),
             "fork_point": None if fork_point is None else (float(fork_point[0]), float(fork_point[1])),
-            "coin_path": coin_path,
             "control_band": control_band,
             "bottom_mid": (float(img_w) / 2.0, float(img_h) - 1.0),
             "base_size": (int(img_w), int(img_h)),
@@ -409,9 +406,7 @@ class SegDebugOverlay:
         candidate_path_thickness = max(1, int(round(config.SEG_DEBUG_CANDIDATE_PATH_THICKNESS * scale)))
         merge_guide_thickness = max(1, int(round(config.SEG_DEBUG_MERGE_GUIDE_THICKNESS * scale)))
         bottom_mid_radius = max(1, int(round(config.SEG_DEBUG_BOTTOM_MID_RADIUS * scale)))
-        coin_dot_radius = max(1, int(round(config.SEG_DEBUG_COIN_PATH_DOT_RADIUS * scale)))
         control_band_thickness = max(1, int(round(getattr(config, "SEG_DEBUG_CONTROL_BAND_THICKNESS", 2) * scale)))
-        coin_strict_line_thickness = max(1, int(round(getattr(config, "SEG_DEBUG_COIN_BOTTOM_STRICT_LINE_THICKNESS", 1) * scale)))
 
         if bool(getattr(config, "SEG_DEBUG_DRAW_CANDIDATE_PATHS", False)) and candidate_left_poly is not None:
             cv2.polylines(image, [candidate_left_poly], False, config.SEG_DEBUG_LEFT_PATH_COLOR, candidate_path_thickness)
@@ -439,28 +434,6 @@ class SegDebugOverlay:
             except Exception:
                 pass
 
-        if bool(getattr(config, "SEG_DEBUG_COIN_BOTTOM_STRICT_LINE_ENABLED", True)):
-            strict_rows = float(getattr(config, "COIN_PATH_ROI_BOTTOM_STRICT_ROWS", 0.0))
-            if strict_rows > 0.0:
-                strict_y = int(round((float(base_h) - strict_rows) * scale_y))
-                strict_y = max(0, min(img_h - 1, strict_y))
-                cv2.line(
-                    image,
-                    (0, strict_y),
-                    (img_w - 1, strict_y),
-                    getattr(config, "SEG_DEBUG_COIN_BOTTOM_STRICT_LINE_COLOR", (0, 0, 255)),
-                    coin_strict_line_thickness,
-                    cv2.LINE_AA,
-                )
-
-        coin_path_debug = overlay.get("coin_path")
-        if bool(getattr(config, "SEG_DEBUG_COIN_PATH_ENABLED", True)) and coin_path_debug:
-            coin_planned_poly = _scaled_polyline(coin_path_debug.get("planned_path"))
-            if coin_planned_poly is not None:
-                cv2.polylines(image, [coin_planned_poly], False, config.SEG_DEBUG_COIN_PATH_COLOR, max(1, path_thickness), cv2.LINE_AA)
-            for pt in coin_path_debug.get("coin_points", []):
-                cv2.circle(image, _scale_point(pt), coin_dot_radius, config.SEG_DEBUG_COIN_PATH_COLOR, -1, cv2.LINE_AA)
-
         bottom_mid = overlay.get("bottom_mid", (float(base_w) / 2.0, float(base_h) - 1.0))
         fork_point = overlay.get("fork_point")
         if fork_point is not None:
@@ -478,7 +451,7 @@ class SegDebugOverlay:
         return image
 
 
-def draw_seg_status_text(ai_view, fps_stats, steer_signal, servo_pwm, branch_stats, stone_branch_side=None, coin_path_debug=None):
+def draw_seg_status_text(ai_view, fps_stats, steer_signal, servo_pwm, branch_stats, stone_branch_side=None):
     """绘制 Seg 调试文字."""
     cv2.putText(
         ai_view,
@@ -528,25 +501,6 @@ def draw_seg_status_text(ai_view, fps_stats, steer_signal, servo_pwm, branch_sta
         config.SEG_DEBUG_TEXT_COLOR_BRANCH,
         config.SEG_DEBUG_TEXT_THICKNESS,
     )
-    if coin_path_debug is not None:
-        cv2.putText(
-            ai_view,
-            (
-                f"Coin raw:{coin_path_debug.get('raw_coin_items', 0)} "
-                f"meas:{coin_path_debug.get('coin_measurements', 0)} "
-                f"pts:{coin_path_debug.get('coin_points_count', 0)} "
-                f"chg:{int(bool(coin_path_debug.get('path_changed', False)))} "
-                f"rej:{coin_path_debug.get('reject_car_state', 0)}/"
-                f"{coin_path_debug.get('reject_blocked', 0)} "
-                f"st:{str(coin_path_debug.get('car_state', ''))[:3]} "
-                f"gate:{int(bool(coin_path_debug.get('car_gate_active', False)))}"
-            ),
-            config.SEG_DEBUG_TEXT_POS_COIN,
-            1,
-            config.SEG_DEBUG_TEXT_FONT_SCALE,
-            config.SEG_DEBUG_TEXT_COLOR_COIN,
-            config.SEG_DEBUG_TEXT_THICKNESS,
-        )
     return ai_view
 
 
@@ -632,9 +586,9 @@ def draw_preview_status_panel(
     sign_llm_waiting_result,
     sign_llm_stop_active,
     person_stop_active,
-    person_avoid_active,
-    person_avoid_boundary_inset_x,
-    person_avoid_boundary_side,
+    person_avoid_active=False,
+    person_avoid_boundary_inset_x=0.0,
+    person_avoid_boundary_side="none",
     debug_keyboard_stop_active=False,
     route_state,
     route_choice,
@@ -699,9 +653,6 @@ def draw_preview_status_panel(
         stop_text = "SIGN_LLM_OCR"
     elif person_stop_active:
         stop_text = "STOP_BY_PERSON"
-    elif person_avoid_active:
-        side_text = "R" if str(person_avoid_boundary_side).lower() == "right" else "L"
-        stop_text = f"AVOID_PERSON_{side_text}"
     if stop_text:
         cv2.putText(
             rendered_img,

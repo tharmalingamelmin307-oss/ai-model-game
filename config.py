@@ -231,7 +231,6 @@ YOLO_NMS_THRES = 0.45
 # }
 CLASS_MIN_SCORES = {
     "car": 0.50,
-    "coin": 0.50,
     "person": 0.50,
     "door": 0.50,
     "stone": 0.50,
@@ -243,7 +242,6 @@ CLASS_MIN_SCORES = {
 # 类别级最大面积比例过滤，比例基准是最终输出坐标系画面面积。
 # 用于压掉小目标类别上异常大的误框，参数对齐当前 detv3 测试脚本。
 YOLO_MAX_AREA_RATIO_BY_CLASS = {
-    "coin": 0.08,
     "sign": 0.16,
     "start": 0.16,
     "stop": 0.16,
@@ -532,10 +530,9 @@ SEG_FIXED_WIDTHS_320_SMOOTH = [
 PATH_LOCK_FORK_MIN_SEP = 36.0
 
 # 会被映射到分割平面里的“规划相关类别”。
-# car 用于避车状态机，coin 用于金币路径规划，stone 用于分支选择，其它类别预留给场景逻辑。
+# car 用于避车状态机，stone 用于分支选择，其它类别预留给场景逻辑。
 PLANNING_CLASS_NAMES = (
     "car",
-    "coin",
     "person",
     "stone",
     "door",
@@ -809,10 +806,7 @@ CONTROL_C_MIN_FIT_POINTS = 3
 # 无目标控制增益：只在没有金币、没有避障车时乘到 steer_signal 上。
 # 可用于补偿无目标控制行段变短、归一化后转向偏软等情况。
 STEER_SIGNAL_NO_TARGET_GAIN = 1.0
-# 金币控制增益：只在 coin 路径规划 active 时生效。
-# 注意金币自身还可能有距离相关的 control_gain，这里是额外的全局模式增益。
-STEER_SIGNAL_COIN_GAIN = 1.0
-# 避障车控制增益：只在 car 避障 active 且没有 coin 控制接管时生效。
+# 避障车控制增益：只在 car 避障 active 时生效。
 # 如果中心偏移已经足够但舵机反应偏小，优先调大这个值。
 STEER_SIGNAL_CAR_GAIN = 1.0
 
@@ -884,14 +878,10 @@ DEFAULT_CONTROL_DATA = {
     "person_clear_line_side": "",
     "person_stop_cutoff_y": None,
     "person_stop_event": "",
-    "person_avoid_active": False,
-    "person_avoid_boundary_inset_x": 0.0,
-    "person_avoid_boundary_side": "left",
     "person_move_direction": 0,
     "person_missing_started_at": None,
     "person_stop_started_at": None,
     "person_stop_max_released": False,
-    "person_avoid_hold_frames": 0,
     "person_clear_frames": 0,
     "person_miss_frames": 0,
     "person_last_frame_id": -1,
@@ -1001,7 +991,7 @@ PERSON_CLASS_NAME = "person"
 # 正常情况下这些值不应该生效；它们更像是一层容错保护。
 PERSON_CLASS_ID_FALLBACK = 2
 
-# 行人停车/绕行逻辑。
+# 行人停车/放行逻辑。
 # 触发不做路径 ROI 过滤；person 框底边足够靠近画面底部后停车观察。
 # 当前策略: 先停车观察；确认行人沿某一方向稳定移动，并且底部中心跨过“行人放行线”后，再直接释放停车。
 # 画面上先画“停车截至横线”，它直接对应 PERSON_STOP_TRIGGER_DIST。
@@ -1029,28 +1019,11 @@ PERSON_STOP_CUTOFF_LINE_THICKNESS = 2
 PERSON_DEBUG_DRAW_RELEASE_LINE = True
 # 兼容旧参数名，保留给外部脚本读取；当前主逻辑不再依赖中心带状窗口。
 PERSON_CLEAR_CENTER_WINDOW_X = 25.0
-# 兼容旧参数名；当前普通停车不靠这个超时自动放行，
-# 主要靠放行线条件解除。
+# 行人停车后连续漏检超过这个时间就放行，单位秒。
 PERSON_STOP_MISSING_TIMEOUT_SECONDS = 2.0
 # 兼容保留字段；当前普通行人停车不再按时间自动释放。
 PERSON_STOP_MAX_SECONDS = 8.0
-# 行人停车后是否进入绕行分支。
-# 当前主逻辑已不再续写绕行，放行后直接恢复正常巡线。
-PERSON_AVOID_ENABLED = False
-# 是否根据 car 所在左右侧自动选择行人绕行基准线。
-# False 时固定使用 PERSON_AVOID_DEFAULT_BOUNDARY_SIDE；默认假设车在右边，行人从左边绕。
-PERSON_AVOID_USE_CAR_SIDE = False
-# 不按 car 左右动态选择时的默认绕行侧: "left" 或 "right"。
-PERSON_AVOID_DEFAULT_BOUNDARY_SIDE = "left"
-# 行人左绕时实际循线基准: 左边界向中线方向内收多少像素。
-PERSON_AVOID_LEFT_BOUNDARY_INSET = 30.0
-# 行人右绕时实际循线基准: 右边界向中线方向内收多少像素。
-PERSON_AVOID_RIGHT_BOUNDARY_INSET = PERSON_AVOID_LEFT_BOUNDARY_INSET
-# 绕行期间，行人连续漏检多少帧后开始退出候选。
-PERSON_AVOID_EXIT_MISSING_FRAMES = 3
-# 绕行退出候选需要保持多少帧才真正结束绕行。
-PERSON_AVOID_EXIT_HOLD_FRAMES = 10
-# 普通行人停车状态下的漏检帧数只用于状态显示；短暂漏检仍保持停车锁。
+# 兼容保留字段；当前漏检放行按 PERSON_STOP_MISSING_TIMEOUT_SECONDS 计时。
 PERSON_STOP_MISS_RELEASE_FRAMES = 3
 
 # OCR 检测框与 OCR 文字框做“最近中心点匹配”时使用的初始最大距离。
@@ -1329,14 +1302,6 @@ SEG_PATH_TOP_TIER_SCORE_GAP = 150.0
 # 最终拟合路径重新采样成多少个密集点，用来计算 steer_signal 和画线。
 SEG_PATH_DENSE_SAMPLES = 30
 
-# 金币分段路径启用时，舵机控制最多只看车身底部往上这段距离。
-# 金币比这个更远时，仍按普通底部窗口控制；金币进入窗口内后才按距离给比例增益。
-COIN_PATH_CONTROL_FIRST_SEGMENT_ONLY = True
-COIN_PATH_CONTROL_BAND_HEIGHT = 96.0
-# 金币进入控制窗口后的参考距离。实际增益约为 BAND_HEIGHT / 金币距离。
-# 例如 BAND=96，金币距底部 60 行，则增益约 1.6；超过 96 行则不加增益。
-COIN_PATH_CONTROL_REFERENCE_ROWS = 96.0
-
 # 终端打印当前赛道宽度的节流间隔，单位秒。
 TRACK_WIDTH_LOG_INTERVAL = 1.5
 
@@ -1351,11 +1316,12 @@ TRACK_WIDTH_LOG_INTERVAL = 1.5
 CAR_AVOIDANCE_ENABLED = True
 # 锁定 car 后，普通避障实际循线基准: 左边界向中线方向内收多少像素。
 CAR_AVOIDANCE_LEFT_BOUNDARY_INSET = 25.0
-# car 更靠近车身时使用的近距离阈值，单位为离分割底部多少行。
-CAR_AVOIDANCE_NEAR_BOUNDARY_ROWS = 2.0
-# 近距离避障实际循线基准: 左边界向中线方向内收多少像素。
-# 默认和普通避障保持一致，避免近距离时退回到不内收的空值。
-CAR_AVOIDANCE_NEAR_LEFT_BOUNDARY_INSET = CAR_AVOIDANCE_LEFT_BOUNDARY_INSET
+# car 底部中心距离画面底部超过这个行数时，不做内收，只保留跟踪锁定。
+CAR_AVOIDANCE_START_BOUNDARY_ROWS = 90.0
+# car 底部中心距离画面底部不超过这个行数时，切到近距离内收。
+CAR_AVOIDANCE_NEAR_BOUNDARY_ROWS = 60.0
+# 近距离内收量。
+CAR_AVOIDANCE_NEAR_LEFT_BOUNDARY_INSET = 10.0
 # car 跟踪锁定。锁定主要看车框底部中心点的连续性，面积只做异常框过滤。
 # 连续命中后进入避障；短暂漏检会继续沿用锁定目标，超过允许帧数后进入 CLEARING。
 # 新 car 目标需要连续命中多少帧才锁定。
@@ -1373,7 +1339,6 @@ CAR_AVOIDANCE_MISS_FRAMES = 6
 CAR_AVOIDANCE_MIN_SCORE = 0.0
 # car 检测最大面积过滤；0 表示不额外过滤。
 CAR_AVOIDANCE_MAX_AREA = 0.0
-
 # 避障退出状态机。
 # 车丢失后不立刻回正，而是先进入 CLEARING。
 # CLEARING 里会先保留上一条左边界内收基准线，再慢慢回到正常巡线。
@@ -1392,50 +1357,6 @@ CAR_AVOIDANCE_FIXED_BOUNDARY_HEIGHT_THRESH = 60.0
 CAR_AVOIDANCE_FIXED_BOUNDARY_RIGHT_MARGIN = 10.0
 # 贴右下特殊规则要求 car 离底边的最大距离。
 CAR_AVOIDANCE_FIXED_BOUNDARY_BOTTOM_MARGIN = 10.0
-# 避障时允许金币的窗口。
-# AVOIDING 期间只允许“底部第一段金币”；CLEARING 期间只允许更靠底且更安全的金币。
-# AVOIDING 状态下，coin 距底部多少行内才允许接管。
-CAR_AVOIDANCE_COIN_ALLOW_BOTTOM_ROWS = 28.0
-# CLEARING 状态下，coin 需要更靠底才允许接管。
-CAR_AVOIDANCE_CLEARING_COIN_SAFE_ROWS = 16.0
-
-# ---------------------------------------------------------------------------
-# 金币分段路径参数
-# ---------------------------------------------------------------------------
-# 只处理 coin:
-# - 使用检测框底部两点中点作为金币锚点
-# - 只保留落在当前路径纵向范围内、附近有 mask、且离当前中线不超过赛道半宽的金币点
-# - 路径按“底部路径点 -> 金币点 -> 最远路径点”从近到远分段重采样
-COIN_PATH_ENABLED = False
-# 新锁定金币必须位于这个 y 行以下，防止太远的金币过早拉动路径。
-COIN_PATH_ROI_Y_MIN = 15
-# coin 底部边缘严格区。靠近分割输入底边时，用“当前路径中线 +/- 赛道半宽”
-# 再额外收窄，压掉车尾/路边被误识别成 coin 的情况。
-COIN_PATH_ROI_BOTTOM_STRICT_ROWS = 80
-# 底部严格区内的赛道半宽缩放，越小越严格。
-COIN_PATH_BOTTOM_HALF_WIDTH_SCALE = 0.42
-# 是否过滤底部严格区里贴近左右边缘的 coin 框。
-COIN_PATH_EDGE_REJECT_ENABLED = True
-# 判断 coin 框贴边的边距，单位是分割平面像素。
-COIN_PATH_EDGE_REJECT_MARGIN = 8.0
-# coin 底部点附近必须有 mask 的搜索半径，单位是分割平面像素。
-COIN_PATH_MASK_RADIUS = 10
-# 普通 coin 横向合法区域的赛道半宽缩放，1.0 表示使用完整半宽。
-COIN_PATH_HALF_WIDTH_SCALE = 1.0
-# coin 或 car 接管控制时是否跳过相邻帧路径横跳限幅，避免目标路径被限幅拖慢。
-COIN_PATH_BYPASS_FRAME_JUMP = True
-# 金币锁定/过滤参数。新目标不做连续帧确认，但锁定后允许短暂丢失沿用。
-# 锁定 coin 丢失后最多沿用多少帧。
-COIN_TRACK_MAX_MISS_FRAMES = 2
-# 锁定 coin 与新检测点匹配的最大 x/y 搜索半径。
-COIN_TRACK_SEARCH_RADIUS = 36.0
-# coin 检测框最大面积，超过则认为太近或异常，不参与锁定。
-COIN_TRACK_MAX_AREA = 2400.0
-# coin 底部点距离画面底部小于这个值时，认为已经吃到，释放锁定。
-COIN_TRACK_EAT_Y_MARGIN = 6.0
-# 新目标如果太贴近底部，优先跳过它改锁下一个金币，避免临场急打方向。
-COIN_TRACK_BOTTOM_TOO_CLOSE_ROWS = 8.0
-
 # 主分割调试图绘制风格。
 # 最终路径线颜色。
 SEG_DEBUG_PATH_COLOR = (255, 0, 255)
@@ -1463,6 +1384,15 @@ SEG_DEBUG_BOUNDARY_THICKNESS = 2
 SEG_DEBUG_BOTTOM_MID_COLOR = (255, 255, 0)
 # 底部车身参考点半径。
 SEG_DEBUG_BOTTOM_MID_RADIUS = 4
+# 兼容旧文件读取：coin 追踪/规划已删除，这些值只防止混版本运行时报缺配置。
+COIN_PATH_ENABLED = False
+COIN_PATH_ROI_BOTTOM_STRICT_ROWS = 0.0
+SEG_DEBUG_COIN_PATH_ENABLED = False
+SEG_DEBUG_COIN_PATH_COLOR = (0, 255, 255)
+SEG_DEBUG_COIN_PATH_DOT_RADIUS = 4
+SEG_DEBUG_COIN_BOTTOM_STRICT_LINE_ENABLED = False
+SEG_DEBUG_COIN_BOTTOM_STRICT_LINE_COLOR = (0, 0, 255)
+SEG_DEBUG_COIN_BOTTOM_STRICT_LINE_THICKNESS = 1
 # Y 岔路分界线颜色。
 SEG_DEBUG_FORK_DIVIDER_COLOR = (0, 255, 0)
 # Y 岔路分界线粗细。
@@ -1471,25 +1401,12 @@ SEG_DEBUG_FORK_DIVIDER_THICKNESS = 1
 SEG_DEBUG_MERGE_GUIDE_COLOR = (255, 255, 255)
 # 汇合引导线粗细。
 SEG_DEBUG_MERGE_GUIDE_THICKNESS = 2
-# 是否绘制 coin 规划路径与 coin 点。
-SEG_DEBUG_COIN_PATH_ENABLED = True
-# coin 规划线和点颜色。
-SEG_DEBUG_COIN_PATH_COLOR = (0, 255, 255)
-# coin 锚点圆点半径。
-SEG_DEBUG_COIN_PATH_DOT_RADIUS = 4
 # 是否绘制 steer_signal 斜率累计实际使用的 y 区域，两条横线分别表示参与控制点的上下边界。
 SEG_DEBUG_CONTROL_BAND_ENABLED = True
 # steer_signal 控制区域横线颜色。
 SEG_DEBUG_CONTROL_BAND_COLOR = (255, 0, 255)
 # steer_signal 控制区域横线粗细。
 SEG_DEBUG_CONTROL_BAND_THICKNESS = 2
-# 是否绘制 coin 底部严格区分界线。
-SEG_DEBUG_COIN_BOTTOM_STRICT_LINE_ENABLED = False
-# coin 底部严格区分界线颜色。
-SEG_DEBUG_COIN_BOTTOM_STRICT_LINE_COLOR = (0, 0, 255)
-# coin 底部严格区分界线粗细。
-SEG_DEBUG_COIN_BOTTOM_STRICT_LINE_THICKNESS = 1
-
 # 分割调试图左上角文字的字号、位置与颜色。
 # 这些信息主要用于现场快速确认：
 # - Seg / YOLO FPS

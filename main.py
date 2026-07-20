@@ -264,9 +264,7 @@ def has_car_on_left(boxes, left_boundary_x=None, right_boundary_x=None):
 def update_person_stop_state(state, person_info, left_boundary_x, right_boundary_x, yolo_frame_id, car_on_left=False):
     """行人靠近时先停车；确认其沿当前方向越过放行线后，直接恢复正常巡线."""
     active = bool(state.get("person_stop_active", False))
-    avoid_active = bool(state.get("person_avoid_active", False))
     prev_active = active
-    prev_avoid_active = avoid_active
     yolo_frame_id = int(yolo_frame_id)
     last_frame_id = int(state.get("person_last_frame_id", -1))
     if yolo_frame_id == last_frame_id:
@@ -277,25 +275,31 @@ def update_person_stop_state(state, person_info, left_boundary_x, right_boundary
 
     clear_frames = int(state.get("person_clear_frames", 0))
     miss_frames = int(state.get("person_miss_frames", 0))
-    avoid_hold_frames = int(state.get("person_avoid_hold_frames", 0))
     move_direction = int(state.get("person_move_direction", 0))
     missing_started_at = state.get("person_missing_started_at")
     stop_started_at = state.get("person_stop_started_at")
     max_released = bool(state.get("person_stop_max_released", False))
     now = time.monotonic()
     released_by_line = False
+    released_by_missing = False
 
     if person_info is None:
         miss_frames += 1
-        avoid_active = False
-        avoid_hold_frames = 0
         if active:
             if stop_started_at is None:
                 stop_started_at = now
             if missing_started_at is None:
                 missing_started_at = now
+            missing_timeout = max(0.0, float(getattr(config, "PERSON_STOP_MISSING_TIMEOUT_SECONDS", 2.0)))
+            if missing_timeout > 0.0 and now - float(missing_started_at) >= missing_timeout:
+                active = False
+                clear_frames = 0
+                move_direction = 0
+                missing_started_at = None
+                stop_started_at = None
+                max_released = True
+                released_by_missing = True
         state["person_stop_active"] = active
-        state["person_avoid_active"] = avoid_active
         state["person_bottom_y"] = None
         state["person_bottom_center_x"] = None
         state["person_bottom_right_x"] = None
@@ -310,19 +314,16 @@ def update_person_stop_state(state, person_info, left_boundary_x, right_boundary
         state["person_stop_cutoff_y"] = None
         state["person_miss_frames"] = miss_frames
         state["person_clear_frames"] = clear_frames
-        state["person_avoid_hold_frames"] = avoid_hold_frames
-        state["person_move_direction"] = move_direction if (active or avoid_active) else 0
+        state["person_move_direction"] = move_direction if active else 0
         state["person_missing_started_at"] = missing_started_at if active else None
         state["person_stop_started_at"] = stop_started_at if active else None
         state["person_stop_max_released"] = max_released
-        state["person_avoid_boundary_inset_x"] = 0.0
-        state["person_avoid_boundary_side"] = str(
-            getattr(config, "PERSON_AVOID_DEFAULT_BOUNDARY_SIDE", "left")
-        ).lower()
         state["person_last_frame_id"] = yolo_frame_id
         if not active:
             state["person_last_bottom_center_x"] = None
-        if prev_active and not active:
+        if prev_active and not active and released_by_missing:
+            state["person_stop_event"] = "release_missing"
+        elif prev_active and not active:
             state["person_stop_event"] = "release_timeout"
         else:
             state["person_stop_event"] = ""
@@ -375,14 +376,13 @@ def update_person_stop_state(state, person_info, left_boundary_x, right_boundary
         clear_line_side = "left"
 
     if near_bottom:
-        if enough_area and not avoid_active and not max_released:
+        if enough_area and not max_released:
             if not active:
                 stop_started_at = now
             active = True
     elif not active:
         stop_started_at = None
     miss_frames = 0
-    avoid_hold_frames = 0
 
     line_reached = False
     if release_direction > 0:
@@ -408,25 +408,17 @@ def update_person_stop_state(state, person_info, left_boundary_x, right_boundary
     if active and clear_frames >= int(config.PERSON_CLEAR_MOVE_FRAMES):
         active = False
         clear_frames = 0
-        avoid_active = False
-        avoid_hold_frames = 0
         stop_started_at = None
         max_released = True
         released_by_line = True
 
-    state["person_avoid_boundary_inset_x"] = 0.0
-    state["person_avoid_boundary_side"] = str(
-        getattr(config, "PERSON_AVOID_DEFAULT_BOUNDARY_SIDE", "left")
-    ).lower()
-
     if active:
         if stop_started_at is None:
             stop_started_at = now
-    elif not avoid_active and not near_bottom:
+    elif not near_bottom:
         stop_started_at = None
 
     state["person_stop_active"] = active
-    state["person_avoid_active"] = avoid_active
     state["person_bottom_y"] = bottom_y
     state["person_bottom_center_x"] = bottom_center_x
     state["person_bottom_right_x"] = bottom_right_x
@@ -441,7 +433,6 @@ def update_person_stop_state(state, person_info, left_boundary_x, right_boundary
     state["person_stop_cutoff_y"] = stop_cutoff_y
     state["person_clear_frames"] = clear_frames
     state["person_miss_frames"] = miss_frames
-    state["person_avoid_hold_frames"] = avoid_hold_frames
     state["person_move_direction"] = move_direction
     state["person_missing_started_at"] = missing_started_at
     state["person_stop_started_at"] = stop_started_at
@@ -1408,7 +1399,6 @@ def seg_worker(core_id, worker_id=0):
             actual_speed = global_control_data.get("target_speed", config.CONTROL_MIN_SPEED)
             sign_llm_stop_active = global_control_data.get("sign_llm_stop_active", False)
             sign_llm_waiting_result = global_control_data.get("sign_llm_waiting_result", False)
-            person_avoid_active = bool(global_control_data.get("person_avoid_active", False))
             debug_keyboard_stop_active = bool(global_control_data.get("debug_keyboard_stop_active", False))
             update_sign_route_after_seg(global_control_data, bool(y_fork_active))
             route_state = str(global_control_data.get("sign_route_state", "IDLE"))
@@ -1472,9 +1462,6 @@ def seg_worker(core_id, worker_id=0):
                 sign_llm_waiting_result=sign_llm_waiting_result,
                 sign_llm_stop_active=sign_llm_stop_active,
                 person_stop_active=person_stop_active,
-                person_avoid_active=person_avoid_active,
-                person_avoid_boundary_inset_x=float(global_control_data.get("person_avoid_boundary_inset_x", 0.0)),
-                person_avoid_boundary_side=str(global_control_data.get("person_avoid_boundary_side", "left")),
                 debug_keyboard_stop_active=debug_keyboard_stop_active,
                 route_state=route_state,
                 route_choice=route_choice,
@@ -1496,12 +1483,8 @@ def seg_worker(core_id, worker_id=0):
                 current_yolo_boxes = [obj.copy() for obj in global_yolo_boxes]
                 current_yolo_frame_id = int(global_yolo_frame_id)
                 turn_intent = global_control_data.get("turn_intent", -1)
-                external_boundary_inset_x = (
-                    float(global_control_data.get("person_avoid_boundary_inset_x", 0.0))
-                    if bool(global_control_data.get("person_avoid_active", False))
-                    else 0.0
-                )
-                external_boundary_side = str(global_control_data.get("person_avoid_boundary_side", "left"))
+                external_boundary_inset_x = 0.0
+                external_boundary_side = "left"
 
             try:
                 steer_signal, rendered_img = seg.run(
@@ -1601,12 +1584,8 @@ def seg_worker(core_id, worker_id=0):
             current_yolo_boxes = [obj.copy() for obj in global_yolo_boxes]
             current_yolo_frame_id = int(global_yolo_frame_id)
             turn_intent = global_control_data.get("turn_intent", -1)
-            external_boundary_inset_x = (
-                float(global_control_data.get("person_avoid_boundary_inset_x", 0.0))
-                if bool(global_control_data.get("person_avoid_active", False))
-                else 0.0
-            )
-            external_boundary_side = str(global_control_data.get("person_avoid_boundary_side", "left"))
+            external_boundary_inset_x = 0.0
+            external_boundary_side = "left"
         t_lock_end = time.perf_counter()
 
         try:
@@ -1678,7 +1657,6 @@ def serial_control_thread():
             sign_llm_collecting = bool(global_control_data.get("sign_llm_collecting", False))
             sign_llm_frame_id = int(global_control_data.get("sign_llm_frame_id", -1))
             person_stop_active = bool(global_control_data.get("person_stop_active", False))
-            person_avoid_active = bool(global_control_data.get("person_avoid_active", False))
             person_dist_to_bottom = global_control_data.get("person_dist_to_bottom")
             person_area = global_control_data.get("person_bottom_area")
             person_left_boundary_x = global_control_data.get("person_left_boundary_x")
@@ -1691,7 +1669,6 @@ def serial_control_thread():
             person_bottom_right_x = global_control_data.get("person_bottom_right_x")
             person_clear_frames = int(global_control_data.get("person_clear_frames", 0))
             person_stop_event = str(global_control_data.get("person_stop_event", ""))
-            person_avoid_boundary_side = str(global_control_data.get("person_avoid_boundary_side", "left")).lower()
         debug_keyboard_state = get_debug_drive_keyboard_state()
         debug_keyboard_stop_active = bool(debug_keyboard_state.get("manual_stop_active", False))
 
@@ -1808,7 +1785,6 @@ def serial_control_thread():
             person_stop_cutoff_y = None
             person_clear_frames = 0
             person_stop_event = ""
-            person_avoid_active = False
             debug_keyboard_state = get_debug_drive_keyboard_state()
             debug_keyboard_stop_active = bool(debug_keyboard_state.get("manual_stop_active", False))
             if sign_llm_stop_active or person_stop_active:
@@ -1818,12 +1794,6 @@ def serial_control_thread():
 
         with data_lock:
             global_control_data["person_stop_active"] = person_stop_active
-            global_control_data["person_avoid_active"] = person_avoid_active
-            if not person_avoid_active:
-                global_control_data["person_avoid_boundary_inset_x"] = 0.0
-                global_control_data["person_avoid_boundary_side"] = str(
-                    getattr(config, "PERSON_AVOID_DEFAULT_BOUNDARY_SIDE", "left")
-                ).lower()
             global_control_data["actual_servo_pwm"] = servo_pwm
             global_control_data["target_speed"] = target_speed
             global_control_data["debug_keyboard_enabled"] = bool(debug_keyboard_state.get("enabled", False))
@@ -1850,27 +1820,19 @@ def serial_control_thread():
                 state=("stop", person_area_text, person_dist_text),
                 min_interval=0.0,
             )
-        elif person_stop_event == "avoid_boundary":
-            side_text = "右边界" if person_avoid_boundary_side == "right" else "左边界"
-            throttled_log(
-                "person_stop_event",
-                f">>> 行人: {side_text}内收绕行 area={person_area_text}",
-                state=("avoid_boundary", person_avoid_boundary_side, person_area_text),
-                min_interval=0.0,
-            )
-        elif person_stop_event == "release_missing":
-            throttled_log(
-                "person_stop_event",
-                ">>> 行人: 走",
-                state=("release_missing",),
-                min_interval=0.0,
-            )
         elif person_stop_event == "release_line":
             line_side_text = "右侧" if person_clear_line_side == "right" else "左侧"
             throttled_log(
                 "person_stop_event",
                 f">>> 行人: 过线放行({line_side_text}) cutoff_y={cutoff_line_text}",
                 state=("release_line", person_clear_line_side, clear_line_text),
+                min_interval=0.0,
+            )
+        elif person_stop_event == "release_missing":
+            throttled_log(
+                "person_stop_event",
+                ">>> 行人: 漏检2秒放行",
+                state=("release_missing",),
                 min_interval=0.0,
             )
         elif person_stop_event == "release_timeout":
@@ -1880,23 +1842,16 @@ def serial_control_thread():
                 state=("release_timeout",),
                 min_interval=0.0,
             )
-        elif person_stop_event == "avoid_done":
-            throttled_log(
-                "person_stop_event",
-                ">>> 行人: 绕行结束",
-                state=("avoid_done",),
-                min_interval=0.0,
-            )
 
-        if person_stop_active and not person_avoid_active:
+        if person_stop_active:
             throttled_log(
                 "person_stop_detail",
                 (
-                f">>> 行人: 停车待绕 area={person_area_text} "
+                f">>> 行人: 停车待放行 area={person_area_text} "
                     f"dist={person_dist_text} center={road_center_text} clear={person_clear_frames} cutoff_y={cutoff_line_text}"
                 ),
                 state=(
-                    "stop_wait_avoid",
+                    "stop_wait_release",
                     person_area_text,
                     person_dist_text,
                     person_clear_frames,
