@@ -352,7 +352,10 @@ class SegDebugOverlay:
         merge_guide_pts=None,
         fork_point=None,
         control_band=None,
+        bottom_mid=None,
     ):
+        if bottom_mid is None:
+            bottom_mid = (float(img_w) / 2.0, float(img_h) - 1.0)
         self.overlay = {
             "path": None if path_pts is None else np.array(path_pts, dtype=np.float32).copy(),
             "left": None if left_pts is None else np.array(left_pts, dtype=np.float32).copy(),
@@ -362,7 +365,7 @@ class SegDebugOverlay:
             "merge_guide": None if merge_guide_pts is None else np.array(merge_guide_pts, dtype=np.float32).copy(),
             "fork_point": None if fork_point is None else (float(fork_point[0]), float(fork_point[1])),
             "control_band": control_band,
-            "bottom_mid": (float(img_w) / 2.0, float(img_h) - 1.0),
+            "bottom_mid": (float(bottom_mid[0]), float(bottom_mid[1])),
             "base_size": (int(img_w), int(img_h)),
         }
 
@@ -438,7 +441,7 @@ class SegDebugOverlay:
         fork_point = overlay.get("fork_point")
         if fork_point is not None:
             fork_pt = _scale_point(fork_point)
-            fork_bottom_pt = _scale_point((float(fork_point[0]), float(base_h) - 1.0))
+            fork_bottom_pt = _scale_point(bottom_mid)
             cv2.line(
                 image,
                 fork_pt,

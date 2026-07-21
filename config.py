@@ -171,7 +171,7 @@ OCR_MIN_SIGN_BOX_AREA = 6200
 # sign 在进入 OCR 前，四周需要保留的最小边距比例。
 # 例如 0.03 表示检测框四边都要距离画面边界至少 3% 的宽/高。
 # 这样可以尽量避开“框看起来够大，但其实有一部分已经贴边截断”的情况。
-OCR_SIGN_EDGE_MARGIN_RATIO = 0.05
+OCR_SIGN_EDGE_MARGIN_RATIO = 0.1
 
 # 语义路牌停车触发比普通 OCR 更严格：框离边缘太近时不停车，避免牌子被截断还触发采样。
 SIGN_LLM_TRIGGER_EDGE_MARGIN_RATIO = 0.015
@@ -181,7 +181,7 @@ SIGN_OCR_MATCH_EXPAND_RATIO = 0.20
 
 # OCR 识别结果的最小平均置信度阈值。
 # 低于这个值的 OCR 文本会在进入主逻辑前直接丢弃，避免低分脏结果参与。
-OCR_MIN_SCORE = 0.50
+OCR_MIN_SCORE = 0.4
 
 # 语义路牌大模型判定。
 # sign 面积达到阈值且不贴边后先停车，停车期间连续收集若干次 OCR 结果，再一次性发给千帆。
@@ -189,8 +189,12 @@ OCR_MIN_SCORE = 0.50
 # False 时会回到更简单的 OCR 文本直接生效逻辑。
 SIGN_LLM_ENABLED = True
 # 触发语义路牌停车采样的 sign 框面积阈值，单位是 TARGET_RES 坐标系像素面积。
-# 它会和 SIGN_LLM_TRIGGER_EDGE_MARGIN_RATIO 同时满足后才停车。
-SIGN_LLM_TRIGGER_AREA = 13000
+# 它会和 SIGN_LLM_TRIGGER_DIST、SIGN_LLM_TRIGGER_EDGE_MARGIN_RATIO 同时满足后才停车。
+SIGN_LLM_TRIGGER_AREA = 12500
+# 触发语义路牌停车采样的 sign 截止距离，单位是 TARGET_RES 像素。
+# 路牌框底边距离画面底部小于等于该值，才认为已经足够近，可以停车采样。
+# 调大：更早停车；调小：更靠近再停车。
+SIGN_LLM_TRIGGER_DIST = 460
 # 停车后希望采集的有效 OCR 样本数量。
 # 收满后会提交给千帆；如果超时，也可能提前提交已有样本。
 SIGN_LLM_OCR_SAMPLES = 5
@@ -1034,7 +1038,7 @@ PERSON_CLASS_ID_FALLBACK = 2
 # 画面上先画“停车截至横线”，它直接对应 PERSON_STOP_TRIGGER_DIST。
 # 竖向放行线后面再按调试需要打开。
 # 行人框底边距离画面底部小于该值才触发停车，单位 TARGET_RES 像素。
-PERSON_STOP_TRIGGER_DIST = 330
+PERSON_STOP_TRIGGER_DIST = 300
 # 行人框面积至少达到该值，才允许触发行人停车，单位 TARGET_RES 像素面积。
 PERSON_STOP_MIN_AREA = 7000
 # 行人朝目标侧连续移动多少帧后，才允许从停车切到绕行。
@@ -1352,7 +1356,7 @@ TRACK_WIDTH_LOG_INTERVAL = 1.5
 # ---------------------------------------------------------------------------
 CAR_AVOIDANCE_ENABLED = True
 # 锁定 car 后，普通避障实际循线基准: 左边界向中线方向内收多少像素。
-CAR_AVOIDANCE_LEFT_BOUNDARY_INSET = 20.0
+CAR_AVOIDANCE_LEFT_BOUNDARY_INSET = 25.0
 # car 底部中心距离画面底部超过这个行数时，不做内收，只保留跟踪锁定。
 CAR_AVOIDANCE_START_BOUNDARY_ROWS = 110.0
 # car 底部中心距离画面底部不超过这个行数时，切到近距离内收。
@@ -1384,7 +1388,7 @@ CAR_AVOIDANCE_CLEARING_MISS_FRAMES = 3
 # CLEARING 状态里绕车基准线衰减到结束需要多少帧。
 CAR_AVOIDANCE_CLEARING_DECAY_FRAMES = 15
 # CLEARING 初期保留原绕车基准线的比例。
-CAR_AVOIDANCE_CLEARING_RESIDUAL_KEEP = 1.0
+CAR_AVOIDANCE_CLEARING_RESIDUAL_KEEP = 0.8
 # 衰减残余低于该比例时认为回正完成。
 CAR_AVOIDANCE_CLEARING_DONE_RESIDUAL = 0.06
 # 车框还在但已经很贴底、贴右且高度较小时，直接进入近距离边界基准。

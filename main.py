@@ -500,18 +500,24 @@ def should_trigger_sign_route(cls_id, rect):
         return False, "non_sign"
     if len(rect) != 4:
         return False, "invalid_rect"
+    x, y, w, h = rect
+    if w < 2 or h < 2:
+        return False, "invalid_rect"
     area = rect_area(rect)
     trigger_area = float(getattr(config, "SIGN_LLM_TRIGGER_AREA", 6000))
     if area < trigger_area:
         return False, f"area_too_small({int(area)}<{int(trigger_area)})"
     frame_w, frame_h = config.TARGET_RES
+    dist_to_bottom = max(0.0, float(frame_h) - float(y + h))
+    trigger_dist = float(getattr(config, "SIGN_LLM_TRIGGER_DIST", 0.0))
+    if trigger_dist > 0.0 and dist_to_bottom > trigger_dist:
+        return False, f"too_far_from_bottom({int(dist_to_bottom)}>{int(trigger_dist)})"
     edge_margin_ratio = max(
         float(config.OCR_SIGN_EDGE_MARGIN_RATIO),
         float(getattr(config, "SIGN_LLM_TRIGGER_EDGE_MARGIN_RATIO", config.OCR_SIGN_EDGE_MARGIN_RATIO)),
     )
     edge_margin_x = frame_w * edge_margin_ratio
     edge_margin_y = frame_h * edge_margin_ratio
-    x, y, w, h = rect
     if (
         x <= edge_margin_x or
         y <= edge_margin_y or
@@ -568,6 +574,19 @@ def point_in_rect(point, rect):
     px, py = point
     x, y, w, h = [float(v) for v in rect]
     return x <= float(px) <= x + w and y <= float(py) <= y + h
+
+
+def pack_ocr_matches(matches):
+    """把多条 OCR 结果合成一个给显示/LLM 使用的文本和平均置信度."""
+    texts = [str(result.get("text", "")).strip().upper() for _, result, _, _ in matches]
+    scores = [float(result.get("score", 0.0)) for _, result, _, _ in matches]
+    text = "；".join([item for item in texts if item])
+    score = float(sum(scores) / max(len(scores), 1))
+    detail = [
+        f"{str(result.get('text', '')).strip()}:{float(result.get('score', 0.0)):.3f}"
+        for _, result, _, _ in matches
+    ]
+    return text, score, detail
 
 
 def rect_area(rect):
@@ -1027,7 +1046,8 @@ def yolo_worker(core_id=None, worker_id=0):
                         global_control_data["sign_llm_error"] = ""
                         throttled_log(
                             "sign_llm_stop_start",
-                            f"语义路牌面积达标且不贴边，停车采集OCR: frame={frame_id} rect={route_trigger_rect}",
+                            f"语义路牌面积、截止距离及边缘条件达标，停车采集OCR: "
+                            f"frame={frame_id} rect={route_trigger_rect}",
                             state=("start", int(frame_id)),
                             min_interval=0.0,
                         )
@@ -1196,38 +1216,69 @@ def ocr_worker():
                     min_interval=config.LOG_INTERVAL_OCR_RAW
                 )
 
+            full_frame_matches = []
+            for result_id, result in enumerate(ocr_results):
+                ocr_cx, ocr_cy = points_center(result.get("points"))
+                text = str(result.get("text", "")).strip().upper()
+                score = float(result.get("score", 0.0))
+                if not text or score < min_ocr_score:
+                    continue
+                full_frame_matches.append((result_id, result, ocr_cx, ocr_cy))
+
+            full_frame_matches.sort(key=lambda item: (float(item[3]), float(item[2])))
+            full_frame_text = ""
+            full_frame_score = 0.0
+            full_frame_sample_recorded = False
+            if full_frame_matches:
+                full_frame_text, full_frame_score, full_frame_detail = pack_ocr_matches(full_frame_matches)
+                with data_lock:
+                    sign_llm_active = (
+                        bool(getattr(config, "SIGN_LLM_ENABLED", True)) and
+                        bool(global_control_data.get("sign_llm_stop_active", False)) and
+                        bool(global_control_data.get("sign_llm_collecting", False))
+                    )
+                    if sign_llm_active:
+                        full_frame_sample_recorded = True
+                        submitted = record_sign_llm_sample(
+                            global_control_data,
+                            int(frame_id),
+                            full_frame_text,
+                            full_frame_score,
+                            "full_frame_ocr",
+                        )
+                        if submitted:
+                            throttled_log(
+                                "sign_llm_submit",
+                                f"语义路牌OCR样本已提交千帆: samples={len(global_control_data.get('sign_llm_samples', []))}",
+                                state=("submit", int(frame_id)),
+                                min_interval=0.0,
+                            )
+                throttled_log(
+                    "ocr_full_frame_llm_sample",
+                    f"OCR整图样本送LLM: 文本={full_frame_text or '<空>'} "
+                    f"置信度={full_frame_score:.3f} 条数={len(full_frame_matches)} matches={full_frame_detail}",
+                    state=(full_frame_text, round(full_frame_score, 3), len(full_frame_matches)),
+                    min_interval=config.LOG_INTERVAL_OCR_RAW,
+                )
+
             used_result_ids = set()
             for idx, cls_id, rect in sign_jobs:
                 try:
                     match_expand_ratio = float(getattr(config, "SIGN_OCR_MATCH_EXPAND_RATIO", 0.20))
                     match_rect = expanded_rect(rect, match_expand_ratio)
                     grouped_matches = []
-                    valid_matches = []
 
-                    for result_id, result in enumerate(ocr_results):
+                    for result_id, result, ocr_cx, ocr_cy in full_frame_matches:
                         if result_id in used_result_ids:
                             continue
-                        ocr_cx, ocr_cy = points_center(result.get("points"))
-                        text = str(result.get("text", "")).strip().upper()
-                        score = float(result.get("score", 0.0))
-                        if not text or score < min_ocr_score:
-                            continue
                         match_item = (result_id, result, ocr_cx, ocr_cy)
-                        valid_matches.append(match_item)
                         if point_in_rect((ocr_cx, ocr_cy), match_rect):
                             grouped_matches.append(match_item)
 
                     if grouped_matches:
                         grouped_matches.sort(key=lambda item: (float(item[3]), float(item[2])))
                         used_result_ids.update(result_id for result_id, _, _, _ in grouped_matches)
-                        texts = [str(result.get("text", "")).strip().upper() for _, result, _, _ in grouped_matches]
-                        scores = [float(result.get("score", 0.0)) for _, result, _, _ in grouped_matches]
-                        text = "；".join([item for item in texts if item])
-                        score = float(sum(scores) / max(len(scores), 1))
-                        match_detail = [
-                            f"{str(result.get('text', '')).strip()}:{float(result.get('score', 0.0)):.3f}"
-                            for _, result, _, _ in grouped_matches
-                        ]
+                        text, score, match_detail = pack_ocr_matches(grouped_matches)
                         throttled_log(
                             "ocr_sign_match_raw",
                             f"OCR匹配到sign扩展框: 文本={text or '<空>'} 置信度={score:.3f} "
@@ -1235,28 +1286,10 @@ def ocr_worker():
                             state=(idx, text, round(score, 3), len(grouped_matches)),
                             min_interval=config.LOG_INTERVAL_OCR_RAW
                         )
-                    elif valid_matches:
-                        valid_matches.sort(key=lambda item: (float(item[3]), float(item[2])))
-                        used_result_ids.update(result_id for result_id, _, _, _ in valid_matches)
-                        texts = [str(result.get("text", "")).strip().upper() for _, result, _, _ in valid_matches]
-                        scores = [float(result.get("score", 0.0)) for _, result, _, _ in valid_matches]
-                        text = "；".join([item for item in texts if item])
-                        score = float(sum(scores) / max(len(scores), 1))
-                        match_detail = [
-                            f"{str(result.get('text', '')).strip()}:{float(result.get('score', 0.0)):.3f}"
-                            for _, result, _, _ in valid_matches
-                        ]
-                        throttled_log(
-                            "ocr_sign_match_raw",
-                            f"OCR扩展框无命中，打包整图有效文本: 文本={text or '<空>'} 置信度={score:.3f} "
-                            f"条数={len(valid_matches)} rect={rect} matches={match_detail}",
-                            state=(idx, text, round(score, 3), len(valid_matches), "fallback_all"),
-                            min_interval=config.LOG_INTERVAL_OCR_RAW
-                        )
                     else:
                         throttled_log(
                             "ocr_match_missing",
-                            f"OCR无达标文本可打包: sign_rect={rect} 文本框={len(ocr_results)}",
+                            f"OCR没有文本落在sign扩展框内: sign_rect={rect} 达标文本框={len(full_frame_matches)}",
                             state=(idx, len(ocr_results)),
                             min_interval=config.LOG_INTERVAL_OCR_RAW
                         )
@@ -1276,21 +1309,22 @@ def ocr_worker():
                     log_once("ocr_single_box_error", f"OCR单框处理异常: {e}")
 
             if not updates:
-                with data_lock:
-                    submitted = record_sign_llm_sample(
-                        global_control_data,
-                        int(frame_id),
-                        "",
-                        0.0,
-                        "no_valid_update",
-                    )
-                    if submitted:
-                        throttled_log(
-                            "sign_llm_submit",
-                            f"语义路牌OCR样本已提交千帆: samples={len(global_control_data.get('sign_llm_samples', []))}",
-                            state=("submit", int(frame_id)),
-                            min_interval=0.0,
+                if not full_frame_sample_recorded:
+                    with data_lock:
+                        submitted = record_sign_llm_sample(
+                            global_control_data,
+                            int(frame_id),
+                            "",
+                            0.0,
+                            "no_valid_update",
                         )
+                        if submitted:
+                            throttled_log(
+                                "sign_llm_submit",
+                                f"语义路牌OCR样本已提交千帆: samples={len(global_control_data.get('sign_llm_samples', []))}",
+                                state=("submit", int(frame_id)),
+                                min_interval=0.0,
+                            )
                 throttled_log(
                     "ocr_no_updates",
                     f"OCR未形成有效更新: 文本框={len(ocr_results)} jobs={len(sign_jobs)}",
@@ -1333,7 +1367,15 @@ def ocr_worker():
                                 bool(global_control_data.get("sign_llm_collecting", False))
                             )
                             if sign_llm_active:
-                                if record_sign_llm_sample(global_control_data, int(frame_id), text, score, "ok"):
+                                if full_frame_text:
+                                    continue
+                                if record_sign_llm_sample(
+                                    global_control_data,
+                                    int(frame_id),
+                                    text,
+                                    score,
+                                    "sign_box_ocr",
+                                ):
                                     throttled_log(
                                         "sign_llm_submit",
                                         f"语义路牌OCR样本已提交千帆: samples={len(global_control_data.get('sign_llm_samples', []))}",
@@ -1517,6 +1559,8 @@ def seg_worker(core_id, worker_id=0):
                 current_yolo_frame_id = int(global_yolo_frame_id)
                 turn_intent = global_control_data.get("turn_intent", -1)
                 sign_route_choice = int(global_control_data.get("sign_route_choice", 0))
+                route_state = str(global_control_data.get("sign_route_state", "IDLE"))
+                sign_route_pending = route_state in ("SIGN_STOP_COLLECT", "WAIT_API")
                 external_boundary_inset_x = 0.0
                 external_boundary_side = "left"
 
@@ -1529,6 +1573,7 @@ def seg_worker(core_id, worker_id=0):
                     sign_route_choice=sign_route_choice,
                     external_boundary_inset_x=external_boundary_inset_x,
                     external_boundary_side=external_boundary_side,
+                    sign_route_pending=sign_route_pending,
                 )
                 publish_seg_result(
                     steer_signal,
@@ -1558,7 +1603,20 @@ def seg_worker(core_id, worker_id=0):
             if item is None:
                 break
 
-            blob_rgb_320, preview_frame, mask, infer_s, total_start, current_yolo_boxes, current_yolo_frame_id, turn_intent, sign_route_choice, external_boundary_inset_x, external_boundary_side = item
+            (
+                blob_rgb_320,
+                preview_frame,
+                mask,
+                infer_s,
+                total_start,
+                current_yolo_boxes,
+                current_yolo_frame_id,
+                turn_intent,
+                sign_route_choice,
+                external_boundary_inset_x,
+                external_boundary_side,
+                sign_route_pending,
+            ) = item
 
             try:
                 t_post_start = time.perf_counter()
@@ -1574,6 +1632,7 @@ def seg_worker(core_id, worker_id=0):
                     preview_frame=preview_frame,
                     external_boundary_inset_x=external_boundary_inset_x,
                     external_boundary_side=external_boundary_side,
+                    sign_route_pending=sign_route_pending,
                 )
                 t_post_end = time.perf_counter()
                 publish_seg_result(
@@ -1621,6 +1680,8 @@ def seg_worker(core_id, worker_id=0):
             current_yolo_frame_id = int(global_yolo_frame_id)
             turn_intent = global_control_data.get("turn_intent", -1)
             sign_route_choice = int(global_control_data.get("sign_route_choice", 0))
+            route_state = str(global_control_data.get("sign_route_state", "IDLE"))
+            sign_route_pending = route_state in ("SIGN_STOP_COLLECT", "WAIT_API")
             external_boundary_inset_x = 0.0
             external_boundary_side = "left"
         t_lock_end = time.perf_counter()
@@ -1645,7 +1706,20 @@ def seg_worker(core_id, worker_id=0):
             except:
                 pass
         t_put_start = time.perf_counter()
-        mask_queue.put((blob_rgb_320, preview_frame, mask, infer_s, total_start, current_yolo_boxes, current_yolo_frame_id, turn_intent, sign_route_choice, external_boundary_inset_x, external_boundary_side))
+        mask_queue.put((
+            blob_rgb_320,
+            preview_frame,
+            mask,
+            infer_s,
+            total_start,
+            current_yolo_boxes,
+            current_yolo_frame_id,
+            turn_intent,
+            sign_route_choice,
+            external_boundary_inset_x,
+            external_boundary_side,
+            sign_route_pending,
+        ))
         t_put_end = time.perf_counter()
         profile_log(
             "seg_infer_loop",

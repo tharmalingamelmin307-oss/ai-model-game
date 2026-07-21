@@ -187,6 +187,7 @@ class RoadSegmentor:
         merge_guide_pts=None,
         fork_point=None,
         control_band=None,
+        bottom_mid=None,
     ):
         """缓存主图路径叠加层，供主线程在其它元素之上重绘."""
         self.debug_overlay.store(
@@ -200,6 +201,7 @@ class RoadSegmentor:
             merge_guide_pts=merge_guide_pts,
             fork_point=fork_point,
             control_band=control_band,
+            bottom_mid=bottom_mid,
         )
 
     def draw_path_overlay(self, image):
@@ -1270,6 +1272,79 @@ class RoadSegmentor:
             right_mask[y, split_col:] = search_mask[y, split_col:]
 
         return left_mask, right_mask
+
+    def _road_bottom_midpoint(self, search_mask):
+        """取道路在画面底部附近的左右中点，作为 fork 拉线的下端点."""
+        if search_mask is None or search_mask.size == 0:
+            w_seg, h_seg = config.SEG_SIZE
+            return (float(w_seg) / 2.0, float(h_seg) - 1.0)
+
+        h, w = search_mask.shape[:2]
+        bottom_touch_height = max(1, int(getattr(config, "SEG_PATH_BOTTOM_TOUCH_HEIGHT", 20)))
+        min_y = max(0, h - bottom_touch_height)
+        min_pixels = max(1, int(getattr(config, "SEG_PATH_MIN_SLICE_PIXELS", 4)))
+
+        for y in range(h - 1, min_y - 1, -1):
+            xs = np.where(search_mask[y] > 0)[0]
+            if len(xs) >= min_pixels:
+                return (0.5 * float(xs[0] + xs[-1]), float(y))
+
+        return (float(w) / 2.0, float(h) - 1.0)
+
+    def _build_fork_centerline_candidate(self, search_mask, fork_point, bottom_mid):
+        """构造“岔路点 -> 道路底部中点”的临时中线候选."""
+        if search_mask is None or search_mask.size == 0 or fork_point is None or bottom_mid is None:
+            return None
+
+        h, w = search_mask.shape[:2]
+        fork_x = float(np.clip(float(fork_point[0]), 0.0, float(w - 1)))
+        fork_y = float(np.clip(float(fork_point[1]), 0.0, float(h - 1)))
+        bottom_x = float(np.clip(float(bottom_mid[0]), 0.0, float(w - 1)))
+        bottom_y = float(np.clip(float(bottom_mid[1]), 0.0, float(h - 1)))
+        if bottom_y <= fork_y:
+            return None
+
+        step_y = max(1, int(getattr(config, "SEG_PATH_SEARCH_STEP_Y", 4)))
+        min_nodes = max(2, int(getattr(config, "SEG_PATH_MIN_LENGTH", 3)))
+        node_count = max(min_nodes, int(np.ceil((bottom_y - fork_y) / float(step_y))) + 1)
+        y_values = np.linspace(bottom_y, fork_y, num=node_count)
+        denom = max(1e-6, bottom_y - fork_y)
+
+        nodes = []
+        for y in y_values:
+            t = (bottom_y - float(y)) / denom
+            center_x = (1.0 - t) * bottom_x + t * fork_x
+            row_y = int(np.clip(round(float(y)), 0, h - 1))
+            xs = np.where(search_mask[row_y] > 0)[0]
+            observed_width = 0.0
+            if len(xs) >= 2:
+                observed_width = float(xs[-1] - xs[0])
+            width = self._fixed_track_width_at_y(float(y), observed_width)
+            if width <= 0.0:
+                width = max(float(getattr(config, "SEG_PATH_MIN_PAIR_WIDTH", 8)) * 2.0, float(w) * 0.25)
+            half_width = max(1.0, float(width) * 0.5)
+            left_x = float(np.clip(center_x - half_width, 0.0, float(w - 1)))
+            right_x = float(np.clip(center_x + half_width, 0.0, float(w - 1)))
+            if right_x <= left_x:
+                continue
+            nodes.append({
+                "pt": (float(center_x), float(y)),
+                "left_x": left_x,
+                "right_x": right_x,
+                "width": max(0.0, right_x - left_x),
+                "local_center": float(center_x),
+                "pair_count": 1,
+            })
+
+        if len(nodes) < 2:
+            return None
+
+        return {
+            "path": np.array([node["pt"] for node in nodes], dtype=np.float32),
+            "nodes": nodes,
+            "score": 0.0,
+            "avg_x": float(np.mean([node["pt"][0] for node in nodes])),
+        }
 
     def _build_row_segments(self, mask_row, edge_row):
         """把单行白区解析成若干个左右边界配对后的通道片段."""
@@ -2499,6 +2574,7 @@ class RoadSegmentor:
         preview_frame=None,
         external_boundary_inset_x=0.0,
         external_boundary_side="left",
+        sign_route_pending=False,
     ):
         """对已推理出的 mask 做路径规划、控制器调用和调试渲染.
 
@@ -2569,6 +2645,7 @@ class RoadSegmentor:
             y_fork_info = {"active": False, "fork_point": None, "split_rows": 0}
         else:
             y_fork_info = self._detect_y_fork(search_mask)
+        fork_bottom_mid = self._road_bottom_midpoint(search_mask)
         branch_pair_count_max = 0
         branch_support_rows = 0
         t_search_end = time.perf_counter()
@@ -2659,9 +2736,20 @@ class RoadSegmentor:
                 )
                 if stone_branch_side == 0:
                     stone_branch_side = self._estimate_stone_branch_side(planning_items, candidate_pool)
-                preferred_turn = self._resolve_preferred_turn(stone_branch_side, preferred_turn_default)
-                best_candidate = right_best if preferred_turn == 1 else left_best
-                fork_selected_side = "right" if preferred_turn == 1 else "left"
+                fork_center_candidate = None
+                if bool(sign_route_pending):
+                    fork_center_candidate = self._build_fork_centerline_candidate(
+                        search_mask,
+                        y_fork_info.get("fork_point"),
+                        fork_bottom_mid,
+                    )
+                if fork_center_candidate is not None:
+                    best_candidate = fork_center_candidate
+                    fork_selected_side = None
+                else:
+                    preferred_turn = self._resolve_preferred_turn(stone_branch_side, preferred_turn_default)
+                    best_candidate = right_best if preferred_turn == 1 else left_best
+                    fork_selected_side = "right" if preferred_turn == 1 else "left"
                 best_path = best_candidate["path"]
                 best_nodes = best_candidate["nodes"]
 
@@ -2941,6 +3029,7 @@ class RoadSegmentor:
             "external_boundary_inset_x": float(external_boundary_inset_x),
             "external_boundary_side": external_boundary_side,
             "avoid_bias_source": avoid_bias_source,
+            "sign_route_pending_centerline": bool(sign_route_pending and y_fork_active and fork_selected_side is None),
         }
         self._store_main_overlay(
             pts_final_orig,
@@ -2953,6 +3042,7 @@ class RoadSegmentor:
             merge_guide_pts=None if merge_guide_info is None else merge_guide_info.get("guide_polyline"),
             fork_point=y_fork_info.get("fork_point") if y_fork_active else None,
             control_band=control_band if 'control_band' in locals() else None,
+            bottom_mid=fork_bottom_mid if y_fork_active else None,
         )
         t_fit_end = time.perf_counter()
 
@@ -3052,6 +3142,7 @@ class RoadSegmentor:
         sign_route_choice=0,
         external_boundary_inset_x=0.0,
         external_boundary_side="left",
+        sign_route_pending=False,
     ):
         """兼容旧串行调用：推理和后处理在同一个线程里连续执行."""
         t_total_start = time.perf_counter()
@@ -3067,4 +3158,5 @@ class RoadSegmentor:
             total_start=t_total_start,
             external_boundary_inset_x=external_boundary_inset_x,
             external_boundary_side=external_boundary_side,
+            sign_route_pending=sign_route_pending,
         )
