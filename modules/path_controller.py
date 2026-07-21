@@ -38,8 +38,9 @@ class PathController:
         self.reset_stanley_band()
         self.reset_control_c()
 
-    def compute_steer_signal(self, path_points, img_w, img_h, center_bias_x=0.0, lateral_points=None):
+    def compute_steer_signal(self, path_points, img_w, img_h, center_bias_x=0.0, lateral_points=None, d_gain_scale=1.0):
         """按配置选择单一转向控制器；各控制器互不自动切换."""
+        d_gain_scale = float(np.clip(float(d_gain_scale), 0.0, 1.0))
         mode = str(getattr(config, "STEER_CONTROL_MODE", "weighted_slope")).lower()
         if mode == "weighted_slope":
             return self._compute_weighted_steer_signal(
@@ -47,6 +48,7 @@ class PathController:
                 img_w,
                 img_h,
                 center_bias_x=center_bias_x,
+                d_gain_scale=d_gain_scale,
             )
         if mode == "stanley_band":
             stanley_signal = self._compute_stanley_band_steer_signal(
@@ -55,6 +57,7 @@ class PathController:
                 img_h,
                 center_bias_x=center_bias_x,
                 lateral_points=lateral_points,
+                d_gain_scale=d_gain_scale,
             )
             if stanley_signal is not None and np.isfinite(stanley_signal):
                 return float(stanley_signal)
@@ -66,6 +69,7 @@ class PathController:
                 img_h,
                 center_bias_x=center_bias_x,
                 lateral_points=lateral_points,
+                d_gain_scale=d_gain_scale,
             )
             if control_c_signal is not None and np.isfinite(control_c_signal):
                 return float(control_c_signal)
@@ -142,7 +146,7 @@ class PathController:
             float(np.max(rows)),
         )
 
-    def _compute_weighted_steer_signal(self, path_points, img_w, img_h, center_bias_x=0.0):
+    def _compute_weighted_steer_signal(self, path_points, img_w, img_h, center_bias_x=0.0, d_gain_scale=1.0):
         """算法 A: 路径点到底部中点连线斜率的加权平均."""
         if path_points is None or len(path_points) == 0:
             self.reset_weighted_slope()
@@ -177,7 +181,7 @@ class PathController:
             signal_delta = filtered_signal - float(self.last_weighted_slope_signal)
         self.last_weighted_slope_signal = float(filtered_signal)
 
-        d_gain = float(getattr(config, "STEER_SIGNAL_D_GAIN", 0.0))
+        d_gain = float(getattr(config, "STEER_SIGNAL_D_GAIN", 0.0)) * float(d_gain_scale)
         heading_ff = self._compute_weighted_slope_heading_ff(pts, img_h)
         return slope_signal + d_gain * signal_delta + heading_ff
 
@@ -292,7 +296,7 @@ class PathController:
         dx_dy = float(np.clip(dx_dy, -2.0, 2.0))
         return float(np.arctan(-dx_dy))
 
-    def _compute_stanley_band_steer_signal(self, path_points, img_w, img_h, center_bias_x=0.0, lateral_points=None):
+    def _compute_stanley_band_steer_signal(self, path_points, img_w, img_h, center_bias_x=0.0, lateral_points=None, d_gain_scale=1.0):
         """算法 B: 按前视行 Stanley 公式计算转向量."""
         geom = self._compute_stanley_point_geometry(
             path_points,
@@ -320,7 +324,7 @@ class PathController:
         speed_estimate = max(0.0, float(getattr(config, "STANLEY_SPEED_ESTIMATE", 0.0)))
         lateral_gain = float(getattr(config, "STANLEY_LATERAL_GAIN", 0.028))
         heading_gain = float(getattr(config, "STANLEY_HEADING_GAIN", 0.85))
-        d_gain = float(getattr(config, "STANLEY_LATERAL_D_GAIN", 0.0))
+        d_gain = float(getattr(config, "STANLEY_LATERAL_D_GAIN", 0.0)) * float(d_gain_scale)
         curvature_gain = float(getattr(config, "STANLEY_CURVATURE_FF_GAIN", 0.0))
         signal_scale = float(getattr(config, "STANLEY_SIGNAL_SCALE", 10000.0))
 
@@ -355,7 +359,7 @@ class PathController:
         output_sign = float(getattr(config, "STANLEY_OUTPUT_SIGN", 1.0))
         return output_sign * (lateral_term + d_term + heading_term + curvature_term) * signal_scale
 
-    def _compute_control_c_steer_signal(self, path_points, img_w, img_h, center_bias_x=0.0, lateral_points=None):
+    def _compute_control_c_steer_signal(self, path_points, img_w, img_h, center_bias_x=0.0, lateral_points=None, d_gain_scale=1.0):
         """算法 C: 连续曲率调度控制，e/de 纠偏，psi/psi_ff 顺弯."""
         geom = self._compute_stanley_point_geometry(
             path_points,
@@ -440,7 +444,7 @@ class PathController:
             float(getattr(config, "CONTROL_C_LATERAL_D_GAIN", 0.12)),
             float(getattr(config, "CONTROL_C_LATERAL_D_GAIN", 0.12)),
             curve_level,
-        )
+        ) * float(d_gain_scale)
         heading_gain = self._lerp_config(
             "CONTROL_C_HEADING_GAIN_STRAIGHT",
             "CONTROL_C_HEADING_GAIN_CURVE",

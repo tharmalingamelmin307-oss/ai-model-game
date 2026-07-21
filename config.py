@@ -847,8 +847,7 @@ CONTROL_C_DEBUG_LOG_INTERVAL = 0.5
 # 无目标控制增益：只在没有金币、没有避障车时乘到 steer_signal 上。
 # 可用于补偿无目标控制行段变短、归一化后转向偏软等情况。
 STEER_SIGNAL_NO_TARGET_GAIN = 1.0
-# 避障车控制增益：只在 car 避障 active 时生效。
-# 如果中心偏移已经足够但舵机反应偏小，优先调大这个值。
+# 旧路径避障控制增益：只有关闭 CAR_AVOIDANCE_SERVO_BIAS_ENABLED 时才作用到 car active 的 steer_signal。
 STEER_SIGNAL_CAR_GAIN = 1.0
 
 
@@ -928,6 +927,18 @@ DEFAULT_CONTROL_DATA = {
     "person_miss_frames": 0,
     "person_last_frame_id": -1,
     "person_last_bottom_center_x": None,
+    "car_avoidance_active": False,
+    "car_avoidance_state": "FOLLOW_LANE",
+    "car_avoidance_rows_to_bottom": None,
+    "car_avoidance_miss_frames": 0,
+    "car_avoidance_clear_frames": 0,
+    "car_avoidance_left_boundary_error": None,
+    "car_avoidance_left_boundary_x": None,
+    "car_avoidance_left_boundary_p_pwm": 0.0,
+    "car_avoidance_left_boundary_d_pwm": 0.0,
+    "car_avoidance_boundary_inset_x": 0.0,
+    "car_avoidance_boundary_path_active": False,
+    "car_avoidance_servo_bias_pwm": 0.0,
     "debug_keyboard_enabled": False,
     "debug_keyboard_stop_active": False,
     "debug_keyboard_message": "",
@@ -1039,7 +1050,7 @@ PERSON_CLASS_ID_FALLBACK = 2
 # 画面上先画“停车截至横线”，它直接对应 PERSON_STOP_TRIGGER_DIST。
 # 竖向放行线后面再按调试需要打开。
 # 行人框底边距离画面底部小于该值才触发停车，单位 TARGET_RES 像素。
-PERSON_STOP_TRIGGER_DIST = 350
+PERSON_STOP_TRIGGER_DIST = 300
 # 行人框面积至少达到该值，才允许触发行人停车，单位 TARGET_RES 像素面积。
 PERSON_STOP_MIN_AREA = 7000
 # 行人朝目标侧连续移动并过线多少帧后，才允许从停车切到放行。
@@ -1351,15 +1362,55 @@ TRACK_WIDTH_LOG_INTERVAL = 1.5
 # 车辆避障控制参数
 # 这组参数工作在分割输入 `SEG_SIZE = 416x160` 的坐标系里。
 # y 方向是 160 行高度，所有 `*_ROWS` 都是“离底部多少行”的意思。
-# 当前策略用状态机锁定 car；进入避障后把控制基准线切到
-# 左边界向中线内收的路径。看不见车后不立刻回中线，
-# 而是先走 `CLEARING`，再把上一条绕车基准线逐步混回中线。
+# 当前策略用状态机锁定 car；默认走左边界内收路径：
+# 远距离左边界内收 25，近距离内收 10；看不见车后不立刻回正，
+# 而是先走 `CLEARING`，从内收 10 的路径逐步混回正常中线。
 # ---------------------------------------------------------------------------
 CAR_AVOIDANCE_ENABLED = True
-# 锁定 car 后，普通避障实际循线基准: 左边界向中线方向内收多少像素。
+# True 时 car 避障只做最终 PWM 偏移；False 时走左边界内收路径。
+CAR_AVOIDANCE_SERVO_BIAS_ENABLED = False
+# `distance_bias`: 随距离给前馈偏移，再用左边界 P 抵消。
+# `left_boundary_pd`: 绕车单独用左边界横向 PD 生成 PWM 偏移。
+CAR_AVOIDANCE_SERVO_BIAS_MODE = "distance_bias"
+# 偏移方向。现场如果发现避障打反，改成 -1 即可。
+CAR_AVOIDANCE_SERVO_BIAS_SIGN = 1.0
+# car 离车较远/较近时的 PWM 偏移范围。
+CAR_AVOIDANCE_SERVO_BIAS_MIN_PWM = 15.0
+CAR_AVOIDANCE_SERVO_BIAS_MAX_PWM = 58.0
+# 左边界横向 P 修正: 避车时希望道路左边界不要跑到画面中线右侧太多。
+# left_error = left_boundary_x - image_center_x，超过 deadband 后用 P 修正抵消一部分避车 PWM。
+CAR_AVOIDANCE_LEFT_BOUNDARY_TARGET_RATIO = 0.50
+CAR_AVOIDANCE_LEFT_BOUNDARY_P_DEADBAND = 4.0
+CAR_AVOIDANCE_LEFT_BOUNDARY_P_GAIN = 0.55
+CAR_AVOIDANCE_LEFT_BOUNDARY_P_MAX_PWM = 75.0
+# 左边界严重偏右时，允许 P 修正越过 0，给一点反向 PWM 主动拉回。
+CAR_AVOIDANCE_LEFT_BOUNDARY_P_REVERSE_MAX_PWM = 12.0
+# 左边界 P 释放不要瞬间归零，避免近距离 bias 从很小突然跳回最大值。
+CAR_AVOIDANCE_LEFT_BOUNDARY_P_RELEASE_KEEP_FRAMES = 2
+CAR_AVOIDANCE_LEFT_BOUNDARY_P_RELEASE_DECAY = 0.55
+# 横向 PD 绕车模式：只用左边界相对目标位置生成最终 PWM 偏移。
+CAR_AVOIDANCE_LEFT_BOUNDARY_PD_P_GAIN = 0.85
+CAR_AVOIDANCE_LEFT_BOUNDARY_PD_D_GAIN = 0.45
+CAR_AVOIDANCE_LEFT_BOUNDARY_PD_MAX_PWM = 58.0
+CAR_AVOIDANCE_LEFT_BOUNDARY_PD_REVERSE_MAX_PWM = 16.0
+CAR_AVOIDANCE_LEFT_BOUNDARY_PD_MAX_STEP_UP = 14.0
+CAR_AVOIDANCE_LEFT_BOUNDARY_PD_MAX_STEP_DOWN = 22.0
+# 车很近时，如果左边界从“太靠右”突然跳到左侧，认为正在过车，不允许 bias 瞬间重新大幅外打。
+CAR_AVOIDANCE_LEFT_BOUNDARY_PD_POST_PASS_ROWS = 30.0
+CAR_AVOIDANCE_LEFT_BOUNDARY_PD_POST_PASS_ENTER_ERROR = 70.0
+CAR_AVOIDANCE_LEFT_BOUNDARY_PD_POST_PASS_EXIT_ERROR = -20.0
+CAR_AVOIDANCE_LEFT_BOUNDARY_PD_POST_PASS_HOLD_FRAMES = 6
+# 使用最终 PWM 偏移避车时，正常循线 D 项的保留比例。
+# 0 表示避车期间关闭 D，避免 D 把刻意偏出去的动作拉回来；0.3/0.5 可保留部分阻尼。
+CAR_AVOIDANCE_SERVO_BIAS_D_GAIN_SCALE = 0.0
+# 线性偏移对应的远/近距离阈值；默认沿用旧边界避障触发距离。
+CAR_AVOIDANCE_SERVO_BIAS_START_ROWS = 135.0
+CAR_AVOIDANCE_SERVO_BIAS_NEAR_ROWS = 35.0
+# 旧路径避障参数/兼容项：现在主流程默认直接按左边界内收路径控制。
+# 这里仍保留给老逻辑和调试参考。
 CAR_AVOIDANCE_LEFT_BOUNDARY_INSET = 25.0
-# car 底部中心距离画面底部超过这个行数时，不做内收，只保留跟踪锁定。
-CAR_AVOIDANCE_START_BOUNDARY_ROWS = 110.0
+# car 底部中心距离画面底部超过这个行数时，只锁定跟踪，不切避障基准线。
+CAR_AVOIDANCE_START_BOUNDARY_ROWS = 115.0
 # car 底部中心距离画面底部不超过这个行数时，切到近距离内收。
 CAR_AVOIDANCE_NEAR_BOUNDARY_ROWS = 60.0
 # 近距离内收量。
@@ -1369,29 +1420,33 @@ CAR_AVOIDANCE_NEAR_LEFT_BOUNDARY_INSET = 10.0
 # 新 car 目标需要连续命中多少帧才锁定。
 CAR_AVOIDANCE_LOCK_HIT_FRAMES = 2
 # 锁定目标和新检测框匹配的搜索半径。
-CAR_AVOIDANCE_SEARCH_RADIUS = 48.0
+CAR_AVOIDANCE_SEARCH_RADIUS = 90.0
 # 目标漏检期间，搜索半径随漏检帧数增加的增益。
-CAR_AVOIDANCE_SEARCH_RADIUS_MISS_GAIN = 16.0
+CAR_AVOIDANCE_SEARCH_RADIUS_MISS_GAIN = 32.0
 # 锁定目标位置 EMA 平滑系数。
 CAR_AVOIDANCE_TRACK_EMA_ALPHA = 0.65
 # car 框短暂变小、被遮挡或漏检时，继续沿用最近一次锁定目标的帧数。
-# 调大可避免太早回正；过大会让已经绕过车后继续偏左太久。
-CAR_AVOIDANCE_MISS_FRAMES = 6
+# 漏 1 帧/2 帧继续正常避障，第 3 帧仍没检测到才进入 CLEARING。
+CAR_AVOIDANCE_MISS_FRAMES = 2
+# 近距离也按同样规则处理，避免贴底后长期挂在避障状态。
+CAR_AVOIDANCE_NEAR_MISS_FRAMES = 2
 # car 检测最低置信度过滤；0 表示不额外过滤。
 CAR_AVOIDANCE_MIN_SCORE = 0.0
 # car 检测最大面积过滤；0 表示不额外过滤。
 CAR_AVOIDANCE_MAX_AREA = 0.0
 # 避障退出状态机。
 # 车丢失后不立刻回正，而是先进入 CLEARING。
-# CLEARING 里会先保留上一条左边界内收基准线，再慢慢回到正常巡线。
-# 进入 CLEARING 前需要连续漏检多少帧。
-CAR_AVOIDANCE_CLEARING_MISS_FRAMES = 3
-# CLEARING 状态里绕车基准线衰减到结束需要多少帧。
-CAR_AVOIDANCE_CLEARING_DECAY_FRAMES = 15
-# CLEARING 初期保留原绕车基准线的比例。
-CAR_AVOIDANCE_CLEARING_RESIDUAL_KEEP = 0.8
+# CLEARING 里会先保留上一轮避障偏移，再慢慢回到正常巡线。
+# 进入 CLEARING 后不再额外保持，直接开始从内收路径回正。
+CAR_AVOIDANCE_CLEARING_MISS_FRAMES = 0
+# CLEARING 先走一帧近距离内收路径，再按 (当前行半宽 - 10) / 5 逐帧回中线。
+CAR_AVOIDANCE_CLEARING_DECAY_FRAMES = 5
+# CLEARING 硬退出上限，避免丢车后长期挂在内收 10。
+CAR_AVOIDANCE_CLEARING_MAX_FRAMES = 6
+# CLEARING 初期保留上一轮避障偏移的比例。
+CAR_AVOIDANCE_CLEARING_RESIDUAL_KEEP = 1.0
 # 衰减残余低于该比例时认为回正完成。
-CAR_AVOIDANCE_CLEARING_DONE_RESIDUAL = 0.06
+CAR_AVOIDANCE_CLEARING_DONE_RESIDUAL = 0.0
 # 车框还在但已经很贴底、贴右且高度较小时，直接进入近距离边界基准。
 # 贴右下特殊规则的 car 框高度上限。
 CAR_AVOIDANCE_FIXED_BOUNDARY_HEIGHT_THRESH = 60.0
@@ -1399,6 +1454,8 @@ CAR_AVOIDANCE_FIXED_BOUNDARY_HEIGHT_THRESH = 60.0
 CAR_AVOIDANCE_FIXED_BOUNDARY_RIGHT_MARGIN = 10.0
 # 贴右下特殊规则要求 car 离底边的最大距离。
 CAR_AVOIDANCE_FIXED_BOUNDARY_BOTTOM_MARGIN = 10.0
+# 避车 PWM 偏移日志间隔。
+LOG_INTERVAL_CAR_AVOIDANCE_DETAIL = 1.0
 # 主分割调试图绘制风格。
 # 最终路径线颜色。
 SEG_DEBUG_PATH_COLOR = (255, 0, 255)
