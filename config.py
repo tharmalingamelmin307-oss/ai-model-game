@@ -699,7 +699,7 @@ STANLEY_FF_NEAR_Y = STANLEY_FF_Y_BOTTOM
 # 横向误差优先使用拟合前中心点在前视行附近的平均值，减少拟合线底部失真影响。
 STANLEY_LATERAL_AVG_HALF_WINDOW = 10.0
 # 横向误差增益 k，控制 atan(k * e / (v_s + soft)) 的纠偏力度。
-STANLEY_LATERAL_GAIN = 0.30
+STANLEY_LATERAL_GAIN = 0.32
 # 横向 D 系数 Kd，作用在 EMA 后横向误差的帧间变化量 de 上。
 # 默认关闭；想试 B+d 时先从很小值开始，例如 0.040-0.045。
 STANLEY_LATERAL_D_GAIN = 0.022
@@ -907,6 +907,7 @@ DEFAULT_CONTROL_DATA = {
     "sign_route_api_submitted": False,
     "person_stop_active": False,
     "person_bottom_y": None,
+    "person_bottom_left_x": None,
     "person_bottom_center_x": None,
     "person_bottom_right_x": None,
     "person_bottom_area": None,
@@ -1034,14 +1035,14 @@ PERSON_CLASS_ID_FALLBACK = 2
 
 # 行人停车/放行逻辑。
 # 触发不做路径 ROI 过滤；person 框底边足够靠近画面底部后停车观察。
-# 当前策略: 先停车观察；确认行人沿某一方向稳定移动，并且底部中心跨过“行人放行线”后，再直接释放停车。
+# 当前策略: 先停车观察；确认行人沿某一方向稳定移动，并且对应侧底角跨过“行人放行线”后，再直接释放停车。
 # 画面上先画“停车截至横线”，它直接对应 PERSON_STOP_TRIGGER_DIST。
 # 竖向放行线后面再按调试需要打开。
 # 行人框底边距离画面底部小于该值才触发停车，单位 TARGET_RES 像素。
-PERSON_STOP_TRIGGER_DIST = 300
+PERSON_STOP_TRIGGER_DIST = 350
 # 行人框面积至少达到该值，才允许触发行人停车，单位 TARGET_RES 像素面积。
 PERSON_STOP_MIN_AREA = 7000
-# 行人朝目标侧连续移动多少帧后，才允许从停车切到绕行。
+# 行人朝目标侧连续移动并过线多少帧后，才允许从停车切到放行。
 PERSON_CLEAR_MOVE_FRAMES = 2
 # 判定“行人横向移动”的最小底部中心 x 增量。
 PERSON_CLEAR_MIN_MOVE_DX = 3.0

@@ -219,6 +219,7 @@ def extract_person_stop_candidate(boxes, frame_id):
         best = {
             "frame_id": int(frame_id),
             "bottom_y": bottom_y,
+            "bottom_left_x": min(x1, x2),
             "bottom_center_x": 0.5 * (x1 + x2),
             "bottom_right_x": max(x1, x2),
             "dist_to_bottom": float(target_h) - bottom_y,
@@ -301,6 +302,7 @@ def update_person_stop_state(state, person_info, left_boundary_x, right_boundary
                 released_by_missing = True
         state["person_stop_active"] = active
         state["person_bottom_y"] = None
+        state["person_bottom_left_x"] = None
         state["person_bottom_center_x"] = None
         state["person_bottom_right_x"] = None
         state["person_bottom_area"] = None
@@ -329,6 +331,7 @@ def update_person_stop_state(state, person_info, left_boundary_x, right_boundary
             state["person_stop_event"] = ""
         return active
 
+    bottom_left_x = float(person_info.get("bottom_left_x", person_info["bottom_center_x"]))
     bottom_center_x = float(person_info["bottom_center_x"])
     bottom_right_x = float(person_info["bottom_right_x"])
     bottom_y = float(person_info["bottom_y"])
@@ -386,9 +389,9 @@ def update_person_stop_state(state, person_info, left_boundary_x, right_boundary
 
     line_reached = False
     if release_direction > 0:
-        line_reached = bottom_center_x >= clear_line_x
+        line_reached = bottom_left_x >= clear_line_x
     elif release_direction < 0:
-        line_reached = bottom_center_x <= clear_line_x
+        line_reached = bottom_right_x <= clear_line_x
 
     movement_confirmed = (
         active and
@@ -420,6 +423,7 @@ def update_person_stop_state(state, person_info, left_boundary_x, right_boundary
 
     state["person_stop_active"] = active
     state["person_bottom_y"] = bottom_y
+    state["person_bottom_left_x"] = bottom_left_x
     state["person_bottom_center_x"] = bottom_center_x
     state["person_bottom_right_x"] = bottom_right_x
     state["person_bottom_area"] = person_area
