@@ -194,7 +194,7 @@ SIGN_LLM_TRIGGER_AREA = 12500
 # 触发语义路牌停车采样的 sign 截止距离，单位是 TARGET_RES 像素。
 # 路牌框底边距离画面底部小于等于该值，才认为已经足够近，可以停车采样。
 # 调大：更早停车；调小：更靠近再停车。
-SIGN_LLM_TRIGGER_DIST = 460
+SIGN_LLM_TRIGGER_DIST = 400
 # 停车后希望采集的有效 OCR 样本数量。
 # 收满后会提交给千帆；如果超时，也可能提前提交已有样本。
 SIGN_LLM_OCR_SAMPLES = 5
