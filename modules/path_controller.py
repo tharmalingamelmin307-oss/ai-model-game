@@ -14,6 +14,7 @@ class PathController:
         self.last_weighted_slope_heading_ff = None
         self.last_stanley_lateral_error = None
         self.last_stanley_heading_error = None
+        self.last_stanley_debug = None
         self.last_control_c_lateral_error = None
         self.last_control_c_heading_error = None
         self.last_control_c_curve_level = None
@@ -26,6 +27,7 @@ class PathController:
     def reset_stanley_band(self):
         self.last_stanley_lateral_error = None
         self.last_stanley_heading_error = None
+        self.last_stanley_debug = None
 
     def reset_control_c(self):
         self.last_control_c_lateral_error = None
@@ -38,7 +40,16 @@ class PathController:
         self.reset_stanley_band()
         self.reset_control_c()
 
-    def compute_steer_signal(self, path_points, img_w, img_h, center_bias_x=0.0, lateral_points=None, d_gain_scale=1.0):
+    def compute_steer_signal(
+        self,
+        path_points,
+        img_w,
+        img_h,
+        center_bias_x=0.0,
+        lateral_points=None,
+        heading_points=None,
+        d_gain_scale=1.0,
+    ):
         """按配置选择单一转向控制器；各控制器互不自动切换."""
         d_gain_scale = float(np.clip(float(d_gain_scale), 0.0, 1.0))
         mode = str(getattr(config, "STEER_CONTROL_MODE", "weighted_slope")).lower()
@@ -57,6 +68,7 @@ class PathController:
                 img_h,
                 center_bias_x=center_bias_x,
                 lateral_points=lateral_points,
+                heading_points=heading_points,
                 d_gain_scale=d_gain_scale,
             )
             if stanley_signal is not None and np.isfinite(stanley_signal):
@@ -69,6 +81,7 @@ class PathController:
                 img_h,
                 center_bias_x=center_bias_x,
                 lateral_points=lateral_points,
+                heading_points=heading_points,
                 d_gain_scale=d_gain_scale,
             )
             if control_c_signal is not None and np.isfinite(control_c_signal):
@@ -232,6 +245,7 @@ class PathController:
         *,
         center_bias_x=0.0,
         lateral_points=None,
+        heading_points=None,
         lookahead_y=70.0,
         heading_y_top=80.0,
         heading_y_bottom=120.0,
@@ -254,22 +268,38 @@ class PathController:
         lookahead_y = float(np.clip(lookahead_y, 0.0, bottom_y))
 
         control_pts = pts
+        lateral_pts = pts
+        if lateral_points is not None:
+            candidate_lateral_pts = np.array(lateral_points, dtype=np.float32).reshape((-1, 2))
+            if len(candidate_lateral_pts) > 0:
+                lateral_pts = candidate_lateral_pts
 
         path_x = None
         half_window = max(0.0, float(lateral_half_window))
-        lateral_mask = np.abs(control_pts[:, 1] - lookahead_y) <= half_window
-        window_pts = control_pts[lateral_mask]
+        lateral_mask = np.abs(lateral_pts[:, 1] - lookahead_y) <= half_window
+        window_pts = lateral_pts[lateral_mask]
         if len(window_pts) > 0:
-            path_x = float(np.mean(window_pts[:, 0]))
+            distances = np.abs(window_pts[:, 1] - lookahead_y)
+            weights = (half_window + 1.0) - distances
+            weights = np.maximum(weights, 1e-3)
+            weight_sum = float(np.sum(weights))
+            if weight_sum > 1e-6:
+                path_x = float(np.sum(window_pts[:, 0] * weights) / weight_sum)
         if path_x is None:
-            path_x = self._path_x_at_y_points(control_pts, lookahead_y)
+            path_x = self._path_x_at_y_points(lateral_pts, lookahead_y)
         if path_x is None:
             return None
 
-        heading_error = self._path_angle_between_rows(pts, heading_y_top, heading_y_bottom, bottom_y)
+        heading_pts = pts
+        if heading_points is not None:
+            candidate_heading_pts = np.array(heading_points, dtype=np.float32).reshape((-1, 2))
+            if len(candidate_heading_pts) >= 2:
+                heading_pts = candidate_heading_pts
+
+        heading_error = self._path_angle_between_rows(heading_pts, heading_y_top, heading_y_bottom, bottom_y)
         if heading_error is None:
             return None
-        ff_heading_error = self._path_angle_between_rows(pts, ff_y_top, ff_y_bottom, bottom_y)
+        ff_heading_error = self._path_angle_between_rows(heading_pts, ff_y_top, ff_y_bottom, bottom_y)
         if ff_heading_error is None:
             ff_heading_error = heading_error
 
@@ -296,7 +326,7 @@ class PathController:
         dx_dy = float(np.clip(dx_dy, -2.0, 2.0))
         return float(np.arctan(-dx_dy))
 
-    def _compute_stanley_band_steer_signal(self, path_points, img_w, img_h, center_bias_x=0.0, lateral_points=None, d_gain_scale=1.0):
+    def _compute_stanley_band_steer_signal(self, path_points, img_w, img_h, center_bias_x=0.0, lateral_points=None, heading_points=None, d_gain_scale=1.0):
         """算法 B: 按前视行 Stanley 公式计算转向量."""
         geom = self._compute_stanley_point_geometry(
             path_points,
@@ -304,6 +334,7 @@ class PathController:
             img_h,
             center_bias_x=center_bias_x,
             lateral_points=lateral_points,
+            heading_points=heading_points,
             lookahead_y=float(getattr(config, "STANLEY_LOOKAHEAD_Y", 70.0)),
             heading_y_top=float(getattr(config, "STANLEY_HEADING_Y_TOP", getattr(config, "STANLEY_HEADING_FAR_Y", getattr(config, "STANLEY_HEADING_LOOKAHEAD_Y", 70.0)))),
             heading_y_bottom=float(getattr(config, "STANLEY_HEADING_Y_BOTTOM", getattr(config, "STANLEY_HEADING_NEAR_Y", getattr(config, "STANLEY_LOOKAHEAD_Y", 70.0)))),
@@ -357,9 +388,31 @@ class PathController:
         heading_term = heading_gain * filtered_heading_error
         curvature_term = curvature_gain * float(ff_heading_error)
         output_sign = float(getattr(config, "STANLEY_OUTPUT_SIGN", 1.0))
-        return output_sign * (lateral_term + d_term + heading_term + curvature_term) * signal_scale
+        signal = output_sign * (lateral_term + d_term + heading_term + curvature_term) * signal_scale
+        self.last_stanley_debug = {
+            "lateral_error": float(lateral_error),
+            "filtered_error": float(filtered_error),
+            "error_delta": float(error_delta),
+            "heading_error": float(heading_error),
+            "filtered_heading_error": float(filtered_heading_error),
+            "ff_heading_error": float(ff_heading_error),
+            "lateral_gain": float(lateral_gain),
+            "d_gain": float(d_gain),
+            "heading_gain": float(heading_gain),
+            "curvature_gain": float(curvature_gain),
+            "soft": float(soft),
+            "speed_estimate": float(speed_estimate),
+            "signal_scale": float(signal_scale),
+            "output_sign": float(output_sign),
+            "lateral_term": float(lateral_term),
+            "d_term": float(d_term),
+            "heading_term": float(heading_term),
+            "curvature_term": float(curvature_term),
+            "signal": float(signal),
+        }
+        return signal
 
-    def _compute_control_c_steer_signal(self, path_points, img_w, img_h, center_bias_x=0.0, lateral_points=None, d_gain_scale=1.0):
+    def _compute_control_c_steer_signal(self, path_points, img_w, img_h, center_bias_x=0.0, lateral_points=None, heading_points=None, d_gain_scale=1.0):
         """算法 C: 连续曲率调度控制，e/de 纠偏，psi/psi_ff 顺弯."""
         geom = self._compute_stanley_point_geometry(
             path_points,
@@ -367,6 +420,7 @@ class PathController:
             img_h,
             center_bias_x=center_bias_x,
             lateral_points=lateral_points,
+            heading_points=heading_points,
             lookahead_y=float(getattr(config, "CONTROL_C_LOOKAHEAD_Y", 70.0)),
             heading_y_top=float(getattr(
                 config,

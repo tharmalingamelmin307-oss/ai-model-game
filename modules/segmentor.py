@@ -21,7 +21,12 @@ import numpy as np
 import time
 from rknnlite.api import RKNNLite
 import config
-from modules.debug_tools import SegDebugOverlay, SegProfileLogger, draw_seg_status_text
+from modules.debug_tools import (
+    SegDebugOverlay,
+    SegProfileLogger,
+    draw_seg_status_text,
+    get_debug_drive_keyboard_state,
+)
 from modules.path_controller import PathController
 try:
     from utils.rknn_quiet import suppress_rknn_init_output
@@ -88,6 +93,8 @@ class RoadSegmentor:
         self.merge_state_info = None
         self.merge_state_side = None
         self.merge_edge_trace_debug_counter = 0
+        self.y_fork_state_info = None
+        self.y_fork_state_last_hit_time = None
         self.locked_car = None
         self.locked_car_miss_frames = 0
         self.car_avoidance_state = "FOLLOW_LANE"
@@ -106,9 +113,72 @@ class RoadSegmentor:
         self.debug_overlay = SegDebugOverlay(tuple(config.SEG_SIZE))
         self.seg_profile_logger = SegProfileLogger()
         self.last_control_c_debug_log_at = 0.0
+        self.last_stanley_debug_log_at = 0.0
 
-    def _log_control_c_debug(self, steer_signal, servo_pwm, car_active=False):
+    def _debug_drive_log_allowed(self, debug_drive_active=True):
+        """调参日志只在网页/键盘调试发车后打印."""
+        if not bool(debug_drive_active):
+            return False
+        if bool(getattr(config, "DEBUG_DRIVE_CONTROL_ENABLED", True)):
+            try:
+                state = get_debug_drive_keyboard_state()
+                if bool(state.get("manual_stop_active", False)):
+                    return False
+            except Exception:
+                pass
+        return True
+
+    def _log_stanley_debug(self, steer_signal, servo_pwm, car_active=False, debug_drive_active=True):
+        """低频打印 Stanley 控制内部量，便于定位偏航/横向/PWM 映射问题."""
+        if not self._debug_drive_log_allowed(debug_drive_active):
+            return
+        if not bool(getattr(config, "STANLEY_DEBUG_LOG_ENABLED", False)):
+            return
+        if str(getattr(config, "STEER_CONTROL_MODE", "weighted_slope")).lower() != "stanley_band":
+            return
+
+        debug = getattr(self.path_controller, "last_stanley_debug", None)
+        if not debug:
+            return
+
+        now = time.monotonic()
+        interval = max(0.05, float(getattr(config, "STANLEY_DEBUG_LOG_INTERVAL", 0.5)))
+        if now - float(self.last_stanley_debug_log_at) < interval:
+            return
+        self.last_stanley_debug_log_at = now
+
+        heading_deg = float(np.degrees(debug.get("heading_error", 0.0)))
+        filtered_heading_deg = float(np.degrees(debug.get("filtered_heading_error", 0.0)))
+        ff_heading_deg = float(np.degrees(debug.get("ff_heading_error", 0.0)))
+        center_bias_x = float(getattr(config, "CONTROL_CENTER_BIAS_X", 0.0))
+        print(
+            "B调参: "
+            f"pwm={int(servo_pwm)} ctrl={float(steer_signal):.1f} "
+            f"e={float(debug.get('lateral_error', 0.0)):.1f}px "
+            f"e_f={float(debug.get('filtered_error', 0.0)):.1f}px "
+            f"de={float(debug.get('error_delta', 0.0)):.1f}px "
+            f"psi={heading_deg:.1f}deg "
+            f"psi_f={filtered_heading_deg:.1f}deg "
+            f"psi_ff={ff_heading_deg:.1f}deg "
+            f"Kp={float(debug.get('lateral_gain', 0.0)):.3f} "
+            f"Kd={float(debug.get('d_gain', 0.0)):.3f} "
+            f"Kyaw={float(debug.get('heading_gain', 0.0)):.2f} "
+            f"Kff={float(debug.get('curvature_gain', 0.0)):.2f} "
+            f"terms=({float(debug.get('lateral_term', 0.0)):.3f},"
+            f"{float(debug.get('d_term', 0.0)):.3f},"
+            f"{float(debug.get('heading_term', 0.0)):.3f},"
+            f"{float(debug.get('curvature_term', 0.0)):.3f}) "
+            f"scale={float(debug.get('signal_scale', 0.0)):.0f} "
+            f"gain={float(getattr(config, 'STANLEY_PWM_GAIN', 0.0)):.4f} "
+            f"bias={center_bias_x:.1f}px "
+            f"car={int(bool(car_active))}",
+            flush=True,
+        )
+
+    def _log_control_c_debug(self, steer_signal, servo_pwm, car_active=False, debug_drive_active=True):
         """低频打印 C 控制内部量，便于试车后反推小弯/大弯参数."""
+        if not self._debug_drive_log_allowed(debug_drive_active):
+            return
         if not bool(getattr(config, "CONTROL_C_DEBUG_LOG_ENABLED", False)):
             return
         if str(getattr(config, "STEER_CONTROL_MODE", "weighted_slope")).lower() != "control_c":
@@ -262,6 +332,17 @@ class RoadSegmentor:
             return np.full_like(target_ys, float(unique_xs[0]), dtype=np.float32)
 
         return np.interp(target_ys, unique_ys, unique_xs).astype(np.float32)
+
+    def _path_points_on_ys(self, path_points, target_ys, w_seg):
+        """把稀疏路径插值到指定 y 行，供控制项复用同一批采样行."""
+        xs = self._interp_path_xs(path_points, target_ys)
+        if xs is None:
+            return None
+        ys = np.array(target_ys, dtype=np.float32).reshape((-1,))
+        if len(xs) != len(ys):
+            return None
+        xs = np.clip(xs, 0.0, float(w_seg - 1))
+        return np.vstack((xs, ys)).astype(np.float32).T
 
     def _temporal_path_stats(self, path_points, reference_points=None):
         """计算当前候选路径相对上一帧输出路径的横向跳变量."""
@@ -655,6 +736,38 @@ class RoadSegmentor:
             "fork_point": fork_point,
             "split_rows": max(1, int(len(opening_run))),
         }
+
+    def _reset_y_fork_state(self):
+        """清空 Y 岔短时保持状态."""
+        self.y_fork_state_info = None
+        self.y_fork_state_last_hit_time = None
+
+    def _update_y_fork_state(self, y_fork_info):
+        """Y 岔短时保持：漏检少量帧时继续沿用最近一次分叉点."""
+        now_s = time.perf_counter()
+        hold_s = max(0.0, float(getattr(config, "FORK_STATE_HOLD_SECONDS", 0.5)))
+        empty_info = {"active": False, "fork_point": None, "split_rows": 0, "held": False}
+
+        if y_fork_info is not None and y_fork_info.get("active") and y_fork_info.get("fork_point") is not None:
+            cached_info = dict(y_fork_info)
+            cached_info["held"] = False
+            self.y_fork_state_info = cached_info
+            self.y_fork_state_last_hit_time = now_s
+            return cached_info
+
+        if (
+            hold_s > 0.0 and
+            self.y_fork_state_info is not None and
+            self.y_fork_state_last_hit_time is not None and
+            now_s - float(self.y_fork_state_last_hit_time) <= hold_s
+        ):
+            held_info = dict(self.y_fork_state_info)
+            held_info["active"] = True
+            held_info["held"] = True
+            return held_info
+
+        self._reset_y_fork_state()
+        return empty_info
 
     def _fork_trunk_support_ok(self, search_mask, fork_point):
         """分叉点以下的公共主干应有 mask 支撑，避免分界线长距离悬空."""
@@ -1447,6 +1560,7 @@ class RoadSegmentor:
         if merge_side not in ("left", "right") or not nodes:
             return nodes
 
+        width_ratio = max(0.0, float(getattr(config, "MERGE_BOUNDARY_WIDTH_RATIO", 1.0)))
         guide_points = None
         guide_y_min = None
         guide_y_max = None
@@ -1479,15 +1593,16 @@ class RoadSegmentor:
             if fixed_width <= 0.0 or not guide_in_range:
                 corrected_nodes.append(dict(node))
                 continue
+            patch_width = max(float(fixed_width) * width_ratio, float(getattr(config, "MERGE_GUIDE_LINE_MIN_GAP", 0.0)))
 
             # guide_polyline 就是缺失侧补线。中心线模式下逐行最左/最右点
             # 可能把远处另一条路也包含进来，所以汇合命中后不再用节点外边界。
             if merge_side == "left":
                 left_x = guide_x
-                right_x = guide_x + fixed_width
+                right_x = guide_x + patch_width
             else:
                 right_x = guide_x
-                left_x = guide_x - fixed_width
+                left_x = guide_x - patch_width
 
             left_x = float(np.clip(left_x, 0.0, float(config.SEG_SIZE[0] - 1)))
             right_x = float(np.clip(right_x, 0.0, float(config.SEG_SIZE[0] - 1)))
@@ -1508,12 +1623,13 @@ class RoadSegmentor:
         return corrected_nodes
 
     def _apply_fork_boundary_width(self, nodes, fork_side):
-        """Y 岔选定单侧后，用可信外边界按固定赛道宽度补另一侧边界."""
+        """Y 岔选定单侧后，保留可信边界并按固定宽度补另一侧边界."""
         if fork_side not in ("left", "right") or not nodes:
             return nodes
 
         w_seg = float(config.SEG_SIZE[0] - 1)
         min_gap = max(0.0, float(getattr(config, "MERGE_GUIDE_LINE_MIN_GAP", 0.0)))
+        width_ratio = max(0.0, float(getattr(config, "FORK_BOUNDARY_WIDTH_RATIO", 1.0)))
         corrected_nodes = []
 
         for node in nodes:
@@ -1526,14 +1642,12 @@ class RoadSegmentor:
                 corrected_nodes.append(dict(node))
                 continue
 
+            patch_width = max(float(fixed_width) * width_ratio, min_gap)
+
             if fork_side == "left":
-                trusted_x = left_x
-                left_x = trusted_x
-                right_x = max(trusted_x + fixed_width, trusted_x + min_gap)
+                right_x = left_x + patch_width
             else:
-                trusted_x = right_x
-                right_x = trusted_x
-                left_x = min(trusted_x - fixed_width, trusted_x - min_gap)
+                left_x = right_x - patch_width
 
             left_x = float(np.clip(left_x, 0.0, w_seg))
             right_x = float(np.clip(right_x, 0.0, w_seg))
@@ -1791,6 +1905,7 @@ class RoadSegmentor:
 
         h, w = search_mask.shape[:2]
         min_gap = max(0.0, float(config.MERGE_GUIDE_LINE_MIN_GAP))
+        width_ratio = max(0.0, float(getattr(config, "MERGE_BOUNDARY_WIDTH_RATIO", 1.0)))
 
         guide_pts = []
         for y_int in range(0, h):
@@ -1811,12 +1926,13 @@ class RoadSegmentor:
             fixed_width = self._fixed_track_width_at_y(y, observed_width)
             if fixed_width <= 0.0:
                 continue
+            patch_width = max(float(fixed_width) * width_ratio, min_gap)
 
             if side_name == "left":
-                x = trusted_right_x - fixed_width
+                x = trusted_right_x - patch_width
                 x = min(x, trusted_right_x - min_gap)
             else:
-                x = trusted_left_x + fixed_width
+                x = trusted_left_x + patch_width
                 x = max(x, trusted_left_x + min_gap)
             if x < 0.0 or x > float(w - 1):
                 continue
@@ -2920,6 +3036,7 @@ class RoadSegmentor:
         external_boundary_inset_x=0.0,
         external_boundary_side="left",
         sign_route_pending=False,
+        debug_drive_active=True,
     ):
         """对已推理出的 mask 做路径规划、控制器调用和调试渲染.
 
@@ -2987,9 +3104,10 @@ class RoadSegmentor:
                 merge_guide_info.get("guide_polyline"),
             )
             search_edge_mask = self._extract_edge_mask(search_mask)
+            self._reset_y_fork_state()
             y_fork_info = {"active": False, "fork_point": None, "split_rows": 0}
         else:
-            y_fork_info = self._detect_y_fork(search_mask)
+            y_fork_info = self._update_y_fork_state(self._detect_y_fork(search_mask))
         fork_bottom_mid = self._road_bottom_midpoint(search_mask)
         branch_pair_count_max = 0
         branch_support_rows = 0
@@ -3021,6 +3139,7 @@ class RoadSegmentor:
         if preferred_turn_default not in (-1, 1):
             preferred_turn_default = -1
         route_boundary_side = None
+        fork_boundary_applied_side = None
         stone_branch_side = 0
         car_path_debug = None
         car_avoid_path = None
@@ -3175,14 +3294,18 @@ class RoadSegmentor:
         if best_path is not None:
             guide_polyline = None if merge_guide_info is None else merge_guide_info.get("guide_polyline")
             fit_nodes = self._apply_merge_boundary_width(best_nodes, merge_side, guide_polyline)
+            no_sign_route_active = route_choice == 0 and not bool(sign_route_pending)
+            fork_boundary_side = fork_selected_side or route_boundary_side
             if (
                 bool(getattr(config, "FORK_BOUNDARY_WIDTH_ENABLED", True)) and
+                no_sign_route_active and
                 merge_side not in ("left", "right") and
-                (fork_selected_side or route_boundary_side) in ("left", "right")
+                fork_boundary_side in ("left", "right")
             ):
+                fork_boundary_applied_side = fork_boundary_side
                 fit_nodes = self._apply_fork_boundary_width(
                     fit_nodes,
-                    fork_selected_side or route_boundary_side,
+                    fork_boundary_side,
                 )
             fit_path = np.array([node["pt"] for node in fit_nodes], dtype=np.float32)
             node_x = fit_path[:, 0]
@@ -3212,11 +3335,33 @@ class RoadSegmentor:
             dense_y = np.clip(dense_y, 0, h_seg - 1)
 
             path_points_orig = np.vstack((dense_x, dense_y)).astype(np.float32).T
-            lateral_path_points = None
-            raw_lateral_x = self._interp_path_xs(fit_path, dense_y)
-            if raw_lateral_x is not None:
-                raw_lateral_x = np.clip(raw_lateral_x, 0, w_seg - 1)
-                lateral_path_points = np.vstack((raw_lateral_x, dense_y)).astype(np.float32).T
+            lateral_path_points = fit_path.astype(np.float32)
+            heading_path_points = None
+            heading_path_source = "center"
+            if bool(getattr(config, "PATH_HEADING_USE_TRUSTED_BOUNDARY", True)):
+                route_side = fork_selected_side or route_boundary_side or fork_boundary_applied_side
+                trusted_boundary_side = "left"
+                if bool(sign_route_pending) and y_fork_active and fork_selected_side is None:
+                    heading_path_points = path_points_orig
+                    heading_path_source = "fork_centerline"
+                else:
+                    if merge_side == "left":
+                        trusted_boundary_side = "right"
+                        heading_path_source = "merge_trusted_right"
+                    elif merge_side == "right":
+                        trusted_boundary_side = "left"
+                        heading_path_source = "merge_trusted_left"
+                    elif route_side == "right":
+                        trusted_boundary_side = "right"
+                        heading_path_source = "right_boundary"
+                    elif route_side == "left":
+                        trusted_boundary_side = "left"
+                        heading_path_source = "left_boundary"
+                    else:
+                        heading_path_source = "left_boundary"
+
+                    trusted_boundary_pts = right_boundary_pts if trusted_boundary_side == "right" else left_boundary_pts
+                    heading_path_points = self._path_points_on_ys(trusted_boundary_pts, dense_y, w_seg)
             base_path_points = path_points_orig.copy()
             car_boundary_strength_x, car_path_debug, car_avoid_path = self._update_car_avoidance_boundary_path(
                 path_points_orig,
@@ -3285,6 +3430,7 @@ class RoadSegmentor:
             self.missing_path_frames = 0
             control_path_points = path_points_orig
             lateral_control_points = lateral_path_points
+            heading_control_points = heading_path_points
             control_mode = str(getattr(config, "STEER_CONTROL_MODE", "weighted_slope")).lower()
             if (
                 control_mode in ("stanley_band", "control_c") and
@@ -3303,6 +3449,7 @@ class RoadSegmentor:
                     if weighted_points is not None:
                         control_path_points = weighted_points
                         lateral_control_points = weighted_points
+                        heading_control_points = weighted_points
             else:
                 if control_mode == "weighted_slope":
                     weighted_points = self.path_controller.select_control_points(
@@ -3313,12 +3460,14 @@ class RoadSegmentor:
                     if weighted_points is not None:
                         control_path_points = weighted_points
                         lateral_control_points = weighted_points
+                        heading_control_points = weighted_points
             steer_signal = self.path_controller.compute_steer_signal(
                 control_path_points,
                 w_seg,
                 h_seg,
-                center_bias_x=0.0,
+                center_bias_x=float(getattr(config, "CONTROL_CENTER_BIAS_X", 0.0)),
                 lateral_points=lateral_control_points,
+                heading_points=heading_control_points,
                 d_gain_scale=d_gain_scale,
             )
             if car_active and not car_servo_bias_enabled:
@@ -3370,10 +3519,13 @@ class RoadSegmentor:
             "branch_support_rows": int(branch_support_rows),
             "fork_active": bool(fork_active),
             "y_fork_active": bool(y_fork_active),
+            "y_fork_state_held": bool(y_fork_info.get("held", False)),
             "merge_side": merge_side,
             "merge_state_active": bool(self.merge_state_active),
             "merge_state_hit_frames": int(self.merge_state_hit_frames),
             "merge_state_exit_frames": int(self.merge_state_exit_frames),
+            "heading_path_source": str(heading_path_source if 'heading_path_source' in locals() else "center"),
+            "fork_boundary_applied_side": fork_boundary_applied_side,
             "car_active": bool(car_active),
             "car_state": str(car_state if 'car_state' in locals() else "FOLLOW_LANE"),
             "car_rows_to_bottom": float(car_path_debug.get("rows_to_bottom", 0.0)) if car_path_debug is not None and car_path_debug.get("rows_to_bottom") is not None else None,
@@ -3404,7 +3556,13 @@ class RoadSegmentor:
             merge_guide_pts=None if merge_guide_info is None else merge_guide_info.get("guide_polyline"),
             fork_point=y_fork_info.get("fork_point") if y_fork_active else None,
             control_band=control_band if 'control_band' in locals() else None,
-            bottom_mid=fork_bottom_mid if y_fork_active else None,
+            bottom_mid=(
+                fork_bottom_mid if y_fork_active
+                else (
+                    0.5 * float(w_seg) + float(getattr(config, "CONTROL_CENTER_BIAS_X", 0.0)),
+                    float(h_seg) - 1.0,
+                )
+            ),
         )
         t_fit_end = time.perf_counter()
 
@@ -3462,10 +3620,17 @@ class RoadSegmentor:
             + servo_bias_pwm
         )
         servo_pwm = int(max(config.SERVO_MIN, min(config.SERVO_MAX, servo_pwm)))
+        self._log_stanley_debug(
+            steer_signal,
+            servo_pwm,
+            car_active=bool(car_active) if 'car_active' in locals() else False,
+            debug_drive_active=bool(debug_drive_active),
+        )
         self._log_control_c_debug(
             steer_signal,
             servo_pwm,
             car_active=bool(car_active) if 'car_active' in locals() else False,
+            debug_drive_active=bool(debug_drive_active),
         )
         draw_seg_status_text(
             ai_view,
@@ -3509,6 +3674,7 @@ class RoadSegmentor:
         external_boundary_inset_x=0.0,
         external_boundary_side="left",
         sign_route_pending=False,
+        debug_drive_active=True,
     ):
         """兼容旧串行调用：推理和后处理在同一个线程里连续执行."""
         t_total_start = time.perf_counter()
@@ -3525,4 +3691,5 @@ class RoadSegmentor:
             external_boundary_inset_x=external_boundary_inset_x,
             external_boundary_side=external_boundary_side,
             sign_route_pending=sign_route_pending,
+            debug_drive_active=debug_drive_active,
         )

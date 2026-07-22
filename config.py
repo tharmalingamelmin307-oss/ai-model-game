@@ -369,10 +369,16 @@ FORK_TRUNK_SUPPORT_MIN_RATIO = 0.55
 FORK_TRUNK_SUPPORT_MAX_MISS_ROWS = 18
 # 公共主干至少检查多少行才认为这个验证有意义。
 FORK_TRUNK_SUPPORT_MIN_ROWS = 18
-# 岔路区域按当前目标方向的外侧可信边界 +/- 固定赛道宽度补出另一侧边界。
-# 右路用最右边界补左边，左路/默认左用最左边界补右边；
-# 只在 Y 岔确认或已经分出左右候选时启用，普通单路不补。
+# Y 岔路短时保持时间，单位秒。
+# 命中 Y 岔后，如果后续少量帧漏检，会继续沿用最近一次 fork_point，避免岔路口抖进抖出。
+FORK_STATE_HOLD_SECONDS = 0.5
+# 岔路区域是否按目标方向的外侧可信边界 +/- 固定赛道宽度补出另一侧边界。
+# 当前只在“没有路牌路线任务”的岔路口使用：默认走左时，保留原始左边界并向右补固定宽度；
+# 路牌等待结果时仍走“底部中点 -> 分叉点”拉线，避免提前被补线带拐。
 FORK_BOUNDARY_WIDTH_ENABLED = True
+# 岔路补线使用的固定宽度比例。
+# 例如 0.9 表示补线宽度为当前 y 行标定赛道宽度的 90%；现场偏宽可调到 0.8。
+FORK_BOUNDARY_WIDTH_RATIO = 0.85
 
 
 # ---------------------------------------------------------------------------
@@ -427,6 +433,9 @@ MERGE_GUIDE_LINE_Y_MAX = 160
 # 补左线时，如果它离右边界太近，就限制到“右边界 - gap”左侧；
 # 补右线时，如果它离左边界太近，就推到“左边界 + gap”右侧。
 MERGE_GUIDE_LINE_MIN_GAP = 13.0
+# 汇合补线使用的固定宽度比例。
+# 1.0 保持原始宽度；偏宽时可调到 0.9/0.85/0.8。
+MERGE_BOUNDARY_WIDTH_RATIO = 0.9
 # 汇合 guide line 画入搜索 mask 时使用的线宽。
 MERGE_GUIDE_LINE_THICKNESS = 2
 # 汇合状态机：连续命中若干帧才进入补线；进入后等底部赛道宽度稳定恢复再退出。
@@ -584,13 +593,14 @@ CONTROL_SPEED_MAX_STEP_DOWN = 2
 # 这是“车身理论正前方”对应的 PWM。
 # 当前 750 已确认机械中直；除非重新装舵机/连杆，否则不把它当控制参数来调。
 # SERVO_CENTER = 736
-SERVO_CENTER = 770
+SERVO_CENTER = 735
+# SERVO_CENTER = 770
 
 # 舵机安全最小/最大 PWM。
 # 用于硬限制输出，避免控制算法在极端情况下打到危险位置。
 # SERVO_MIN, SERVO_MAX = 590, 910
-# SERVO_MIN, SERVO_MAX = 596, 876
-SERVO_MIN, SERVO_MAX = 630, 910
+SERVO_MIN, SERVO_MAX = 590, 880
+# SERVO_MIN, SERVO_MAX = 630, 910
 
 # 舵机输出低通滤波。作用在最终 servo_pwm 上，专门压车跑起来时的小幅高频抖动。
 # - EMA_ALPHA 越大越稳，但响应越慢；0 表示不滤波，0.35~0.65 常用。
@@ -600,6 +610,11 @@ SERVO_OUTPUT_FILTER_ENABLED = False
 SERVO_OUTPUT_EMA_ALPHA = 0.0
 SERVO_OUTPUT_DEADBAND_PWM = 0
 SERVO_OUTPUT_MAX_STEP = 0
+
+# 视觉控制参考中线偏置，单位是 SEG_SIZE 坐标里的像素。
+# 舵机中心已经机械校正时保持 0；只在确认相机安装导致图像中线不是车身正前方时才小幅调。
+# 正数: 车身参考中线往画面右侧挪；负数: 往画面左侧挪。
+CONTROL_CENTER_BIAS_X = 0.0
 
 # 当前启用的转向控制器。
 # - "weighted_slope": 算法 A，原始稳定算法。把路径点到底部中点的斜率做远近加权平均。
@@ -670,7 +685,7 @@ WEIGHTED_SLOPE_SAMPLE_ROW_MAX = 90.0
 #   delta = atan(k * e / (v_s + k_soft)) + Kd * de + g_psi * psi_e + g_ff * psi_ff
 # 这里不做逆透视，仍工作在 SEG_SIZE 图像坐标里:
 # - e: 控制路径在 STANLEY_LOOKAHEAD_Y 这一行相对车身中线的横向误差，单位: pixel
-# - de: e 经过 EMA 后的帧间变化量，单位: pixel/frame
+# - de: e 经过 EMA 后的帧间变化量，单位: pixel/frame；正数表示误差变小，负数表示误差变大
 # - psi_e: 控制路径两点之间的航向角，单位: rad
 # - psi_ff: 更远两点之间的航向角前馈，替代原来的二次拟合曲率
 # 因为速度暂时只有编码器档位，v_s 先用 STANLEY_SPEED_ESTIMATE 这个调参量。
@@ -728,6 +743,11 @@ STANLEY_OUTPUT_SIGN = 1.0
 # 控制路径至少需要的点数；不足时当前算法输出 0，不切换到其它控制器。
 STANLEY_MIN_FIT_POINTS = 3
 
+# B 调参打印。试车时终端低频输出:
+# pwm/ctrl/e/de/psi/psi_ff/各项 term/当前 Stanley 参数。
+STANLEY_DEBUG_LOG_ENABLED = True
+STANLEY_DEBUG_LOG_INTERVAL = 0.05
+
 
 # ---------------------------------------------------------------------------
 # 转向算法 C: 线性 PD + 航向抑制参数
@@ -735,9 +755,13 @@ STANLEY_MIN_FIT_POINTS = 3
 # B/C 航向角计算方式。True 时用最小二乘直线 x=a*y+b 的斜率 a 算航向；
 # False 时用二次拟合曲线在 HEADING_LOOKAHEAD_Y 的局部切线算航向。
 PATH_HEADING_LINEAR_FIT_ENABLED = True
+# B/C 航向角是否改用当前可信边界计算。横向误差 e 仍使用目标路径/中线。
+# 默认可信左边界；右岔用右边界；路牌等待结果拉线时用中间拉线；
+# 汇合补左线时用真实右边界，补右线时用真实左边界。
+PATH_HEADING_USE_TRUSTED_BOUNDARY = True
 # B/C 横向误差 e 是否使用最终滤波后的控制路径。
-# True: e、航向和调试紫线使用同一条路径，岔路/汇合后不容易 raw 路径和滤波路径打架。
-# False: e 优先使用拟合前原始中心点，反应更快但分叉后可能短暂取到不一致的路径。
+# 当前默认 False：e 使用拟合前原始中点，并在 LOOKAHEAD_Y 附近按距离加权平均。
+# True 会退回使用拟合/滤波后的控制路径。
 PATH_LATERAL_USE_FILTERED_PATH = True
 
 # C 算法: 小弯/大弯参数自动过渡控制器。
@@ -781,7 +805,7 @@ CONTROL_C_FF_Y_BOTTOM = 35.0
 # 旧参数名保留给外部脚本兼容读取。
 CONTROL_C_HEADING_LOOKAHEAD_Y = CONTROL_C_HEADING_Y_TOP
 
-# 横向误差 e 不是直接取拟合曲线，而是在 CONTROL_C_LOOKAHEAD_Y 附近取拟合前中心点平均。
+# 横向误差 e 不是直接取拟合曲线，而是在 CONTROL_C_LOOKAHEAD_Y 附近取拟合前中心点加权平均。
 # 这里是半窗口高度，5 表示取 y±5 行内的中心点平均。
 # 调大：e 更稳，但会变钝；调小：e 更灵敏，但更容易抖。
 CONTROL_C_LATERAL_AVG_HALF_WINDOW = 10.0

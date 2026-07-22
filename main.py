@@ -16,6 +16,7 @@
 import time
 import struct
 import copy
+import logging
 import numpy as np
 import cv2
 import threading
@@ -47,6 +48,7 @@ except ImportError:
         return
 
 app = Flask(__name__)
+logging.getLogger("werkzeug").disabled = True
 LOG_GREEN = "\033[92m"
 LOG_RESET = "\033[0m"
 
@@ -1012,19 +1014,44 @@ def yolo_worker(core_id=None, worker_id=0):
             sign_jobs = []
             pending_sign_jobs = []
             route_trigger_rect = None
+            route_skip_debug = None
             for idx, obj in enumerate(objs):
                 cls_id = obj.get("class_id")
                 if cls_id != config.SIGN_CLASS_ID:
                     continue
                 rect = obj.get("rect", [0, 0, 0, 0])
                 if route_trigger_rect is None:
-                    should_trigger, _ = should_trigger_sign_route(cls_id, rect)
+                    should_trigger, trigger_skip_reason = should_trigger_sign_route(cls_id, rect)
                     if should_trigger:
                         route_trigger_rect = list(rect)
+                    elif route_skip_debug is None:
+                        x, y, w, h = rect if len(rect) == 4 else (0, 0, 0, 0)
+                        frame_w, frame_h = config.TARGET_RES
+                        route_skip_debug = {
+                            "reason": trigger_skip_reason,
+                            "area": rect_area(rect),
+                            "dist": max(0.0, float(frame_h) - float(y + h)),
+                            "rect": list(rect),
+                        }
                 should_enqueue, skip_reason = should_enqueue_ocr_job(cls_id, rect)
                 if not should_enqueue:
                     continue
                 pending_sign_jobs.append((idx, cls_id, rect))
+            if route_trigger_rect is None and route_skip_debug is not None:
+                throttled_log(
+                    "sign_route_trigger_skip",
+                    "语义路牌未触发停车: "
+                    f"原因={route_skip_debug['reason']} "
+                    f"area={route_skip_debug['area']:.0f} "
+                    f"dist={route_skip_debug['dist']:.0f} "
+                    f"rect={route_skip_debug['rect']}",
+                    state=(
+                        route_skip_debug["reason"],
+                        int(route_skip_debug["area"] // 500),
+                        int(route_skip_debug["dist"] // 20),
+                    ),
+                    min_interval=0.5,
+                )
 
             sign_llm_collecting_now = False
             with data_lock:
@@ -1585,6 +1612,8 @@ def seg_worker(core_id, worker_id=0):
                 sign_route_pending = route_state in ("SIGN_STOP_COLLECT", "WAIT_API")
                 external_boundary_inset_x = 0.0
                 external_boundary_side = "left"
+                debug_keyboard_state = get_debug_drive_keyboard_state()
+                debug_drive_active = not bool(debug_keyboard_state.get("manual_stop_active", False))
 
             try:
                 steer_signal, rendered_img = seg.run(
@@ -1596,6 +1625,7 @@ def seg_worker(core_id, worker_id=0):
                     external_boundary_inset_x=external_boundary_inset_x,
                     external_boundary_side=external_boundary_side,
                     sign_route_pending=sign_route_pending,
+                    debug_drive_active=debug_drive_active,
                 )
                 publish_seg_result(
                     steer_signal,
@@ -1638,6 +1668,7 @@ def seg_worker(core_id, worker_id=0):
                 external_boundary_inset_x,
                 external_boundary_side,
                 sign_route_pending,
+                debug_drive_active,
             ) = item
 
             try:
@@ -1655,6 +1686,7 @@ def seg_worker(core_id, worker_id=0):
                     external_boundary_inset_x=external_boundary_inset_x,
                     external_boundary_side=external_boundary_side,
                     sign_route_pending=sign_route_pending,
+                    debug_drive_active=debug_drive_active,
                 )
                 t_post_end = time.perf_counter()
                 publish_seg_result(
@@ -1706,6 +1738,8 @@ def seg_worker(core_id, worker_id=0):
             sign_route_pending = route_state in ("SIGN_STOP_COLLECT", "WAIT_API")
             external_boundary_inset_x = 0.0
             external_boundary_side = "left"
+            debug_keyboard_state = get_debug_drive_keyboard_state()
+            debug_drive_active = not bool(debug_keyboard_state.get("manual_stop_active", False))
         t_lock_end = time.perf_counter()
 
         try:
@@ -1741,6 +1775,7 @@ def seg_worker(core_id, worker_id=0):
             external_boundary_inset_x,
             external_boundary_side,
             sign_route_pending,
+            debug_drive_active,
         ))
         t_put_end = time.perf_counter()
         profile_log(
