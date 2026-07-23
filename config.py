@@ -190,11 +190,11 @@ OCR_MIN_SCORE = 0.4
 SIGN_LLM_ENABLED = True
 # 触发语义路牌停车采样的 sign 框面积阈值，单位是 TARGET_RES 坐标系像素面积。
 # 它会和 SIGN_LLM_TRIGGER_DIST、SIGN_LLM_TRIGGER_EDGE_MARGIN_RATIO 同时满足后才停车。
-SIGN_LLM_TRIGGER_AREA = 12500
+SIGN_LLM_TRIGGER_AREA = 13000
 # 触发语义路牌停车采样的 sign 截止距离，单位是 TARGET_RES 像素。
 # 路牌框底边距离画面底部小于等于该值，才认为已经足够近，可以停车采样。
 # 调大：更早停车；调小：更靠近再停车。
-SIGN_LLM_TRIGGER_DIST = 400
+SIGN_LLM_TRIGGER_DIST = 500
 # 停车后希望采集的有效 OCR 样本数量。
 # 收满后会提交给千帆；如果超时，也可能提前提交已有样本。
 SIGN_LLM_OCR_SAMPLES = 5
@@ -593,13 +593,13 @@ CONTROL_SPEED_MAX_STEP_DOWN = 2
 # 这是“车身理论正前方”对应的 PWM。
 # 当前 750 已确认机械中直；除非重新装舵机/连杆，否则不把它当控制参数来调。
 # SERVO_CENTER = 736
-SERVO_CENTER = 735
+SERVO_CENTER = 750
 # SERVO_CENTER = 770
 
 # 舵机安全最小/最大 PWM。
 # 用于硬限制输出，避免控制算法在极端情况下打到危险位置。
-# SERVO_MIN, SERVO_MAX = 590, 910
-SERVO_MIN, SERVO_MAX = 590, 880
+SERVO_MIN, SERVO_MAX = 590, 910
+# SERVO_MIN, SERVO_MAX = 590, 866
 # SERVO_MIN, SERVO_MAX = 630, 910
 
 # 舵机输出低通滤波。作用在最终 servo_pwm 上，专门压车跑起来时的小幅高频抖动。
@@ -699,8 +699,8 @@ STANLEY_USE_BOUNDARY_MIDPOINTS = False
 STANLEY_LOOKAHEAD_Y = 100.0
 # 航向角只看近中距离区域，负责抑制当前车头附近的左右摆。
 # TOP 是画面更上方/更远处，BOTTOM 是画面更下方/更近处。
-STANLEY_HEADING_Y_TOP = 60.0
-STANLEY_HEADING_Y_BOTTOM = 100.0
+STANLEY_HEADING_Y_TOP = 30.0
+STANLEY_HEADING_Y_BOTTOM = 110.0
 # 前馈角单独看更远区域，负责提前感知弯道趋势；不要和航向角共用同一段区域。
 STANLEY_FF_Y_TOP = 10.0
 STANLEY_FF_Y_BOTTOM = 30.0
@@ -714,19 +714,19 @@ STANLEY_FF_NEAR_Y = STANLEY_FF_Y_BOTTOM
 # 横向误差优先使用拟合前中心点在前视行附近的平均值，减少拟合线底部失真影响。
 STANLEY_LATERAL_AVG_HALF_WINDOW = 10.0
 # 横向误差增益 k，控制 atan(k * e / (v_s + soft)) 的纠偏力度。
-STANLEY_LATERAL_GAIN = 0.32
+STANLEY_LATERAL_GAIN = 0.32  #0.32
 # 横向 D 系数 Kd，作用在 EMA 后横向误差的帧间变化量 de 上。
 # 默认关闭；想试 B+d 时先从很小值开始，例如 0.040-0.045。
-STANLEY_LATERAL_D_GAIN = 0.022
+STANLEY_LATERAL_D_GAIN =0.022 #0.022
 # D 项使用前先对 e 做 EMA 平滑。数值越大越稳，但 D 项反应越慢。
 STANLEY_LATERAL_D_EMA_ALPHA = 0.1
 # 航向误差增益 g_psi。
-STANLEY_HEADING_GAIN = 0.25
+STANLEY_HEADING_GAIN = 0.15#0.25
 # 航向误差 psi 的 EMA 平滑。只影响 STANLEY_HEADING_GAIN 非 0 时的航向项。
 # 调大：航向项更稳、更不追拟合线小抖；过大则航向抑制反应变慢。
-STANLEY_HEADING_EMA_ALPHA = 0.5
+STANLEY_HEADING_EMA_ALPHA = 0.2
 # 两点角度前馈增益 g_ff。替代原来的曲率前馈，减少曲线拟合不稳定造成的左右飘。
-STANLEY_CURVATURE_FF_GAIN = 0.01
+STANLEY_CURVATURE_FF_GAIN = 0.05
 # 轴距 L，单位 m。保留兼容旧配置；当前两点角度前馈不再使用它。
 STANLEY_WHEELBASE_M = 0.2
 # 速度估计 v_s。当前仅算法 B 使用。
@@ -1074,7 +1074,7 @@ PERSON_CLASS_ID_FALLBACK = 2
 # 画面上先画“停车截至横线”，它直接对应 PERSON_STOP_TRIGGER_DIST。
 # 竖向放行线后面再按调试需要打开。
 # 行人框底边距离画面底部小于该值才触发停车，单位 TARGET_RES 像素。
-PERSON_STOP_TRIGGER_DIST = 300
+PERSON_STOP_TRIGGER_DIST = 340
 # 行人框面积至少达到该值，才允许触发行人停车，单位 TARGET_RES 像素面积。
 PERSON_STOP_MIN_AREA = 7000
 # 行人朝目标侧连续移动并过线多少帧后，才允许从停车切到放行。

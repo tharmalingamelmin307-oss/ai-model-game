@@ -323,7 +323,7 @@ class PathController:
             return None
 
         dx_dy = (float(bottom_x) - float(top_x)) / dy
-        dx_dy = float(np.clip(dx_dy, -2.0, 2.0))
+        dx_dy = float(np.clip(dx_dy, -3.5, 3.5))
         return float(np.arctan(-dx_dy))
 
     def _compute_stanley_band_steer_signal(self, path_points, img_w, img_h, center_bias_x=0.0, lateral_points=None, heading_points=None, d_gain_scale=1.0):
