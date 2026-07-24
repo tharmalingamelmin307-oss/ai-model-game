@@ -1761,6 +1761,7 @@ def seg_worker(core_id, worker_id=0):
             global_control_data["car_avoidance_rows_to_bottom"] = car_stats.get("car_rows_to_bottom")
             global_control_data["car_avoidance_miss_frames"] = int(car_stats.get("car_miss_frames", 0))
             global_control_data["car_avoidance_clear_frames"] = int(car_stats.get("car_clear_frames", 0))
+            global_control_data["car_avoidance_state_paused"] = bool(car_stats.get("car_state_paused", False))
             global_control_data["car_avoidance_left_boundary_error"] = car_stats.get("car_left_boundary_error")
             global_control_data["car_avoidance_left_boundary_x"] = car_stats.get("car_left_boundary_x")
             global_control_data["car_avoidance_left_boundary_p_pwm"] = float(car_stats.get("car_left_boundary_p_pwm", 0.0))
@@ -1768,6 +1769,7 @@ def seg_worker(core_id, worker_id=0):
             global_control_data["car_avoidance_boundary_inset_x"] = float(car_stats.get("car_boundary_inset_x", 0.0))
             global_control_data["car_avoidance_boundary_path_active"] = bool(car_stats.get("car_boundary_path_active", False))
             global_control_data["car_avoidance_pd_pwm"] = float(car_stats.get("car_pd_pwm", 0.0))
+            global_control_data["car_avoidance_servo_bias_pwm"] = float(car_stats.get("car_servo_bias_pwm", 0.0))
             y_fork_point = car_stats.get("y_fork_point")
             y_fork_rows_to_bottom = None
             if bool(y_fork_active) and y_fork_point is not None:
@@ -1890,7 +1892,12 @@ def seg_worker(core_id, worker_id=0):
                 external_boundary_inset_x = 0.0
                 external_boundary_side = "left"
                 debug_keyboard_state = get_debug_drive_keyboard_state()
-                debug_drive_active = not bool(debug_keyboard_state.get("manual_stop_active", False))
+                drive_stop_active = (
+                    bool(debug_keyboard_state.get("manual_stop_active", False)) or
+                    bool(global_control_data.get("person_stop_active", False)) or
+                    bool(global_control_data.get("sign_llm_stop_active", False))
+                )
+                debug_drive_active = not drive_stop_active
 
             try:
                 steer_signal, rendered_img = seg.run(
@@ -2018,7 +2025,12 @@ def seg_worker(core_id, worker_id=0):
             external_boundary_inset_x = 0.0
             external_boundary_side = "left"
             debug_keyboard_state = get_debug_drive_keyboard_state()
-            debug_drive_active = not bool(debug_keyboard_state.get("manual_stop_active", False))
+            drive_stop_active = (
+                bool(debug_keyboard_state.get("manual_stop_active", False)) or
+                bool(global_control_data.get("person_stop_active", False)) or
+                bool(global_control_data.get("sign_llm_stop_active", False))
+            )
+            debug_drive_active = not drive_stop_active
         t_lock_end = time.perf_counter()
 
         try:
@@ -2105,6 +2117,7 @@ def serial_control_thread():
             car_avoidance_rows_to_bottom = global_control_data.get("car_avoidance_rows_to_bottom")
             car_avoidance_miss_frames = int(global_control_data.get("car_avoidance_miss_frames", 0))
             car_avoidance_clear_frames = int(global_control_data.get("car_avoidance_clear_frames", 0))
+            car_avoidance_state_paused = bool(global_control_data.get("car_avoidance_state_paused", False))
             car_avoidance_left_boundary_error = global_control_data.get("car_avoidance_left_boundary_error")
             car_avoidance_left_boundary_x = global_control_data.get("car_avoidance_left_boundary_x")
             car_avoidance_left_boundary_p_pwm = float(global_control_data.get("car_avoidance_left_boundary_p_pwm", 0.0))
@@ -2112,6 +2125,7 @@ def serial_control_thread():
             car_avoidance_boundary_inset_x = float(global_control_data.get("car_avoidance_boundary_inset_x", 0.0))
             car_avoidance_boundary_path_active = bool(global_control_data.get("car_avoidance_boundary_path_active", False))
             car_avoidance_pd_pwm = float(global_control_data.get("car_avoidance_pd_pwm", 0.0))
+            car_avoidance_servo_bias_pwm = float(global_control_data.get("car_avoidance_servo_bias_pwm", 0.0))
             sign_llm_stop_active = bool(global_control_data.get("sign_llm_stop_active", False))
             sign_llm_collecting = bool(global_control_data.get("sign_llm_collecting", False))
             sign_llm_frame_id = int(global_control_data.get("sign_llm_frame_id", -1))
@@ -2201,6 +2215,7 @@ def serial_control_thread():
             raw_pwm = (
                 config.SERVO_CENTER
                 - steer_signal * pwm_gain
+                + car_avoidance_servo_bias_pwm
             )
             target_servo_pwm = int(max(config.SERVO_MIN, min(config.SERVO_MAX, raw_pwm)))
             servo_pwm = target_servo_pwm
@@ -2238,6 +2253,7 @@ def serial_control_thread():
             car_avoidance_rows_to_bottom = None
             car_avoidance_miss_frames = 0
             car_avoidance_clear_frames = 0
+            car_avoidance_state_paused = False
             car_avoidance_left_boundary_error = None
             car_avoidance_left_boundary_x = None
             car_avoidance_left_boundary_p_pwm = 0.0
@@ -2286,20 +2302,23 @@ def serial_control_thread():
         car_rows_text = "无" if car_avoidance_rows_to_bottom is None else f"{float(car_avoidance_rows_to_bottom):.1f}"
         car_miss_text = f"{int(car_avoidance_miss_frames)}"
         car_clear_text = f"{int(car_avoidance_clear_frames)}"
+        car_pause_text = "1" if car_avoidance_state_paused else "0"
         car_left_x_text = "无" if car_avoidance_left_boundary_x is None else f"{float(car_avoidance_left_boundary_x):.1f}"
         car_left_error_text = "无" if car_avoidance_left_boundary_error is None else f"{float(car_avoidance_left_boundary_error):.1f}"
         car_left_p_text = f"{float(car_avoidance_left_boundary_p_pwm):.1f}"
         car_left_d_text = f"{float(car_avoidance_left_boundary_d_pwm):.1f}"
         car_boundary_inset_text = f"{float(car_avoidance_boundary_inset_x):.1f}"
         car_pd_text = f"{float(car_avoidance_pd_pwm):.1f}"
+        car_servo_bias_text = f"{float(car_avoidance_servo_bias_pwm):.1f}"
 
         if car_avoidance_active and (car_avoidance_state != "FOLLOW_LANE" or abs(float(car_avoidance_boundary_inset_x)) > 0.0):
             throttled_log(
                 "car_avoid_detail",
                 f">>> 避车(B): state={car_avoidance_state} rows={car_rows_text} "
-                f"miss={car_miss_text} clear={car_clear_text} inset={car_boundary_inset_text} "
-                f"left_x={car_left_x_text} left_e={car_left_error_text}",
-                state=(car_avoidance_state, car_rows_text, car_miss_text, car_clear_text, car_boundary_inset_text, car_left_x_text, car_left_error_text),
+                f"miss={car_miss_text} clear={car_clear_text} pause={car_pause_text} inset={car_boundary_inset_text} "
+                f"left_x={car_left_x_text} left_e={car_left_error_text} "
+                f"bias={car_servo_bias_text} p={car_left_p_text}",
+                state=(car_avoidance_state, car_rows_text, car_miss_text, car_clear_text, car_pause_text, car_boundary_inset_text, car_left_x_text, car_left_error_text, car_servo_bias_text, car_left_p_text),
                 min_interval=float(getattr(config, "LOG_INTERVAL_CAR_AVOIDANCE_DETAIL", 1.0)),
             )
 

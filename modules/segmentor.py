@@ -21,13 +21,8 @@ import numpy as np
 import time
 from rknnlite.api import RKNNLite
 import config
-from modules.debug_tools import (
-    SegDebugOverlay,
-    SegProfileLogger,
-    draw_seg_status_text,
-    get_debug_drive_keyboard_state,
-)
-from modules.path_controller import CarAvoidancePdController, PathController
+from modules.debug_tools import SegDebugOverlay, SegProfileLogger, draw_seg_status_text
+from modules.path_controller import PathController
 try:
     from utils.rknn_quiet import suppress_rknn_init_output
 except ImportError:
@@ -82,7 +77,7 @@ class RoadSegmentor:
             "car_active": False,
             "car_state": "FOLLOW_LANE",
             "car_rows_to_bottom": None,
-            "car_pd_pwm": 0.0,
+            "car_servo_bias_pwm": 0.0,
         }
         self.merge_state_active = False
         self.merge_state_hit_frames = 0
@@ -93,80 +88,28 @@ class RoadSegmentor:
         self.merge_state_info = None
         self.merge_state_side = None
         self.merge_edge_trace_debug_counter = 0
-        self.y_fork_state_info = None
-        self.y_fork_state_last_hit_time = None
         self.locked_car = None
         self.locked_car_miss_frames = 0
-        self.car_avoidance_controller = CarAvoidancePdController()
+        self.car_avoidance_state = "FOLLOW_LANE"
+        self.car_clearing_frames = 0
+        self.car_last_avoid_path = None
+        self.car_last_avoid_path_is_boundary = False
+        self.car_last_boundary_inset_x = 0.0
+        self.car_last_blocked_y_range = None
+        self.car_last_servo_bias_pwm = 0.0
+        self.car_last_left_boundary_sample_y = None
+        self.car_last_left_boundary_p_pwm = 0.0
+        self.car_left_boundary_p_release_frames = 0
+        self.car_left_boundary_pd_error = None
+        self.car_last_left_boundary_pd_bias_pwm = 0.0
+        self.car_left_boundary_pd_post_pass_frames = 0
+        self.car_left_boundary_range_error_ema = None
         self.debug_overlay = SegDebugOverlay(tuple(config.SEG_SIZE))
         self.seg_profile_logger = SegProfileLogger()
         self.last_control_c_debug_log_at = 0.0
-        self.last_stanley_debug_log_at = 0.0
 
-    def _debug_drive_log_allowed(self, debug_drive_active=True):
-        """调参日志只在网页/键盘调试发车后打印."""
-        if not bool(debug_drive_active):
-            return False
-        if bool(getattr(config, "DEBUG_DRIVE_CONTROL_ENABLED", True)):
-            try:
-                state = get_debug_drive_keyboard_state()
-                if bool(state.get("manual_stop_active", False)):
-                    return False
-            except Exception:
-                pass
-        return True
-
-    def _log_stanley_debug(self, steer_signal, servo_pwm, car_active=False, debug_drive_active=True):
-        """低频打印 Stanley 控制内部量，便于定位偏航/横向/PWM 映射问题."""
-        if not self._debug_drive_log_allowed(debug_drive_active):
-            return
-        if not bool(getattr(config, "STANLEY_DEBUG_LOG_ENABLED", False)):
-            return
-        if str(getattr(config, "STEER_CONTROL_MODE", "weighted_slope")).lower() != "stanley_band":
-            return
-
-        debug = getattr(self.path_controller, "last_stanley_debug", None)
-        if not debug:
-            return
-
-        now = time.monotonic()
-        interval = max(0.05, float(getattr(config, "STANLEY_DEBUG_LOG_INTERVAL", 0.5)))
-        if now - float(self.last_stanley_debug_log_at) < interval:
-            return
-        self.last_stanley_debug_log_at = now
-
-        heading_deg = float(np.degrees(debug.get("heading_error", 0.0)))
-        filtered_heading_deg = float(np.degrees(debug.get("filtered_heading_error", 0.0)))
-        ff_heading_deg = float(np.degrees(debug.get("ff_heading_error", 0.0)))
-        center_bias_x = float(getattr(config, "CONTROL_CENTER_BIAS_X", 0.0))
-        print(
-            "B调参: "
-            f"pwm={int(servo_pwm)} ctrl={float(steer_signal):.1f} "
-            f"e={float(debug.get('lateral_error', 0.0)):.1f}px "
-            f"e_f={float(debug.get('filtered_error', 0.0)):.1f}px "
-            f"de={float(debug.get('error_delta', 0.0)):.1f}px "
-            f"psi={heading_deg:.1f}deg "
-            f"psi_f={filtered_heading_deg:.1f}deg "
-            f"psi_ff={ff_heading_deg:.1f}deg "
-            f"Kp={float(debug.get('lateral_gain', 0.0)):.3f} "
-            f"Kd={float(debug.get('d_gain', 0.0)):.3f} "
-            f"Kyaw={float(debug.get('heading_gain', 0.0)):.2f} "
-            f"Kff={float(debug.get('curvature_gain', 0.0)):.2f} "
-            f"terms=({float(debug.get('lateral_term', 0.0)):.3f},"
-            f"{float(debug.get('d_term', 0.0)):.3f},"
-            f"{float(debug.get('heading_term', 0.0)):.3f},"
-            f"{float(debug.get('curvature_term', 0.0)):.3f}) "
-            f"scale={float(debug.get('signal_scale', 0.0)):.0f} "
-            f"gain={float(getattr(config, 'STANLEY_PWM_GAIN', 0.0)):.4f} "
-            f"bias={center_bias_x:.1f}px "
-            f"car={int(bool(car_active))}",
-            flush=True,
-        )
-
-    def _log_control_c_debug(self, steer_signal, servo_pwm, car_active=False, debug_drive_active=True):
+    def _log_control_c_debug(self, steer_signal, servo_pwm, car_active=False):
         """低频打印 C 控制内部量，便于试车后反推小弯/大弯参数."""
-        if not self._debug_drive_log_allowed(debug_drive_active):
-            return
         if not bool(getattr(config, "CONTROL_C_DEBUG_LOG_ENABLED", False)):
             return
         if str(getattr(config, "STEER_CONTROL_MODE", "weighted_slope")).lower() != "control_c":
@@ -320,17 +263,6 @@ class RoadSegmentor:
             return np.full_like(target_ys, float(unique_xs[0]), dtype=np.float32)
 
         return np.interp(target_ys, unique_ys, unique_xs).astype(np.float32)
-
-    def _path_points_on_ys(self, path_points, target_ys, w_seg):
-        """把稀疏路径插值到指定 y 行，供控制项复用同一批采样行."""
-        xs = self._interp_path_xs(path_points, target_ys)
-        if xs is None:
-            return None
-        ys = np.array(target_ys, dtype=np.float32).reshape((-1,))
-        if len(xs) != len(ys):
-            return None
-        xs = np.clip(xs, 0.0, float(w_seg - 1))
-        return np.vstack((xs, ys)).astype(np.float32).T
 
     def _temporal_path_stats(self, path_points, reference_points=None):
         """计算当前候选路径相对上一帧输出路径的横向跳变量."""
@@ -724,38 +656,6 @@ class RoadSegmentor:
             "fork_point": fork_point,
             "split_rows": max(1, int(len(opening_run))),
         }
-
-    def _reset_y_fork_state(self):
-        """清空 Y 岔短时保持状态."""
-        self.y_fork_state_info = None
-        self.y_fork_state_last_hit_time = None
-
-    def _update_y_fork_state(self, y_fork_info):
-        """Y 岔短时保持：漏检少量帧时继续沿用最近一次分叉点."""
-        now_s = time.perf_counter()
-        hold_s = max(0.0, float(getattr(config, "FORK_STATE_HOLD_SECONDS", 0.5)))
-        empty_info = {"active": False, "fork_point": None, "split_rows": 0, "held": False}
-
-        if y_fork_info is not None and y_fork_info.get("active") and y_fork_info.get("fork_point") is not None:
-            cached_info = dict(y_fork_info)
-            cached_info["held"] = False
-            self.y_fork_state_info = cached_info
-            self.y_fork_state_last_hit_time = now_s
-            return cached_info
-
-        if (
-            hold_s > 0.0 and
-            self.y_fork_state_info is not None and
-            self.y_fork_state_last_hit_time is not None and
-            now_s - float(self.y_fork_state_last_hit_time) <= hold_s
-        ):
-            held_info = dict(self.y_fork_state_info)
-            held_info["active"] = True
-            held_info["held"] = True
-            return held_info
-
-        self._reset_y_fork_state()
-        return empty_info
 
     def _fork_trunk_support_ok(self, search_mask, fork_point):
         """分叉点以下的公共主干应有 mask 支撑，避免分界线长距离悬空."""
@@ -1259,26 +1159,8 @@ class RoadSegmentor:
             }
         return None
 
-    def _merge_patch_side_no_edge_exit_ready(self, search_mask, merge_side):
-        """补线侧原始边界不再贴边时，汇合补线可以立即退出."""
-        if search_mask is None or search_mask.size == 0:
-            return False
-        if merge_side not in ("left", "right"):
-            return False
-
-        h, _ = search_mask.shape[:2]
-        no_edge_top = int(np.clip(int(getattr(config, "MERGE_STATE_EXIT_NO_EDGE_Y_TOP", 40)), 0, h - 1))
-        no_edge_bottom = int(np.clip(int(getattr(config, "MERGE_STATE_EXIT_NO_EDGE_Y_BOTTOM", 150)), 0, h - 1))
-        if no_edge_bottom < no_edge_top:
-            no_edge_top, no_edge_bottom = no_edge_bottom, no_edge_top
-        edge_col = 0 if merge_side == "left" else search_mask.shape[1] - 1
-        for y in range(no_edge_top, no_edge_bottom + 1):
-            if search_mask[y, edge_col] > 0:
-                return False
-        return True
-
-    def _merge_bottom_width_exit_ready(self, search_mask, merge_side=None):
-        """底部宽度恢复时，按补线方向检查原始边界是否仍贴边."""
+    def _merge_bottom_width_exit_ready(self, search_mask):
+        """底部连续若干行总白区宽度小于阈值时，认为汇合补线可以退出."""
         if search_mask is None or search_mask.size == 0:
             return False
 
@@ -1293,10 +1175,6 @@ class RoadSegmentor:
             row_width = float(xs[-1] - xs[0])
             if row_width >= width_thresh:
                 return False
-
-        if merge_side in ("left", "right"):
-            return self._merge_patch_side_no_edge_exit_ready(search_mask, merge_side)
-
         no_edge_top = int(np.clip(int(getattr(config, "MERGE_STATE_EXIT_NO_EDGE_Y_TOP", 40)), 0, h - 1))
         no_edge_bottom = int(np.clip(int(getattr(config, "MERGE_STATE_EXIT_NO_EDGE_Y_BOTTOM", 150)), 0, h - 1))
         if no_edge_bottom < no_edge_top:
@@ -1306,16 +1184,6 @@ class RoadSegmentor:
             if row[0] > 0 or row[-1] > 0:
                 return False
         return True
-
-    def _reset_merge_state(self):
-        self.merge_state_active = False
-        self.merge_state_hit_frames = 0
-        self.merge_state_hit_times = []
-        self.merge_state_miss_frames = 0
-        self.merge_state_exit_frames = 0
-        self.merge_state_enter_time = None
-        self.merge_state_info = None
-        self.merge_state_side = None
 
     def _update_merge_state(self, merge_detect_info, search_mask):
         """汇合补线状态机：时间窗口内累计命中确认，底部宽度连续恢复后退出."""
@@ -1382,20 +1250,20 @@ class RoadSegmentor:
             else max(0.0, float(now_s - self.merge_state_enter_time))
         )
         hold_ready = hold_elapsed_s is None or hold_elapsed_s >= min_hold_s
-        if (
-            self.merge_state_side in ("left", "right") and
-            self._merge_patch_side_no_edge_exit_ready(search_mask, self.merge_state_side)
-        ):
-            self._reset_merge_state()
-            return None
-
-        if hold_ready and self._merge_bottom_width_exit_ready(search_mask, self.merge_state_side):
+        if hold_ready and self._merge_bottom_width_exit_ready(search_mask):
             self.merge_state_exit_frames += 1
         else:
             self.merge_state_exit_frames = 0
 
         if self.merge_state_exit_frames >= exit_confirm_frames:
-            self._reset_merge_state()
+            self.merge_state_active = False
+            self.merge_state_hit_frames = 0
+            self.merge_state_hit_times = []
+            self.merge_state_miss_frames = 0
+            self.merge_state_exit_frames = 0
+            self.merge_state_enter_time = None
+            self.merge_state_info = None
+            self.merge_state_side = None
             return None
 
         if self.merge_state_info is not None:
@@ -1580,7 +1448,6 @@ class RoadSegmentor:
         if merge_side not in ("left", "right") or not nodes:
             return nodes
 
-        width_ratio = max(0.0, float(getattr(config, "MERGE_BOUNDARY_WIDTH_RATIO", 1.0)))
         guide_points = None
         guide_y_min = None
         guide_y_max = None
@@ -1613,16 +1480,15 @@ class RoadSegmentor:
             if fixed_width <= 0.0 or not guide_in_range:
                 corrected_nodes.append(dict(node))
                 continue
-            patch_width = max(float(fixed_width) * width_ratio, float(getattr(config, "MERGE_GUIDE_LINE_MIN_GAP", 0.0)))
 
             # guide_polyline 就是缺失侧补线。中心线模式下逐行最左/最右点
             # 可能把远处另一条路也包含进来，所以汇合命中后不再用节点外边界。
             if merge_side == "left":
                 left_x = guide_x
-                right_x = guide_x + patch_width
+                right_x = guide_x + fixed_width
             else:
                 right_x = guide_x
-                left_x = guide_x - patch_width
+                left_x = guide_x - fixed_width
 
             left_x = float(np.clip(left_x, 0.0, float(config.SEG_SIZE[0] - 1)))
             right_x = float(np.clip(right_x, 0.0, float(config.SEG_SIZE[0] - 1)))
@@ -1643,13 +1509,12 @@ class RoadSegmentor:
         return corrected_nodes
 
     def _apply_fork_boundary_width(self, nodes, fork_side):
-        """Y 岔选定单侧后，保留可信边界并按固定宽度补另一侧边界."""
+        """Y 岔选定单侧后，用可信外边界按固定赛道宽度补另一侧边界."""
         if fork_side not in ("left", "right") or not nodes:
             return nodes
 
         w_seg = float(config.SEG_SIZE[0] - 1)
         min_gap = max(0.0, float(getattr(config, "MERGE_GUIDE_LINE_MIN_GAP", 0.0)))
-        width_ratio = max(0.0, float(getattr(config, "FORK_BOUNDARY_WIDTH_RATIO", 1.0)))
         corrected_nodes = []
 
         for node in nodes:
@@ -1662,12 +1527,14 @@ class RoadSegmentor:
                 corrected_nodes.append(dict(node))
                 continue
 
-            patch_width = max(float(fixed_width) * width_ratio, min_gap)
-
             if fork_side == "left":
-                right_x = left_x + patch_width
+                trusted_x = left_x
+                left_x = trusted_x
+                right_x = max(trusted_x + fixed_width, trusted_x + min_gap)
             else:
-                left_x = right_x - patch_width
+                trusted_x = right_x
+                right_x = trusted_x
+                left_x = min(trusted_x - fixed_width, trusted_x - min_gap)
 
             left_x = float(np.clip(left_x, 0.0, w_seg))
             right_x = float(np.clip(right_x, 0.0, w_seg))
@@ -1925,7 +1792,6 @@ class RoadSegmentor:
 
         h, w = search_mask.shape[:2]
         min_gap = max(0.0, float(config.MERGE_GUIDE_LINE_MIN_GAP))
-        width_ratio = max(0.0, float(getattr(config, "MERGE_BOUNDARY_WIDTH_RATIO", 1.0)))
 
         guide_pts = []
         for y_int in range(0, h):
@@ -1946,13 +1812,12 @@ class RoadSegmentor:
             fixed_width = self._fixed_track_width_at_y(y, observed_width)
             if fixed_width <= 0.0:
                 continue
-            patch_width = max(float(fixed_width) * width_ratio, min_gap)
 
             if side_name == "left":
-                x = trusted_right_x - patch_width
+                x = trusted_right_x - fixed_width
                 x = min(x, trusted_right_x - min_gap)
             else:
-                x = trusted_left_x + patch_width
+                x = trusted_left_x + fixed_width
                 x = max(x, trusted_left_x + min_gap)
             if x < 0.0 or x > float(w - 1):
                 continue
@@ -2296,6 +2161,46 @@ class RoadSegmentor:
             return False
         return bool(np.any(mask[y1:y2, x1:x2] > 0))
 
+    def _blend_paths(self, base_path, target_path, blend):
+        """按 blend 把 target_path 混回 base_path."""
+        base = np.array(base_path, dtype=np.float32).reshape((-1, 2))
+        target = np.array(target_path, dtype=np.float32).reshape((-1, 2))
+        if len(base) == 0:
+            return target
+        if len(base) != len(target):
+            return target
+        blend = float(np.clip(blend, 0.0, 1.0))
+        return (base * (1.0 - blend) + target * blend).astype(np.float32)
+
+    def _build_car_clearing_path(self, base_path, avoid_path, clear_frames, fixed_bias_ready=False):
+        """CLEARING: 给旧路径基准和新 PWM 偏移复用同一套缓慢回正权重。"""
+        base = np.array(base_path, dtype=np.float32).reshape((-1, 2))
+        if len(base) < 2:
+            return base, 0.0
+        avoid = np.array(avoid_path, dtype=np.float32).reshape((-1, 2))
+        if len(avoid) != len(base):
+            avoid = base.copy()
+
+        miss_frames = max(0, int(getattr(config, "CAR_AVOIDANCE_CLEARING_MISS_FRAMES", 2)))
+        decay_frames = max(1, int(getattr(config, "CAR_AVOIDANCE_CLEARING_DECAY_FRAMES", 8)))
+        residual_keep = float(getattr(config, "CAR_AVOIDANCE_CLEARING_RESIDUAL_KEEP", 0.35))
+        residual_done = float(getattr(config, "CAR_AVOIDANCE_CLEARING_DONE_RESIDUAL", 0.06))
+
+        # 贴右、贴底且高度较小时，直接保持近距离边界基准。
+        if fixed_bias_ready:
+            bias_ratio = 1.0
+        else:
+            if clear_frames <= miss_frames:
+                bias_ratio = residual_keep
+            else:
+                t = float(np.clip((clear_frames - miss_frames) / float(decay_frames), 0.0, 1.0))
+                bias_ratio = residual_keep + (residual_done - residual_keep) * t
+            bias_ratio = float(np.clip(bias_ratio, 0.0, 1.0))
+
+        mixed = self._blend_paths(base, avoid, bias_ratio)
+        mixed[:, 0] = np.clip(mixed[:, 0], 0.0, float(config.SEG_SIZE[0] - 1))
+        return mixed, bias_ratio
+
     def _build_boundary_inset_path(self, base_path, boundary, inset_x, w_seg):
         """把控制基准切到指定边界向中线内收后的路径."""
         base = np.array(base_path, dtype=np.float32).reshape((-1, 2))
@@ -2316,6 +2221,54 @@ class RoadSegmentor:
         planned[:, 0] = boundary_xs + direction * step
         planned[:, 0] = np.clip(planned[:, 0], 0.0, float(w_seg - 1))
         return planned.astype(np.float32), True
+
+    def _build_car_clearing_inset_path(self, base_path, left_boundary, start_inset_x, clear_frames, w_seg):
+        """CLEARING: 按每行半宽把左边界内收量从 start_inset 逐帧增到中线."""
+        base = np.array(base_path, dtype=np.float32).reshape((-1, 2))
+        if len(base) < 2 or left_boundary is None:
+            return base, 0.0, 0.0, False
+
+        boundary_xs = self._interp_path_xs(left_boundary, base[:, 1])
+        if boundary_xs is None or len(boundary_xs) != len(base):
+            return base, 0.0, 0.0, False
+
+        decay_frames = max(1, int(getattr(config, "CAR_AVOIDANCE_CLEARING_DECAY_FRAMES", 5)))
+        # clear_frames=1 时仍走内收 10 的路径；之后每帧增加 (半宽 - 10) / decay_frames。
+        progress_frames = max(0.0, float(clear_frames) - 1.0)
+        progress = float(np.clip(progress_frames / float(decay_frames), 0.0, 1.0))
+        half_width = np.abs(base[:, 0] - boundary_xs)
+        start_inset = np.minimum(half_width, max(0.0, float(start_inset_x)))
+        # 等价于每帧增加 (half_width - start_inset) / decay_frames。
+        inset = start_inset + (half_width - start_inset) * progress
+        direction = np.sign(base[:, 0] - boundary_xs)
+        direction[direction == 0.0] = 1.0
+
+        planned = base.copy()
+        planned[:, 0] = boundary_xs + direction * inset
+        planned[:, 0] = np.clip(planned[:, 0], 0.0, float(w_seg - 1))
+        avoid_weight = 1.0 - progress
+        return planned.astype(np.float32), float(avoid_weight), float(np.mean(inset)), True
+
+    def _build_car_left_boundary_path(self, base_path, left_boundary, inset_x, w_seg):
+        """把车避障控制基准切到左边界向中线内收后的路径."""
+        return self._build_boundary_inset_path(base_path, left_boundary, inset_x, w_seg)
+
+    def _car_fixed_boundary_ready(self, locked_car, w_seg, h_seg):
+        """车框贴右下且高度较小时，直接进入近距离边界基准。"""
+        if locked_car is None:
+            return False
+        measurement = locked_car.get("measurement") or {}
+        x_max = float(measurement.get("x_max", 0.0))
+        y_min = float(measurement.get("y_min", 0.0))
+        y_max = float(measurement.get("y_max", 0.0))
+        box_h = max(0.0, y_max - y_min)
+        height_thresh = float(getattr(config, "CAR_AVOIDANCE_FIXED_BOUNDARY_HEIGHT_THRESH", 90.0))
+        right_margin = float(getattr(config, "CAR_AVOIDANCE_FIXED_BOUNDARY_RIGHT_MARGIN", 20.0))
+        bottom_margin = float(getattr(config, "CAR_AVOIDANCE_FIXED_BOUNDARY_BOTTOM_MARGIN", 20.0))
+        touch_right = x_max >= float(w_seg - 1) - max(0.0, right_margin)
+        touch_bottom = y_max >= float(h_seg - 1) - max(0.0, bottom_margin)
+        small_height = box_h <= max(0.0, height_thresh)
+        return bool(touch_right and touch_bottom and small_height)
 
     def _boundary_x_at_y(self, boundary_points, y):
         """按 y 在左右边界点上插值得到边界 x."""
@@ -2476,13 +2429,13 @@ class RoadSegmentor:
             return None
         return self.locked_car
 
-    def _car_avoidance_distance_window(self, locked_car, base):
-        """判断锁定车辆是否进入避障拉线接管距离窗口."""
+    def _car_avoidance_boundary_inset(self, locked_car, base):
+        """基于锁定目标决定左边界内收量."""
         if locked_car is None:
-            return None, False
+            return 0.0, None, False
         measurement = locked_car.get("measurement")
         if measurement is None:
-            return None, False
+            return 0.0, None, False
 
         path_y_min = float(np.min(base[:, 1]))
         path_y_max = float(np.max(base[:, 1]))
@@ -2491,57 +2444,368 @@ class RoadSegmentor:
         path_bottom_y = float(np.max(base[:, 1]))
         rows_to_car = max(0.0, path_bottom_y - center_y)
         start_rows = max(0.0, float(getattr(config, "CAR_AVOIDANCE_START_BOUNDARY_ROWS", 115.0)))
+        near_rows = max(0.0, float(getattr(config, "CAR_AVOIDANCE_NEAR_BOUNDARY_ROWS", 60.0)))
+        normal_inset = max(0.0, float(getattr(config, "CAR_AVOIDANCE_LEFT_BOUNDARY_INSET", 20.0)))
+        near_inset = max(0.0, float(getattr(config, "CAR_AVOIDANCE_NEAR_LEFT_BOUNDARY_INSET", normal_inset)))
 
         if rows_to_car > start_rows:
-            return (center_y, path_bottom_y), False
+            return 0.0, (center_y, path_bottom_y), False
 
-        return (center_y, path_bottom_y), True
+        # 进入避障窗口后走左边界内收路径：远距离用 25，近距离用 10。
+        inset = near_inset if rows_to_car <= near_rows else normal_inset
+        return float(inset), (center_y, path_bottom_y), True
 
-    def _car_pd_sample_geometry(self, left_boundary, base_path, w_seg):
-        """在固定前视行窗口内平均左边界和正常中线，供车辆 PD 使用."""
-        if left_boundary is None or base_path is None:
-            return None, None, None
-        base = np.array(base_path, dtype=np.float32).reshape((-1, 2))
+    def _car_servo_bias_from_rows(self, rows_to_car):
+        """按 car 离画面底部的距离线性生成最终舵机 PWM 偏移."""
+        if rows_to_car is None:
+            return 0.0
+
+        far_rows = max(0.0, float(getattr(config, "CAR_AVOIDANCE_SERVO_BIAS_START_ROWS", getattr(config, "CAR_AVOIDANCE_START_BOUNDARY_ROWS", 90.0))))
+        near_rows = max(0.0, float(getattr(config, "CAR_AVOIDANCE_SERVO_BIAS_NEAR_ROWS", getattr(config, "CAR_AVOIDANCE_NEAR_BOUNDARY_ROWS", 60.0))))
+        if float(rows_to_car) > far_rows:
+            return 0.0
+
+        min_pwm = max(0.0, float(getattr(config, "CAR_AVOIDANCE_SERVO_BIAS_MIN_PWM", 20.0)))
+        max_pwm = max(min_pwm, float(getattr(config, "CAR_AVOIDANCE_SERVO_BIAS_MAX_PWM", 60.0)))
+        if far_rows <= near_rows:
+            ratio = 1.0
+        else:
+            ratio = (far_rows - float(rows_to_car)) / (far_rows - near_rows)
+        ratio = float(np.clip(ratio, 0.0, 1.0))
+        sign = 1.0 if float(getattr(config, "CAR_AVOIDANCE_SERVO_BIAS_SIGN", 1.0)) >= 0.0 else -1.0
+        return sign * (min_pwm + (max_pwm - min_pwm) * ratio)
+
+    def _car_left_boundary_p_correction(self, left_boundary, sample_y, w_seg):
+        """左边界横向 P 修正：左边界被顶到画面中线右侧时，抵消一部分避车偏移。"""
+        if left_boundary is None:
+            return 0.0, None, None
+
+        left_x = self._boundary_x_at_y(left_boundary, sample_y)
+        if left_x is None:
+            return 0.0, None, None
+
+        target_x = float(w_seg) * float(getattr(config, "CAR_AVOIDANCE_LEFT_BOUNDARY_TARGET_RATIO", 0.50))
+        deadband = max(0.0, float(getattr(config, "CAR_AVOIDANCE_LEFT_BOUNDARY_P_DEADBAND", 4.0)))
+        error = float(left_x) - target_x
+        active_error = max(0.0, error - deadband)
+        gain = max(0.0, float(getattr(config, "CAR_AVOIDANCE_LEFT_BOUNDARY_P_GAIN", 0.45)))
+        max_pwm = max(0.0, float(getattr(config, "CAR_AVOIDANCE_LEFT_BOUNDARY_P_MAX_PWM", 35.0)))
+        correction = float(np.clip(active_error * gain, 0.0, max_pwm))
+        return correction, error, float(left_x)
+
+    def _apply_car_left_boundary_p_to_bias(self, servo_bias_pwm, left_p_pwm):
+        """用左边界 P 抵消避车偏移，必要时允许小幅反向拉回。"""
+        servo_bias_pwm = float(servo_bias_pwm)
+        left_p_pwm = max(0.0, float(left_p_pwm))
+        if abs(servo_bias_pwm) <= 1e-6 or left_p_pwm <= 0.0:
+            return servo_bias_pwm
+
+        avoid_sign = 1.0 if float(getattr(config, "CAR_AVOIDANCE_SERVO_BIAS_SIGN", 1.0)) >= 0.0 else -1.0
+        corrected = servo_bias_pwm - avoid_sign * left_p_pwm
+        reverse_max = max(0.0, float(getattr(config, "CAR_AVOIDANCE_LEFT_BOUNDARY_P_REVERSE_MAX_PWM", 12.0)))
+        if avoid_sign > 0.0:
+            return max(-reverse_max, float(corrected))
+        return min(reverse_max, float(corrected))
+
+    def _apply_car_left_boundary_range_to_bias(self, servo_bias_pwm, left_boundary_error):
+        """按左边界误差区间连续调节避车偏置."""
+        servo_bias_pwm = float(servo_bias_pwm)
+        if left_boundary_error is None:
+            return servo_bias_pwm, 0.0
+
+        raw_error = float(left_boundary_error)
+        ema_alpha = float(getattr(config, "CAR_AVOIDANCE_LEFT_BOUNDARY_ERROR_EMA_ALPHA", 0.55))
+        ema_alpha = float(np.clip(ema_alpha, 0.0, 1.0))
+        if self.car_left_boundary_range_error_ema is None:
+            self.car_left_boundary_range_error_ema = raw_error
+        else:
+            self.car_left_boundary_range_error_ema = (
+                ema_alpha * float(self.car_left_boundary_range_error_ema)
+                + (1.0 - ema_alpha) * raw_error
+            )
+        error = float(self.car_left_boundary_range_error_ema)
+        low_error = float(getattr(config, "CAR_AVOIDANCE_LEFT_BOUNDARY_RANGE_LOW_ERROR", -20.0))
+        high_error = float(getattr(config, "CAR_AVOIDANCE_LEFT_BOUNDARY_RANGE_HIGH_ERROR", 25.0))
+        full_low_error = float(getattr(config, "CAR_AVOIDANCE_LEFT_BOUNDARY_RANGE_FULL_LOW_ERROR", -60.0))
+        if full_low_error >= low_error:
+            full_low_error = low_error - 1.0
+        if high_error <= low_error:
+            high_error = low_error + 1.0
+
+        avoid_sign = 1.0 if float(getattr(config, "CAR_AVOIDANCE_SERVO_BIAS_SIGN", 1.0)) >= 0.0 else -1.0
+        correction = 0.0
+        if error > high_error:
+            gain = max(0.0, float(getattr(config, "CAR_AVOIDANCE_LEFT_BOUNDARY_P_GAIN", 1.0)))
+            max_pwm = max(0.0, float(getattr(config, "CAR_AVOIDANCE_LEFT_BOUNDARY_P_MAX_PWM", 90.0)))
+            reverse_max = max(0.0, float(getattr(config, "CAR_AVOIDANCE_LEFT_BOUNDARY_P_REVERSE_MAX_PWM", 35.0)))
+            correction = float(np.clip((error - high_error) * gain, 0.0, max_pwm))
+            servo_bias_pwm = servo_bias_pwm - avoid_sign * correction
+            if avoid_sign > 0.0:
+                servo_bias_pwm = max(-reverse_max, servo_bias_pwm)
+            else:
+                servo_bias_pwm = min(reverse_max, servo_bias_pwm)
+            return float(servo_bias_pwm), correction
+
+        if error < low_error:
+            if error <= full_low_error:
+                keep_ratio = 0.0
+            else:
+                keep_ratio = (error - full_low_error) / (low_error - full_low_error)
+            keep_ratio = float(np.clip(keep_ratio, 0.0, 1.0))
+            positive_pwm = max(0.0, servo_bias_pwm * avoid_sign)
+            released_positive_pwm = positive_pwm * keep_ratio
+            recover_gain = max(
+                0.0,
+                float(getattr(config, "CAR_AVOIDANCE_LEFT_BOUNDARY_FORWARD_RECOVER_GAIN", 0.6)),
+            )
+            recover_max = max(
+                0.0,
+                float(getattr(config, "CAR_AVOIDANCE_LEFT_BOUNDARY_FORWARD_RECOVER_MAX_PWM", 25.0)),
+            )
+            recover_pwm = float(np.clip((low_error - error) * recover_gain, 0.0, recover_max))
+            corrected = avoid_sign * max(released_positive_pwm, recover_pwm)
+            correction = abs(servo_bias_pwm - corrected)
+            return float(corrected), float(correction)
+
+        if servo_bias_pwm * avoid_sign < 0.0:
+            reverse_decay = float(getattr(config, "CAR_AVOIDANCE_LEFT_BOUNDARY_REVERSE_RELEASE_DECAY", 0.25))
+            reverse_decay = float(np.clip(reverse_decay, 0.0, 1.0))
+            corrected = servo_bias_pwm * reverse_decay
+            if abs(corrected) < float(getattr(config, "CAR_AVOIDANCE_LEFT_BOUNDARY_REVERSE_RELEASE_DEADBAND", 3.0)):
+                corrected = 0.0
+            correction = abs(servo_bias_pwm - corrected)
+            return float(corrected), float(correction)
+
+        neutral_decay = float(getattr(config, "CAR_AVOIDANCE_LEFT_BOUNDARY_NEUTRAL_RELEASE_DECAY", 0.85))
+        neutral_decay = float(np.clip(neutral_decay, 0.0, 1.0))
+        corrected = servo_bias_pwm * neutral_decay
+        if abs(corrected) < float(getattr(config, "CAR_AVOIDANCE_LEFT_BOUNDARY_REVERSE_RELEASE_DEADBAND", 3.0)):
+            corrected = 0.0
+        correction = abs(servo_bias_pwm - corrected)
+        return float(corrected), float(correction)
+
+    def _limit_car_servo_bias_step(self, target_bias_pwm, clearing=False):
+        """限制避车 PWM 偏置每帧变化，避免回正阶段舵机突然反打。"""
+        target_bias_pwm = float(target_bias_pwm)
+        last_bias = float(self.car_last_servo_bias_pwm)
+        if bool(clearing):
+            avoid_sign = 1.0 if float(getattr(config, "CAR_AVOIDANCE_SERVO_BIAS_SIGN", 1.0)) >= 0.0 else -1.0
+            reverse_max = max(
+                0.0,
+                float(getattr(config, "CAR_AVOIDANCE_CLEARING_REVERSE_MAX_PWM", 35.0)),
+            )
+            if target_bias_pwm * avoid_sign < 0.0:
+                target_bias_pwm = -avoid_sign * min(abs(target_bias_pwm), reverse_max)
+            start_step = max(
+                0.0,
+                float(getattr(
+                    config,
+                    "CAR_AVOIDANCE_SERVO_BIAS_CLEARING_STEP_START_PWM",
+                    getattr(config, "CAR_AVOIDANCE_SERVO_BIAS_CLEARING_STEP_MAX_PWM", 14.0),
+                )),
+            )
+            end_step = max(
+                start_step,
+                float(getattr(
+                    config,
+                    "CAR_AVOIDANCE_SERVO_BIAS_CLEARING_STEP_END_PWM",
+                    getattr(config, "CAR_AVOIDANCE_SERVO_BIAS_CLEARING_STEP_MAX_PWM", start_step),
+                )),
+            )
+            ramp_frames = max(
+                1,
+                int(getattr(config, "CAR_AVOIDANCE_SERVO_BIAS_CLEARING_STEP_RAMP_FRAMES", 1)),
+            )
+            progress = float(np.clip((float(self.car_clearing_frames) - 1.0) / float(ramp_frames), 0.0, 1.0))
+            max_step = start_step + (end_step - start_step) * progress
+        else:
+            max_step = float(getattr(config, "CAR_AVOIDANCE_SERVO_BIAS_STEP_MAX_PWM", 22.0))
+        max_step = max(0.0, max_step)
+        if max_step <= 0.0:
+            return target_bias_pwm
+        return float(last_bias + np.clip(target_bias_pwm - last_bias, -max_step, max_step))
+
+    def _car_left_boundary_p_effective(self, left_boundary, sample_y, w_seg):
+        """给左边界 P 加一点释放保持，避免 correction 突然掉到 0。"""
+        raw_p_pwm, left_boundary_error, left_boundary_x = self._car_left_boundary_p_correction(left_boundary, sample_y, w_seg)
+        keep_frames = max(0, int(getattr(config, "CAR_AVOIDANCE_LEFT_BOUNDARY_P_RELEASE_KEEP_FRAMES", 2)))
+        decay = float(getattr(config, "CAR_AVOIDANCE_LEFT_BOUNDARY_P_RELEASE_DECAY", 0.55))
+        decay = float(np.clip(decay, 0.0, 1.0))
+
+        if raw_p_pwm > float(self.car_last_left_boundary_p_pwm):
+            effective_p = float(raw_p_pwm)
+            self.car_left_boundary_p_release_frames = 0
+        else:
+            self.car_left_boundary_p_release_frames += 1
+            if self.car_left_boundary_p_release_frames <= keep_frames:
+                effective_p = float(self.car_last_left_boundary_p_pwm)
+            else:
+                effective_p = max(float(raw_p_pwm), float(self.car_last_left_boundary_p_pwm) * decay)
+
+        self.car_last_left_boundary_p_pwm = float(effective_p)
+        return float(effective_p), left_boundary_error, left_boundary_x
+
+    def _reset_car_left_boundary_control(self):
+        """清掉 car 横向控制历史。"""
+        self.car_last_left_boundary_sample_y = None
+        self.car_last_left_boundary_p_pwm = 0.0
+        self.car_left_boundary_p_release_frames = 0
+        self.car_left_boundary_pd_error = None
+        self.car_last_left_boundary_pd_bias_pwm = 0.0
+        self.car_left_boundary_pd_post_pass_frames = 0
+        self.car_left_boundary_range_error_ema = None
+
+    def _car_servo_bias_mode(self):
+        if bool(getattr(config, "CAR_AVOIDANCE_PD_ENABLED", False)):
+            return "left_boundary_pd"
+        return str(getattr(config, "CAR_AVOIDANCE_SERVO_BIAS_MODE", "distance_bias")).lower()
+
+    def _car_left_boundary_pd_bias(self, left_boundary, sample_y, w_seg, rows_to_car=None, allow_positive=True):
+        """绕车横向 PD：只按左边界相对目标位置输出最终 PWM 偏移。"""
+        left_x = None
+        if left_boundary is not None:
+            left_x = self._boundary_x_at_y(left_boundary, sample_y)
+        if left_x is None:
+            return None, None, None, 0.0, 0.0
+
+        target_x = float(w_seg) * float(getattr(config, "CAR_AVOIDANCE_LEFT_BOUNDARY_TARGET_RATIO", 0.50))
+        deadband = max(0.0, float(getattr(config, "CAR_AVOIDANCE_LEFT_BOUNDARY_PD_DEADBAND", 4.0)))
+        raw_error = float(left_x) - target_x
+        if raw_error > deadband:
+            error = raw_error - deadband
+        elif raw_error < -deadband:
+            error = raw_error + deadband
+        else:
+            error = 0.0
+
+        prev_error = self.car_left_boundary_pd_error
+        d_error = 0.0 if prev_error is None else float(error) - float(prev_error)
+        p_gain = max(0.0, float(getattr(config, "CAR_AVOIDANCE_LEFT_BOUNDARY_PD_P_GAIN", 0.85)))
+        d_gain = max(0.0, float(getattr(config, "CAR_AVOIDANCE_LEFT_BOUNDARY_PD_D_GAIN", 0.45)))
+        p_term = -p_gain * float(error)
+        d_term = -d_gain * float(d_error)
+        target_bias = p_term + d_term
+
+        max_pwm = max(0.0, float(getattr(config, "CAR_AVOIDANCE_LEFT_BOUNDARY_PD_MAX_PWM", 58.0)))
+        reverse_max = max(0.0, float(getattr(config, "CAR_AVOIDANCE_LEFT_BOUNDARY_PD_REVERSE_MAX_PWM", 16.0)))
+        sign = 1.0 if float(getattr(config, "CAR_AVOIDANCE_SERVO_BIAS_SIGN", 1.0)) >= 0.0 else -1.0
+        target_bias = sign * float(np.clip(target_bias * sign, -reverse_max, max_pwm))
+
+        post_rows = max(0.0, float(getattr(config, "CAR_AVOIDANCE_LEFT_BOUNDARY_PD_POST_PASS_ROWS", 30.0)))
+        enter_error = float(getattr(config, "CAR_AVOIDANCE_LEFT_BOUNDARY_PD_POST_PASS_ENTER_ERROR", 70.0))
+        exit_error = float(getattr(config, "CAR_AVOIDANCE_LEFT_BOUNDARY_PD_POST_PASS_EXIT_ERROR", -20.0))
+        hold_frames = max(0, int(getattr(config, "CAR_AVOIDANCE_LEFT_BOUNDARY_PD_POST_PASS_HOLD_FRAMES", 6)))
+        if (
+            rows_to_car is not None and
+            float(rows_to_car) <= post_rows and
+            prev_error is not None and
+            float(prev_error) >= enter_error and
+            raw_error <= exit_error
+        ):
+            self.car_left_boundary_pd_post_pass_frames = hold_frames
+        if self.car_left_boundary_pd_post_pass_frames > 0:
+            target_bias = min(0.0, float(target_bias)) if sign > 0.0 else max(0.0, float(target_bias))
+            self.car_left_boundary_pd_post_pass_frames -= 1
+        if not allow_positive:
+            target_bias = min(0.0, float(target_bias)) if sign > 0.0 else max(0.0, float(target_bias))
+
+        last_bias = float(self.car_last_left_boundary_pd_bias_pwm)
+        step_up = max(0.0, float(getattr(config, "CAR_AVOIDANCE_LEFT_BOUNDARY_PD_MAX_STEP_UP", 14.0)))
+        step_down = max(0.0, float(getattr(config, "CAR_AVOIDANCE_LEFT_BOUNDARY_PD_MAX_STEP_DOWN", 22.0)))
+        delta = float(target_bias) - last_bias
+        max_delta = step_up if delta * sign > 0.0 else step_down
+        if max_delta > 0.0:
+            delta = float(np.clip(delta, -max_delta, max_delta))
+            target_bias = last_bias + delta
+
+        self.car_left_boundary_pd_error = float(error)
+        self.car_last_left_boundary_pd_bias_pwm = float(target_bias)
+        return float(target_bias), raw_error, float(left_x), float(p_term), float(d_term)
+
+    def _bottom_obstacle_bias_sign(self, planning_items, base):
+        """用最靠底部的 car/person 决定绕行方向，避免两类目标互相打架."""
+        base = np.array(base, dtype=np.float32).reshape((-1, 2))
         if len(base) < 2:
-            return None, None, None
+            return None
 
-        sample_y = float(getattr(config, "CAR_AVOIDANCE_PD_SAMPLE_Y", 110.0))
-        half_window = max(0.0, float(getattr(config, "CAR_AVOIDANCE_PD_SAMPLE_HALF_WINDOW", 10.0)))
+        best = None
+        for item in planning_items:
+            if item.get("class_name", "") not in ("car", "person"):
+                continue
+            seg_box = item.get("seg_box")
+            if seg_box is None:
+                continue
+            box = np.array(seg_box, dtype=np.float32).reshape((-1, 2))
+            if len(box) < 4:
+                continue
+            y_sorted = np.argsort(box[:, 1])
+            bottom_pts = box[y_sorted[-2:]]
+            bottom_y = float(np.max(bottom_pts[:, 1]))
+            bottom_center_x = float(np.mean(bottom_pts[:, 0]))
+            if best is None or bottom_y > best["bottom_y"]:
+                best = {
+                    "class_name": item.get("class_name", ""),
+                    "bottom_y": bottom_y,
+                    "bottom_center_x": bottom_center_x,
+                }
+
+        if best is None:
+            return None
+
         path_y_min = float(np.min(base[:, 1]))
         path_y_max = float(np.max(base[:, 1]))
-        y0 = max(path_y_min, sample_y - half_window)
-        y1 = min(path_y_max, sample_y + half_window)
-        if y1 < y0:
-            return None, None, None
+        center_y = float(np.clip(best["bottom_y"], path_y_min, path_y_max))
+        path_x = self._path_x_at_y_points(base, center_y)
+        if path_x is None:
+            return None
+        # 目标在路径左边则向右偏，目标在路径右边则向左偏。
+        return -1.0 if float(best["bottom_center_x"]) < float(path_x) else 1.0
 
-        sample_rows = np.arange(float(np.floor(y0)), float(np.ceil(y1)) + 1.0, 1.0, dtype=np.float32)
-        if len(sample_rows) == 0:
-            sample_rows = np.array([float(np.clip(sample_y, path_y_min, path_y_max))], dtype=np.float32)
-
-        left_xs = self._interp_path_xs(left_boundary, sample_rows)
-        center_xs = self._interp_path_xs(base, sample_rows)
-        if left_xs is None or center_xs is None or len(left_xs) != len(center_xs):
-            return None, None, None
-
-        valid = np.isfinite(left_xs) & np.isfinite(center_xs)
-        if not np.any(valid):
-            return None, None, None
-
-        left_x = float(np.mean(left_xs[valid]))
-        center_x = float(np.mean(center_xs[valid]))
-        half_width_x = max(0.0, center_x - left_x)
-        return left_x, center_x, half_width_x
-
-    def _update_car_avoidance_pd_control(self, base_path, planning_items, w_seg, h_seg, left_boundary=None):
-        """检测到 car 时锁定同一辆车，并输出车辆专用 PD 控制状态。"""
-        debug = self.car_avoidance_controller.idle_debug(miss_frames=int(self.locked_car_miss_frames))
+    def _update_car_avoidance_boundary_path(
+        self,
+        base_path,
+        planning_items,
+        w_seg,
+        h_seg,
+        left_boundary=None,
+        state_updates_enabled=True,
+    ):
+        """检测到 car 时锁定同一辆车，并输出旧路径基准与新的 PWM 偏移状态."""
+        debug = {
+            "blocked_y_range": None,
+            "boundary_inset_x": 0.0,
+            "boundary_strength_x": 0.0,
+            "boundary_path_active": False,
+            "rows_to_bottom": None,
+            "left_boundary_error": None,
+            "left_boundary_x": None,
+            "left_boundary_p_pwm": 0.0,
+            "left_boundary_d_pwm": 0.0,
+            "pd_pwm": 0.0,
+            "servo_bias_pwm": 0.0,
+            "servo_bias_mode": self._car_servo_bias_mode(),
+            "miss_frames": int(self.locked_car_miss_frames),
+            "state": self.car_avoidance_state,
+            "clear_frames": int(self.car_clearing_frames),
+            "active": False,
+        }
         base = np.array(base_path, dtype=np.float32).reshape((-1, 2))
-        if (
-            len(base) < 2 or
-            not bool(getattr(config, "CAR_AVOIDANCE_ENABLED", True)) or
-            not bool(getattr(config, "CAR_AVOIDANCE_PD_ENABLED", True))
-        ):
-            self.car_avoidance_controller.reset()
+        if len(base) < 2 or not bool(getattr(config, "CAR_AVOIDANCE_ENABLED", True)):
+            return 0.0, debug, None
+
+        if not bool(state_updates_enabled):
+            servo_bias_pwm = float(self.car_last_servo_bias_pwm)
+            debug["state"] = self.car_avoidance_state
+            debug["clear_frames"] = int(self.car_clearing_frames)
+            debug["miss_frames"] = int(self.locked_car_miss_frames)
+            debug["servo_bias_pwm"] = servo_bias_pwm
+            if self._car_servo_bias_mode() == "left_boundary_pd":
+                debug["pd_pwm"] = servo_bias_pwm
+            debug["active"] = bool(
+                self.car_avoidance_state != "FOLLOW_LANE" or
+                abs(servo_bias_pwm) > 1e-6
+            )
+            debug["paused"] = True
             return 0.0, debug, None
 
         measurements = []
@@ -2551,96 +2815,313 @@ class RoadSegmentor:
                 measurements.append(measurement)
 
         locked_car = self._update_locked_car(measurements, base)
-        sample_left_x, _sample_center_x, sample_half_width_x = self._car_pd_sample_geometry(left_boundary, base, w_seg)
         if locked_car is None:
-            debug = self.car_avoidance_controller.update_missing(
-                sample_left_x,
-                sample_half_width_x,
-                w_seg,
-                miss_frames=int(self.locked_car_miss_frames),
-            )
-            if debug.get("active") and left_boundary is not None:
-                car_avoid_path, path_ok = self._build_boundary_inset_path(
-                    base_path,
-                    left_boundary,
-                    float(debug.get("boundary_inset_x", 0.0)),
-                    w_seg,
+            if self.car_avoidance_state == "AVOIDING" and self.car_last_avoid_path is not None:
+                near_inset = max(0.0, float(getattr(config, "CAR_AVOIDANCE_NEAR_LEFT_BOUNDARY_INSET", 10.0)))
+                near_path, near_path_ok = self._build_car_left_boundary_path(base, left_boundary, near_inset, w_seg)
+                if near_path_ok:
+                    self.car_last_avoid_path = near_path.copy()
+                    self.car_last_avoid_path_is_boundary = True
+                    self.car_last_boundary_inset_x = float(near_inset)
+                self.car_avoidance_state = "CLEARING"
+                self.car_clearing_frames = 0
+                self.car_left_boundary_pd_error = None
+                self.car_left_boundary_pd_post_pass_frames = 0
+
+            if self.car_avoidance_state == "CLEARING" and self.car_last_avoid_path is not None:
+                self.car_clearing_frames += 1
+                clearing_inset_x = float(self.car_last_boundary_inset_x)
+                clearing_path_ok = False
+                if not bool(getattr(config, "CAR_AVOIDANCE_SERVO_BIAS_ENABLED", True)):
+                    _clearing_path, avoid_weight, clearing_inset_x, clearing_path_ok = self._build_car_clearing_inset_path(
+                        base,
+                        left_boundary,
+                        self.car_last_boundary_inset_x,
+                        self.car_clearing_frames,
+                        w_seg,
+                    )
+                    if not clearing_path_ok:
+                        _clearing_path, avoid_weight = self._build_car_clearing_path(
+                            base,
+                            self.car_last_avoid_path,
+                            self.car_clearing_frames,
+                            fixed_bias_ready=False,
+                        )
+                        clearing_path_ok = bool(self.car_last_avoid_path_is_boundary)
+                else:
+                    _clearing_path, avoid_weight = self._build_car_clearing_path(
+                        base,
+                        self.car_last_avoid_path,
+                        self.car_clearing_frames,
+                        fixed_bias_ready=False,
+                    )
+                    clearing_path_ok = bool(self.car_last_avoid_path_is_boundary)
+                done_residual = float(getattr(config, "CAR_AVOIDANCE_CLEARING_DONE_RESIDUAL", 0.06))
+                done_frames = max(
+                    1,
+                    int(getattr(config, "CAR_AVOIDANCE_CLEARING_DECAY_FRAMES", 8)),
                 )
-                if path_ok:
-                    return float(debug.get("boundary_inset_x", 0.0)), debug, car_avoid_path
+                max_clear_frames = max(
+                    done_frames,
+                    int(getattr(config, "CAR_AVOIDANCE_CLEARING_MAX_FRAMES", done_frames)),
+                )
+                if (
+                    (self.car_clearing_frames >= done_frames and avoid_weight <= done_residual) or
+                    self.car_clearing_frames >= max_clear_frames
+                ):
+                    self.car_avoidance_state = "FOLLOW_LANE"
+                    self.car_clearing_frames = 0
+                    self.car_last_avoid_path = None
+                    self.car_last_avoid_path_is_boundary = False
+                    self.car_last_boundary_inset_x = 0.0
+                    self.car_last_blocked_y_range = None
+                    self.car_last_servo_bias_pwm = 0.0
+                    self._reset_car_left_boundary_control()
+                    debug["state"] = self.car_avoidance_state
+                    debug["clear_frames"] = 0
+                    return 0.0, debug, None
+                boundary_strength = float(self.car_last_boundary_inset_x) * float(avoid_weight)
+                servo_bias_pwm = float(self.car_last_servo_bias_pwm) * float(avoid_weight)
+                left_p_pwm = 0.0
+                left_d_pwm = 0.0
+                left_boundary_error = None
+                left_boundary_x = None
+                if self.car_last_left_boundary_sample_y is not None:
+                    if self._car_servo_bias_mode() == "left_boundary_pd":
+                        left_boundary_x = self._boundary_x_at_y(
+                            left_boundary,
+                            float(self.car_last_left_boundary_sample_y),
+                        ) if left_boundary is not None else None
+                        if left_boundary_x is not None:
+                            target_x = float(w_seg) * float(getattr(config, "CAR_AVOIDANCE_LEFT_BOUNDARY_TARGET_RATIO", 0.50))
+                            deadband = max(0.0, float(getattr(config, "CAR_AVOIDANCE_LEFT_BOUNDARY_PD_DEADBAND", 4.0)))
+                            left_boundary_error = float(left_boundary_x) - target_x
+                            active_error = 0.0
+                            if left_boundary_error > deadband:
+                                active_error = left_boundary_error - deadband
+                            elif left_boundary_error < -deadband:
+                                active_error = left_boundary_error + deadband
+                            left_p_pwm = -max(
+                                0.0,
+                                float(getattr(config, "CAR_AVOIDANCE_LEFT_BOUNDARY_PD_P_GAIN", 0.85)),
+                            ) * float(active_error)
+                        avoid_sign = 1.0 if float(getattr(config, "CAR_AVOIDANCE_SERVO_BIAS_SIGN", 1.0)) >= 0.0 else -1.0
+                        last_bias_pwm = float(self.car_last_servo_bias_pwm)
+                        hold_frames = max(
+                            0,
+                            int(getattr(config, "CAR_AVOIDANCE_CLEARING_PULLBACK_HOLD_FRAMES", 0)),
+                        )
+                        hold_min_pwm = max(
+                            0.0,
+                            float(getattr(config, "CAR_AVOIDANCE_CLEARING_PULLBACK_HOLD_MIN_PWM", 0.0)),
+                        )
+                        if (
+                            self.car_clearing_frames <= hold_frames and
+                            last_bias_pwm * avoid_sign < -hold_min_pwm
+                        ):
+                            servo_bias_pwm = last_bias_pwm
+                        else:
+                            servo_bias_pwm = 0.0
+                    else:
+                        _raw_left_p_pwm, left_boundary_error, left_boundary_x = self._car_left_boundary_p_correction(
+                            left_boundary,
+                            float(self.car_last_left_boundary_sample_y),
+                            w_seg,
+                        )
+                        servo_bias_pwm, left_p_pwm = self._apply_car_left_boundary_range_to_bias(
+                            servo_bias_pwm,
+                            left_boundary_error,
+                        )
+                    servo_bias_pwm = self._limit_car_servo_bias_step(servo_bias_pwm, clearing=True)
+                    self.car_last_servo_bias_pwm = float(servo_bias_pwm)
+                    done_bias_pwm = max(
+                        0.0,
+                        float(getattr(config, "CAR_AVOIDANCE_CLEARING_DONE_BIAS_PWM", 2.0)),
+                    )
+                    min_done_frames = max(
+                        1,
+                        int(getattr(config, "CAR_AVOIDANCE_CLEARING_MIN_BIAS_DONE_FRAMES", 5)),
+                    )
+                    if (
+                        bool(getattr(config, "CAR_AVOIDANCE_SERVO_BIAS_ENABLED", True)) and
+                        self.car_clearing_frames >= min_done_frames and
+                        abs(float(servo_bias_pwm)) <= done_bias_pwm
+                    ):
+                        self.car_avoidance_state = "FOLLOW_LANE"
+                        self.car_clearing_frames = 0
+                        self.car_last_avoid_path = None
+                        self.car_last_avoid_path_is_boundary = False
+                        self.car_last_boundary_inset_x = 0.0
+                        self.car_last_blocked_y_range = None
+                        self.car_last_servo_bias_pwm = 0.0
+                        self._reset_car_left_boundary_control()
+                        debug["state"] = self.car_avoidance_state
+                        debug["clear_frames"] = 0
+                        return 0.0, debug, None
+                debug["state"] = self.car_avoidance_state
+                debug["clear_frames"] = int(self.car_clearing_frames)
+                debug["miss_frames"] = int(self.locked_car_miss_frames)
+                debug["boundary_inset_x"] = float(clearing_inset_x)
+                debug["boundary_strength_x"] = float(clearing_inset_x if clearing_path_ok else boundary_strength)
+                debug["boundary_path_active"] = bool(clearing_path_ok)
+                debug["left_boundary_error"] = None if left_boundary_error is None else float(left_boundary_error)
+                debug["left_boundary_x"] = None if left_boundary_x is None else float(left_boundary_x)
+                debug["left_boundary_p_pwm"] = float(left_p_pwm)
+                debug["left_boundary_d_pwm"] = float(left_d_pwm)
+                debug["servo_bias_pwm"] = float(servo_bias_pwm)
+                if self._car_servo_bias_mode() == "left_boundary_pd":
+                    debug["pd_pwm"] = float(servo_bias_pwm)
+                debug["active"] = True
+                return (
+                    float(clearing_inset_x if clearing_path_ok else boundary_strength),
+                    debug,
+                    _clearing_path if clearing_path_ok else None,
+                )
             return 0.0, debug, None
 
         _smooth_cx, smooth_cy = locked_car.get("bottom_center", (0.0, float(np.max(base[:, 1]))))
+        self.car_last_left_boundary_sample_y = float(smooth_cy)
         rows_to_car = max(0.0, float(np.max(base[:, 1])) - float(smooth_cy))
-        if self.car_avoidance_controller.state == "CLEARING":
-            debug = self.car_avoidance_controller.update_missing(
-                sample_left_x,
-                sample_half_width_x,
-                w_seg,
-                miss_frames=int(self.locked_car_miss_frames),
-            )
-            debug["rows_to_bottom"] = float(rows_to_car)
-            if debug.get("active") and left_boundary is not None:
-                car_avoid_path, path_ok = self._build_boundary_inset_path(
-                    base_path,
+        servo_bias_pwm = 0.0
+        left_p_pwm = 0.0
+        left_d_pwm = 0.0
+        left_boundary_x = self._boundary_x_at_y(left_boundary, float(smooth_cy)) if left_boundary is not None else None
+        target_x = float(w_seg) * float(getattr(config, "CAR_AVOIDANCE_LEFT_BOUNDARY_TARGET_RATIO", 0.50))
+        left_boundary_error = None if left_boundary_x is None else float(left_boundary_x) - target_x
+        if bool(getattr(config, "CAR_AVOIDANCE_SERVO_BIAS_ENABLED", True)):
+            if self._car_servo_bias_mode() == "left_boundary_pd":
+                pd_bias_pwm, left_boundary_error, left_boundary_x, left_p_pwm, left_d_pwm = self._car_left_boundary_pd_bias(
                     left_boundary,
-                    float(debug.get("boundary_inset_x", 0.0)),
+                    float(smooth_cy),
                     w_seg,
+                    rows_to_car=rows_to_car,
+                    allow_positive=True,
                 )
-                if path_ok:
-                    return float(debug.get("boundary_inset_x", 0.0)), debug, car_avoid_path
-            return 0.0, debug, None
-
-        if self.car_avoidance_controller.state == "PASSED_WAIT":
-            debug = self.car_avoidance_controller.idle_debug(miss_frames=int(self.locked_car_miss_frames))
-            debug["rows_to_bottom"] = float(rows_to_car)
-            return 0.0, debug, None
-
-        pass_rows = max(0.0, float(getattr(config, "CAR_AVOIDANCE_PASS_ROWS", 25.0)))
-        if pass_rows > 0.0 and rows_to_car <= pass_rows:
-            self.car_avoidance_controller.begin_clearing(passed=True)
-            debug = self.car_avoidance_controller.update_missing(
-                sample_left_x,
-                sample_half_width_x,
-                w_seg,
-                miss_frames=int(self.locked_car_miss_frames),
-            )
-            debug["rows_to_bottom"] = float(rows_to_car)
-            if debug.get("active") and left_boundary is not None:
-                car_avoid_path, path_ok = self._build_boundary_inset_path(
-                    base_path,
-                    left_boundary,
-                    float(debug.get("boundary_inset_x", 0.0)),
-                    w_seg,
+                if pd_bias_pwm is None:
+                    servo_bias_pwm = float(self.car_last_servo_bias_pwm)
+                else:
+                    servo_bias_pwm = float(pd_bias_pwm)
+            else:
+                servo_bias_pwm = self._car_servo_bias_from_rows(rows_to_car)
+                _raw_left_p_pwm, left_boundary_error, left_boundary_x = self._car_left_boundary_p_correction(left_boundary, float(smooth_cy), w_seg)
+                servo_bias_pwm, left_p_pwm = self._apply_car_left_boundary_range_to_bias(
+                    servo_bias_pwm,
+                    left_boundary_error,
                 )
+                servo_bias_pwm = self._limit_car_servo_bias_step(servo_bias_pwm, clearing=False)
+        debug["rows_to_bottom"] = float(rows_to_car)
+        debug["miss_frames"] = int(self.locked_car_miss_frames)
+        debug["left_boundary_error"] = None if left_boundary_error is None else float(left_boundary_error)
+        debug["left_boundary_x"] = None if left_boundary_x is None else float(left_boundary_x)
+        debug["left_boundary_p_pwm"] = float(left_p_pwm)
+        debug["left_boundary_d_pwm"] = float(left_d_pwm)
+        debug["servo_bias_pwm"] = float(servo_bias_pwm)
+        if self._car_servo_bias_mode() == "left_boundary_pd":
+            debug["pd_pwm"] = float(servo_bias_pwm)
+
+        if bool(getattr(config, "CAR_AVOIDANCE_SERVO_BIAS_ENABLED", True)):
+            if self._car_servo_bias_mode() != "left_boundary_pd" and abs(float(servo_bias_pwm)) <= 1e-6:
+                if self.car_avoidance_state == "AVOIDING":
+                    self.car_avoidance_state = "FOLLOW_LANE"
+                    self.car_clearing_frames = 0
+                    self.car_last_servo_bias_pwm = 0.0
+                    self._reset_car_left_boundary_control()
+                debug["state"] = self.car_avoidance_state
+                debug["clear_frames"] = int(self.car_clearing_frames)
+                return 0.0, debug, None
+
+            path_ok = False
+            avoid_path = base.copy()
+            path_inset = 0.0
+            if bool(getattr(config, "CAR_AVOIDANCE_SERVO_BIAS_PATH_ENABLED", False)):
+                near_rows = max(0.0, float(getattr(config, "CAR_AVOIDANCE_NEAR_BOUNDARY_ROWS", 60.0)))
+                far_inset = max(0.0, float(getattr(config, "CAR_AVOIDANCE_LEFT_BOUNDARY_INSET", 20.0)))
+                near_inset = max(0.0, float(getattr(config, "CAR_AVOIDANCE_NEAR_LEFT_BOUNDARY_INSET", far_inset)))
+                path_inset = near_inset if rows_to_car <= near_rows else far_inset
+                raw_avoid_path, path_ok = self._build_car_left_boundary_path(base, left_boundary, path_inset, w_seg)
                 if path_ok:
-                    return float(debug.get("boundary_inset_x", 0.0)), debug, car_avoid_path
+                    blend = float(getattr(config, "CAR_AVOIDANCE_SERVO_BIAS_PATH_BLEND", 0.0))
+                    blend = float(np.clip(blend, 0.0, 1.0))
+                    avoid_path = self._blend_paths(base, raw_avoid_path, blend)
+                    avoid_path[:, 0] = np.clip(avoid_path[:, 0], 0.0, float(w_seg - 1))
+                else:
+                    avoid_path = base.copy()
+                    path_inset = 0.0
+
+            self.car_avoidance_state = "AVOIDING"
+            self.car_clearing_frames = 0
+            self.car_last_avoid_path = avoid_path.copy() if path_ok else base.copy()
+            self.car_last_avoid_path_is_boundary = bool(path_ok)
+            self.car_last_boundary_inset_x = float(path_inset)
+            self.car_last_servo_bias_pwm = float(servo_bias_pwm)
+            self.car_last_blocked_y_range = None
+            self.car_last_left_boundary_p_pwm = float(left_p_pwm)
+            debug["state"] = self.car_avoidance_state
+            debug["clear_frames"] = 0
+            debug["boundary_inset_x"] = float(path_inset)
+            debug["boundary_strength_x"] = float(path_inset)
+            debug["boundary_path_active"] = bool(path_ok)
+            debug["active"] = True
+            return float(path_inset), debug, avoid_path if path_ok else None
+
+        servo_bias_pwm = 0.0
+        left_p_pwm = 0.0
+        left_d_pwm = 0.0
+        debug["left_boundary_p_pwm"] = 0.0
+        debug["left_boundary_d_pwm"] = 0.0
+        debug["servo_bias_pwm"] = 0.0
+
+        if self._car_fixed_boundary_ready(locked_car, w_seg, h_seg):
+            self.car_avoidance_state = "CLEARING"
+            self.car_clearing_frames = 0
+            inset = float(getattr(config, "CAR_AVOIDANCE_NEAR_LEFT_BOUNDARY_INSET", 30.0))
+            avoid_path, path_ok = self._build_car_left_boundary_path(base, left_boundary, inset, w_seg)
+            self.car_last_avoid_path = avoid_path.copy() if path_ok else base.copy()
+            self.car_last_avoid_path_is_boundary = bool(path_ok)
+            self.car_last_boundary_inset_x = float(inset)
+            self.car_last_servo_bias_pwm = float(servo_bias_pwm)
+            self.car_last_left_boundary_p_pwm = float(left_p_pwm)
+            self.car_left_boundary_p_release_frames = 0
+            debug["state"] = self.car_avoidance_state
+            debug["clear_frames"] = 0
+            debug["fixed_boundary"] = True
+            debug["boundary_inset_x"] = float(inset)
+            debug["boundary_strength_x"] = float(inset)
+            debug["boundary_path_active"] = bool(path_ok)
+            debug["active"] = True
+            return float(inset), debug, avoid_path if path_ok else None
+
+        inset, y_range, boundary_ready = self._car_avoidance_boundary_inset(locked_car, base)
+
+        if not boundary_ready:
+            if self.car_avoidance_state == "AVOIDING":
+                self.car_avoidance_state = "FOLLOW_LANE"
+                self.car_clearing_frames = 0
+                self.car_last_servo_bias_pwm = 0.0
+                self._reset_car_left_boundary_control()
+            debug["state"] = self.car_avoidance_state
+            debug["clear_frames"] = int(self.car_clearing_frames)
             return 0.0, debug, None
 
-        y_range, boundary_ready = self._car_avoidance_distance_window(locked_car, base)
-        blocked_y_range = None
         if y_range is not None:
-            blocked_y_range = (float(y_range[0]), float(y_range[1]))
-        debug = self.car_avoidance_controller.update_locked(
-            rows_to_car=rows_to_car,
-            boundary_ready=boundary_ready,
-            left_x=sample_left_x,
-            half_width_x=sample_half_width_x,
-            w_seg=w_seg,
-            sample_y=float(getattr(config, "CAR_AVOIDANCE_PD_SAMPLE_Y", 110.0)),
-            miss_frames=int(self.locked_car_miss_frames),
-            blocked_y_range=blocked_y_range,
-        )
-        if debug.get("active") and left_boundary is not None:
-            car_avoid_path, path_ok = self._build_boundary_inset_path(
-                base_path,
-                left_boundary,
-                float(debug.get("boundary_inset_x", 0.0)),
-                w_seg,
-            )
-            if path_ok:
-                return float(debug.get("boundary_inset_x", 0.0)), debug, car_avoid_path
-        return 0.0, debug, None
+            debug["blocked_y_range"] = (float(y_range[0]), float(y_range[1]))
+        avoid_path, path_ok = self._build_car_left_boundary_path(base, left_boundary, inset, w_seg)
+        self.car_avoidance_state = "AVOIDING"
+        self.car_clearing_frames = 0
+        self.car_last_avoid_path = avoid_path.copy() if path_ok else base.copy()
+        self.car_last_avoid_path_is_boundary = bool(path_ok)
+        self.car_last_boundary_inset_x = float(inset)
+        self.car_last_servo_bias_pwm = float(servo_bias_pwm)
+        self.car_last_blocked_y_range = debug["blocked_y_range"]
+        self.car_last_left_boundary_p_pwm = float(left_p_pwm)
+        self.car_left_boundary_p_release_frames = 0
+        debug["state"] = self.car_avoidance_state
+        debug["clear_frames"] = 0
+        debug["boundary_inset_x"] = float(inset)
+        debug["boundary_strength_x"] = float(inset)
+        debug["boundary_path_active"] = bool(path_ok)
+        debug["active"] = True
+        return float(inset), debug, avoid_path if path_ok else None
 
     def infer_mask(self, blob_rgb_320):
         """只执行分割模型推理，返回二值 mask 和推理耗时."""
@@ -2738,10 +3219,9 @@ class RoadSegmentor:
                 merge_guide_info.get("guide_polyline"),
             )
             search_edge_mask = self._extract_edge_mask(search_mask)
-            self._reset_y_fork_state()
             y_fork_info = {"active": False, "fork_point": None, "split_rows": 0}
         else:
-            y_fork_info = self._update_y_fork_state(self._detect_y_fork(search_mask))
+            y_fork_info = self._detect_y_fork(search_mask)
         fork_bottom_mid = self._road_bottom_midpoint(search_mask)
         branch_pair_count_max = 0
         branch_support_rows = 0
@@ -2773,7 +3253,6 @@ class RoadSegmentor:
         if preferred_turn_default not in (-1, 1):
             preferred_turn_default = -1
         route_boundary_side = None
-        fork_boundary_applied_side = None
         stone_branch_side = 0
         car_path_debug = None
         car_avoid_path = None
@@ -2781,7 +3260,7 @@ class RoadSegmentor:
         car_boundary_strength_x = 0.0
         external_boundary_inset_x = float(external_boundary_inset_x)
         external_boundary_active = abs(external_boundary_inset_x) > 0.0
-        avoid_control_source = "external" if external_boundary_active else "none"
+        avoid_bias_source = "external" if external_boundary_active else "none"
         centerline_only_mode = bool(getattr(config, "SEG_CENTERLINE_ONLY_MODE", False))
 
         if y_fork_info.get("active"):
@@ -2928,18 +3407,14 @@ class RoadSegmentor:
         if best_path is not None:
             guide_polyline = None if merge_guide_info is None else merge_guide_info.get("guide_polyline")
             fit_nodes = self._apply_merge_boundary_width(best_nodes, merge_side, guide_polyline)
-            no_sign_route_active = route_choice == 0 and not bool(sign_route_pending)
-            fork_boundary_side = fork_selected_side or route_boundary_side
             if (
                 bool(getattr(config, "FORK_BOUNDARY_WIDTH_ENABLED", True)) and
-                no_sign_route_active and
                 merge_side not in ("left", "right") and
-                fork_boundary_side in ("left", "right")
+                (fork_selected_side or route_boundary_side) in ("left", "right")
             ):
-                fork_boundary_applied_side = fork_boundary_side
                 fit_nodes = self._apply_fork_boundary_width(
                     fit_nodes,
-                    fork_boundary_side,
+                    fork_selected_side or route_boundary_side,
                 )
             fit_path = np.array([node["pt"] for node in fit_nodes], dtype=np.float32)
             node_x = fit_path[:, 0]
@@ -2969,40 +3444,19 @@ class RoadSegmentor:
             dense_y = np.clip(dense_y, 0, h_seg - 1)
 
             path_points_orig = np.vstack((dense_x, dense_y)).astype(np.float32).T
-            lateral_path_points = fit_path.astype(np.float32)
-            heading_path_points = None
-            heading_path_source = "center"
-            if bool(getattr(config, "PATH_HEADING_USE_TRUSTED_BOUNDARY", True)):
-                route_side = fork_selected_side or route_boundary_side or fork_boundary_applied_side
-                trusted_boundary_side = "left"
-                if bool(sign_route_pending) and y_fork_active and fork_selected_side is None:
-                    heading_path_points = path_points_orig
-                    heading_path_source = "fork_centerline"
-                else:
-                    if merge_side == "left":
-                        trusted_boundary_side = "right"
-                        heading_path_source = "merge_trusted_right"
-                    elif merge_side == "right":
-                        trusted_boundary_side = "left"
-                        heading_path_source = "merge_trusted_left"
-                    elif route_side == "right":
-                        trusted_boundary_side = "right"
-                        heading_path_source = "right_boundary"
-                    elif route_side == "left":
-                        trusted_boundary_side = "left"
-                        heading_path_source = "left_boundary"
-                    else:
-                        heading_path_source = "left_boundary"
-
-                    trusted_boundary_pts = right_boundary_pts if trusted_boundary_side == "right" else left_boundary_pts
-                    heading_path_points = self._path_points_on_ys(trusted_boundary_pts, dense_y, w_seg)
+            lateral_path_points = None
+            raw_lateral_x = self._interp_path_xs(fit_path, dense_y)
+            if raw_lateral_x is not None:
+                raw_lateral_x = np.clip(raw_lateral_x, 0, w_seg - 1)
+                lateral_path_points = np.vstack((raw_lateral_x, dense_y)).astype(np.float32).T
             base_path_points = path_points_orig.copy()
-            car_boundary_strength_x, car_path_debug, car_avoid_path = self._update_car_avoidance_pd_control(
+            car_boundary_strength_x, car_path_debug, car_avoid_path = self._update_car_avoidance_boundary_path(
                 path_points_orig,
                 planning_items,
                 w_seg,
                 h_seg,
                 left_boundary=left_boundary_pts,
+                state_updates_enabled=bool(debug_drive_active),
             )
             car_active = car_path_debug is not None and car_path_debug.get("active")
             external_boundary_inset_x = float(external_boundary_inset_x)
@@ -3010,7 +3464,7 @@ class RoadSegmentor:
             external_boundary_side = str(external_boundary_side).lower()
             if external_boundary_side not in ("left", "right"):
                 external_boundary_side = "left"
-            avoid_control_source = "car_avoid" if car_active else "none"
+            avoid_bias_source = "car" if car_active else "none"
             if external_boundary_active:
                 external_boundary_pts = right_boundary_pts if external_boundary_side == "right" else left_boundary_pts
                 external_avoid_path, external_path_ok = self._build_boundary_inset_path(
@@ -3024,19 +3478,28 @@ class RoadSegmentor:
                     abs(float(external_boundary_inset_x)) > abs(float(car_boundary_strength_x))
                 ):
                     car_avoid_path = external_avoid_path
-                    avoid_control_source = "external_car_pd" if car_active else "external"
+                    avoid_bias_source = "external_car_dir" if car_active else "external"
                     car_boundary_strength_x = float(external_boundary_inset_x)
             car_state = "FOLLOW_LANE"
             if car_path_debug is not None:
                 car_state = str(car_path_debug.get("state", "FOLLOW_LANE"))
+            car_servo_bias_enabled = bool(getattr(config, "CAR_AVOIDANCE_SERVO_BIAS_ENABLED", True))
             d_gain_scale = 1.0
+            if car_active and car_servo_bias_enabled:
+                d_gain_scale = float(getattr(config, "CAR_AVOIDANCE_SERVO_BIAS_D_GAIN_SCALE", 0.0))
+                d_gain_scale = float(np.clip(d_gain_scale, 0.0, 1.0))
             car_boundary_path_active = (
                 car_avoid_path is not None and
                 (
-                    avoid_control_source in ("external", "external_car_pd", "car_avoid")
+                    avoid_bias_source in ("external", "external_car_dir") or
+                    (
+                        car_active and
+                        avoid_bias_source == "car" and
+                        bool(car_path_debug.get("boundary_path_active", False))
+                    )
                 )
             )
-            bypass_frame_jump = external_boundary_active
+            bypass_frame_jump = external_boundary_active or car_boundary_path_active
             if bypass_frame_jump:
                 path_jump_limited = False
             else:
@@ -3052,7 +3515,6 @@ class RoadSegmentor:
             self.missing_path_frames = 0
             control_path_points = path_points_orig
             lateral_control_points = lateral_path_points
-            heading_control_points = heading_path_points
             control_mode = str(getattr(config, "STEER_CONTROL_MODE", "weighted_slope")).lower()
             if (
                 control_mode in ("stanley_band", "control_c") and
@@ -3062,7 +3524,6 @@ class RoadSegmentor:
             if car_boundary_path_active:
                 control_path_points = car_avoid_path
                 lateral_control_points = car_avoid_path
-                heading_control_points = car_avoid_path
                 if control_mode == "weighted_slope":
                     weighted_points = self.path_controller.select_control_points(
                         control_mode,
@@ -3072,7 +3533,6 @@ class RoadSegmentor:
                     if weighted_points is not None:
                         control_path_points = weighted_points
                         lateral_control_points = weighted_points
-                        heading_control_points = weighted_points
             else:
                 if control_mode == "weighted_slope":
                     weighted_points = self.path_controller.select_control_points(
@@ -3083,17 +3543,18 @@ class RoadSegmentor:
                     if weighted_points is not None:
                         control_path_points = weighted_points
                         lateral_control_points = weighted_points
-                        heading_control_points = weighted_points
             steer_signal = self.path_controller.compute_steer_signal(
                 control_path_points,
                 w_seg,
                 h_seg,
-                center_bias_x=float(getattr(config, "CONTROL_CENTER_BIAS_X", 0.0)),
+                center_bias_x=0.0,
                 lateral_points=lateral_control_points,
-                heading_points=heading_control_points,
                 d_gain_scale=d_gain_scale,
             )
-            steer_signal *= float(getattr(config, "STEER_SIGNAL_NO_TARGET_GAIN", 1.0))
+            if car_active and not car_servo_bias_enabled:
+                steer_signal *= float(getattr(config, "STEER_SIGNAL_CAR_GAIN", 1.0))
+            elif not car_active:
+                steer_signal *= float(getattr(config, "STEER_SIGNAL_NO_TARGET_GAIN", 1.0))
             control_band = None
             lateral_debug_points = None
             control_mode = str(getattr(config, "STEER_CONTROL_MODE", "weighted_slope")).lower()
@@ -3139,30 +3600,29 @@ class RoadSegmentor:
             "branch_support_rows": int(branch_support_rows),
             "fork_active": bool(fork_active),
             "y_fork_active": bool(y_fork_active),
-            "y_fork_state_held": bool(y_fork_info.get("held", False)),
             "merge_side": merge_side,
             "merge_state_active": bool(self.merge_state_active),
             "merge_state_hit_frames": int(self.merge_state_hit_frames),
             "merge_state_exit_frames": int(self.merge_state_exit_frames),
-            "heading_path_source": str(heading_path_source if 'heading_path_source' in locals() else "center"),
-            "fork_boundary_applied_side": fork_boundary_applied_side,
             "car_active": bool(car_active),
             "car_state": str(car_state if 'car_state' in locals() else "FOLLOW_LANE"),
             "car_rows_to_bottom": float(car_path_debug.get("rows_to_bottom", 0.0)) if car_path_debug is not None and car_path_debug.get("rows_to_bottom") is not None else None,
             "car_miss_frames": int(car_path_debug.get("miss_frames", 0)) if car_path_debug is not None else 0,
             "car_clear_frames": int(car_path_debug.get("clear_frames", 0)) if car_path_debug is not None else 0,
+            "car_state_paused": bool(car_path_debug.get("paused", False)) if car_path_debug is not None else False,
             "car_left_boundary_error": float(car_path_debug.get("left_boundary_error", 0.0)) if car_path_debug is not None and car_path_debug.get("left_boundary_error") is not None else None,
             "car_left_boundary_x": float(car_path_debug.get("left_boundary_x", 0.0)) if car_path_debug is not None and car_path_debug.get("left_boundary_x") is not None else None,
             "car_left_boundary_p_pwm": float(car_path_debug.get("left_boundary_p_pwm", 0.0)) if car_path_debug is not None else 0.0,
             "car_left_boundary_d_pwm": float(car_path_debug.get("left_boundary_d_pwm", 0.0)) if car_path_debug is not None else 0.0,
             "car_pd_pwm": float(car_path_debug.get("pd_pwm", 0.0)) if car_path_debug is not None else 0.0,
+            "car_servo_bias_pwm": float(car_path_debug.get("servo_bias_pwm", 0.0)) if car_path_debug is not None else 0.0,
             "car_d_gain_scale": float(d_gain_scale if 'd_gain_scale' in locals() else 1.0),
             "car_boundary_strength_x": float(car_boundary_strength_x if car_active else 0.0),
             "car_boundary_inset_x": float(car_path_debug.get("boundary_inset_x", 0.0)) if car_path_debug is not None else 0.0,
             "car_boundary_path_active": bool(car_boundary_path_active if 'car_boundary_path_active' in locals() else False),
             "external_boundary_inset_x": float(external_boundary_inset_x),
             "external_boundary_side": external_boundary_side,
-            "avoid_control_source": avoid_control_source,
+            "avoid_bias_source": avoid_bias_source,
             "sign_route_pending_centerline": bool(sign_route_pending and y_fork_active and fork_selected_side is None),
         }
         self._store_main_overlay(
@@ -3176,13 +3636,7 @@ class RoadSegmentor:
             merge_guide_pts=None if merge_guide_info is None else merge_guide_info.get("guide_polyline"),
             fork_point=y_fork_info.get("fork_point") if y_fork_active else None,
             control_band=control_band if 'control_band' in locals() else None,
-            bottom_mid=(
-                fork_bottom_mid if y_fork_active
-                else (
-                    0.5 * float(w_seg) + float(getattr(config, "CONTROL_CENTER_BIAS_X", 0.0)),
-                    float(h_seg) - 1.0,
-                )
-            ),
+            bottom_mid=fork_bottom_mid if y_fork_active else None,
         )
         t_fit_end = time.perf_counter()
 
@@ -3231,22 +3685,19 @@ class RoadSegmentor:
             pwm_gain = float(getattr(config, "STANLEY_PWM_GAIN", 0.012))
         elif control_mode == "control_c":
             pwm_gain = float(getattr(config, "CONTROL_C_PWM_GAIN", 12.0))
+        servo_bias_pwm = 0.0
+        if bool(getattr(config, "CAR_AVOIDANCE_SERVO_BIAS_ENABLED", True)):
+            servo_bias_pwm = float(self.last_branch_stats.get("car_servo_bias_pwm", 0.0))
         servo_pwm = int(
             config.SERVO_CENTER
             - steer_signal * pwm_gain
+            + servo_bias_pwm
         )
         servo_pwm = int(max(config.SERVO_MIN, min(config.SERVO_MAX, servo_pwm)))
-        self._log_stanley_debug(
-            steer_signal,
-            servo_pwm,
-            car_active=bool(car_active) if 'car_active' in locals() else False,
-            debug_drive_active=bool(debug_drive_active),
-        )
         self._log_control_c_debug(
             steer_signal,
             servo_pwm,
             car_active=bool(car_active) if 'car_active' in locals() else False,
-            debug_drive_active=bool(debug_drive_active),
         )
         draw_seg_status_text(
             ai_view,
@@ -3290,7 +3741,6 @@ class RoadSegmentor:
         external_boundary_inset_x=0.0,
         external_boundary_side="left",
         sign_route_pending=False,
-        debug_drive_active=True,
     ):
         """兼容旧串行调用：推理和后处理在同一个线程里连续执行."""
         t_total_start = time.perf_counter()
@@ -3307,5 +3757,4 @@ class RoadSegmentor:
             external_boundary_inset_x=external_boundary_inset_x,
             external_boundary_side=external_boundary_side,
             sign_route_pending=sign_route_pending,
-            debug_drive_active=debug_drive_active,
         )
