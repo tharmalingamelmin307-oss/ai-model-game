@@ -137,6 +137,7 @@ def print_runtime_config_summary():
         f"SIGN_ROUTE_DECISION_MODE={getattr(config, 'SIGN_ROUTE_DECISION_MODE', None)} "
         f"SIGN_ROUTE_SKIP_FIRST_PASS={getattr(config, 'SIGN_ROUTE_SKIP_FIRST_PASS', None)} "
         f"SIGN_ROUTE_FIXED_FIRST_CHOICE={getattr(config, 'SIGN_ROUTE_FIXED_FIRST_CHOICE', None)} "
+        f"SIGN_LLM_FORK_POINT_TRIGGER_ROWS={getattr(config, 'SIGN_LLM_FORK_POINT_TRIGGER_ROWS', None)} "
         f"CAR_AVOIDANCE_PD_ENABLED={getattr(config, 'CAR_AVOIDANCE_PD_ENABLED', None)} "
         f"CAR_AVOIDANCE_START_BOUNDARY_ROWS={getattr(config, 'CAR_AVOIDANCE_START_BOUNDARY_ROWS', None)} "
         f"CAR_AVOIDANCE_NEAR_BOUNDARY_ROWS={getattr(config, 'CAR_AVOIDANCE_NEAR_BOUNDARY_ROWS', None)}",
@@ -526,6 +527,19 @@ def should_trigger_sign_route(cls_id, rect):
     trigger_dist = float(getattr(config, "SIGN_LLM_TRIGGER_DIST", 0.0))
     if trigger_dist > 0.0 and dist_to_bottom > trigger_dist:
         return False, f"too_far_from_bottom({int(dist_to_bottom)}>{int(trigger_dist)})"
+    if not sign_rect_edge_safe(rect):
+        return False, "too_close_to_edge"
+    return True, "ok"
+
+
+def sign_rect_edge_safe(rect):
+    """路牌框是否满足不贴边条件."""
+    if len(rect) != 4:
+        return False
+    x, y, w, h = rect
+    if w < 2 or h < 2:
+        return False
+    frame_w, frame_h = config.TARGET_RES
     edge_margin_ratio = max(
         float(config.OCR_SIGN_EDGE_MARGIN_RATIO),
         float(getattr(config, "SIGN_LLM_TRIGGER_EDGE_MARGIN_RATIO", config.OCR_SIGN_EDGE_MARGIN_RATIO)),
@@ -538,8 +552,27 @@ def should_trigger_sign_route(cls_id, rect):
         (x + w) >= (frame_w - edge_margin_x) or
         (y + h) >= (frame_h - edge_margin_y)
     ):
-        return False, "too_close_to_edge"
-    return True, "ok"
+        return False
+    return True
+
+
+def sign_route_fork_point_trigger_active(state):
+    """Y 岔特征点足够靠近底部时，强制启动路牌采样."""
+    if not sign_route_uses_llm():
+        return False, None
+    if not bool(state.get("sign_route_y_fork_active", False)):
+        return False, None
+    rows_to_bottom = state.get("sign_route_fork_rows_to_bottom")
+    if rows_to_bottom is None:
+        return False, None
+    try:
+        rows_to_bottom = float(rows_to_bottom)
+    except (TypeError, ValueError):
+        return False, None
+    trigger_rows = float(getattr(config, "SIGN_LLM_FORK_POINT_TRIGGER_ROWS", 0.0))
+    if trigger_rows <= 0.0:
+        return False, rows_to_bottom
+    return rows_to_bottom <= trigger_rows, rows_to_bottom
 
 
 def class_name_from_id(cls_id):
@@ -1203,13 +1236,23 @@ def yolo_worker(core_id=None, worker_id=0):
             pending_sign_jobs = []
             route_trigger_rect = None
             route_skip_debug = None
+            with data_lock:
+                fork_point_trigger, fork_rows_to_bottom = sign_route_fork_point_trigger_active(global_control_data)
             for idx, obj in enumerate(objs):
                 cls_id = obj.get("class_id")
                 if cls_id != config.SIGN_CLASS_ID:
                     continue
                 rect = obj.get("rect", [0, 0, 0, 0])
                 if sign_route_uses_llm() and route_trigger_rect is None:
-                    should_trigger, trigger_skip_reason = should_trigger_sign_route(cls_id, rect)
+                    if fork_point_trigger:
+                        should_trigger = sign_rect_edge_safe(rect)
+                        trigger_skip_reason = (
+                            "fork_point_near_bottom"
+                            if should_trigger else
+                            "fork_point_near_bottom_but_too_close_to_edge"
+                        )
+                    else:
+                        should_trigger, trigger_skip_reason = should_trigger_sign_route(cls_id, rect)
                     if should_trigger:
                         route_trigger_rect = list(rect)
                     elif route_skip_debug is None:
@@ -1725,6 +1768,19 @@ def seg_worker(core_id, worker_id=0):
             global_control_data["car_avoidance_boundary_inset_x"] = float(car_stats.get("car_boundary_inset_x", 0.0))
             global_control_data["car_avoidance_boundary_path_active"] = bool(car_stats.get("car_boundary_path_active", False))
             global_control_data["car_avoidance_pd_pwm"] = float(car_stats.get("car_pd_pwm", 0.0))
+            y_fork_point = car_stats.get("y_fork_point")
+            y_fork_rows_to_bottom = None
+            if bool(y_fork_active) and y_fork_point is not None:
+                try:
+                    y_fork_rows_to_bottom = max(
+                        0.0,
+                        float(config.SEG_SIZE[1] - 1) - float(y_fork_point[1]),
+                    )
+                except Exception:
+                    y_fork_rows_to_bottom = None
+            global_control_data["sign_route_y_fork_active"] = bool(y_fork_active)
+            global_control_data["sign_route_fork_point"] = y_fork_point if bool(y_fork_active) else None
+            global_control_data["sign_route_fork_rows_to_bottom"] = y_fork_rows_to_bottom
             person_stop_active = update_person_stop_state(
                 global_control_data,
                 person_info,

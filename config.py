@@ -201,11 +201,15 @@ SIGN_ROUTE_SKIP_FIRST_PASS = True
 SIGN_ROUTE_FIXED_FIRST_CHOICE = "LEFT"
 # 触发语义路牌停车采样的 sign 框面积阈值，单位是 TARGET_RES 坐标系像素面积。
 # 它会和 SIGN_LLM_TRIGGER_DIST、SIGN_LLM_TRIGGER_EDGE_MARGIN_RATIO 同时满足后才停车。
-SIGN_LLM_TRIGGER_AREA = 16000
+SIGN_LLM_TRIGGER_AREA = 10000
 # 触发语义路牌停车采样的 sign 截止距离，单位是 TARGET_RES 像素。
 # 路牌框底边距离画面底部小于等于该值，才认为已经足够近，可以停车采样。
 # 调大：更早停车；调小：更靠近再停车。
-SIGN_LLM_TRIGGER_DIST = 500
+SIGN_LLM_TRIGGER_DIST = 400
+# 硬性停车采样条件：Y 岔路特征点距离分割平面底部小于等于该行数时，
+# 若当前帧有不贴边的 sign 框，立刻停车开始路牌 OCR/千帆，不再受 sign 面积/高度限制。
+# 单位是 SEG_SIZE 坐标系像素行。
+SIGN_LLM_FORK_POINT_TRIGGER_ROWS = 130
 # 停车后希望采集的有效 OCR 样本数量。
 # 收满后会提交给千帆；如果超时，也可能提前提交已有样本。
 SIGN_LLM_OCR_SAMPLES = 5
@@ -942,6 +946,9 @@ DEFAULT_CONTROL_DATA = {
     "sign_route_fork_entered_at": None,
     "sign_route_single_road_frames": 0,
     "sign_route_sign_gone_frames": 0,
+    "sign_route_y_fork_active": False,
+    "sign_route_fork_point": None,
+    "sign_route_fork_rows_to_bottom": None,
     "sign_route_api_submitted": False,
     "person_stop_active": False,
     "person_bottom_y": None,
@@ -1089,7 +1096,7 @@ PERSON_CLASS_ID_FALLBACK = 2
 # 画面上先画“停车截至横线”，它直接对应 PERSON_STOP_TRIGGER_DIST。
 # 竖向放行线后面再按调试需要打开。
 # 行人框底边距离画面底部小于该值才触发停车，单位 TARGET_RES 像素。
-PERSON_STOP_TRIGGER_DIST = 420
+PERSON_STOP_TRIGGER_DIST = 450
 # 行人框面积至少达到该值，才允许触发行人停车，单位 TARGET_RES 像素面积。
 PERSON_STOP_MIN_AREA = 2500
 # 行人朝目标侧连续移动并过线多少帧后，才允许从停车切到放行。
