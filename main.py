@@ -363,7 +363,6 @@ def update_person_stop_state(state, person_info, left_boundary_x, right_boundary
     if left_boundary_x is not None and right_boundary_x is not None:
         road_center_x = 0.5 * (float(left_boundary_x) + float(right_boundary_x))
     target_h = float(config.TARGET_RES[1])
-    clear_line_offset_x = float(getattr(config, "PERSON_CLEAR_LINE_OFFSET_X", 18.0))
     trigger_dist = float(config.PERSON_STOP_TRIGGER_DIST)
     stop_cutoff_y = max(0.0, min(target_h - 1.0, target_h - trigger_dist))
     min_area = float(getattr(config, "PERSON_STOP_MIN_AREA", 0.0))
@@ -377,29 +376,34 @@ def update_person_stop_state(state, person_info, left_boundary_x, right_boundary
         max_released = False
 
     release_direction = current_direction if current_direction != 0 else move_direction
-    clear_line_x = road_center_x
+    clear_line_x = None
     clear_line_side = ""
     if release_direction > 0:
-        clear_line_x = road_center_x + clear_line_offset_x
         clear_line_side = "right"
+        if right_boundary_x is not None:
+            clear_line_x = float(right_boundary_x)
     elif release_direction < 0:
-        clear_line_x = road_center_x - clear_line_offset_x
         clear_line_side = "left"
+        if left_boundary_x is not None:
+            clear_line_x = float(left_boundary_x)
+
+    line_reached = False
+    if clear_line_x is not None:
+        if release_direction > 0:
+            line_reached = bottom_left_x >= clear_line_x
+        elif release_direction < 0:
+            line_reached = bottom_right_x <= clear_line_x
 
     if near_bottom:
-        if enough_area and not max_released:
+        if enough_area and (not max_released or not line_reached):
             if not active:
                 stop_started_at = now
             active = True
+            if not line_reached:
+                max_released = False
     elif not active:
         stop_started_at = None
     miss_frames = 0
-
-    line_reached = False
-    if release_direction > 0:
-        line_reached = bottom_left_x >= clear_line_x
-    elif release_direction < 0:
-        line_reached = bottom_right_x <= clear_line_x
 
     movement_confirmed = (
         active and
@@ -1832,10 +1836,6 @@ def seg_worker(core_id, worker_id=0):
                     release_xs = []
                     if person_clear_line_x is not None and person_clear_line_side in ("left", "right"):
                         release_xs.append(float(person_clear_line_x))
-                    else:
-                        center_x = float(target_w) / 2.0 if person_road_center_x is None else float(person_road_center_x)
-                        offset_x = float(getattr(config, "PERSON_CLEAR_LINE_OFFSET_X", 18.0))
-                        release_xs.extend([center_x - offset_x, center_x + offset_x])
                     for release_x in release_xs:
                         line_x = int(round(float(release_x) * scale_x))
                         line_x = max(0, min(rendered_img.shape[1] - 1, line_x))
@@ -2335,13 +2335,19 @@ def serial_control_thread():
             throttled_log(
                 "person_stop_detail",
                 (
-                f">>> 行人: 停车待放行 area={person_area_text} "
-                    f"dist={person_dist_text} center={road_center_text} clear={person_clear_frames} cutoff_y={cutoff_line_text}"
+                    f">>> 行人: 停车待放行 area={person_area_text} "
+                    f"dist={person_dist_text} left={left_boundary_text} right={right_boundary_text} "
+                    f"line={clear_line_text} side={person_clear_line_side or '无'} "
+                    f"center={road_center_text} clear={person_clear_frames} cutoff_y={cutoff_line_text}"
                 ),
                 state=(
                     "stop_wait_release",
                     person_area_text,
                     person_dist_text,
+                    left_boundary_text,
+                    right_boundary_text,
+                    clear_line_text,
+                    person_clear_line_side,
                     person_clear_frames,
                 ),
                 min_interval=float(getattr(config, "LOG_INTERVAL_PERSON_STOP_DETAIL", 1.0)),

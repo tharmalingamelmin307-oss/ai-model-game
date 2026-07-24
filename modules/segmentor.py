@@ -2026,11 +2026,12 @@ class RoadSegmentor:
         return 0
 
     def _resolve_preferred_turn(self, stone_branch_side, turn_intent=-1):
-        """得到最终分支选择：石头避让优先；没有石头时使用 OCR/LLM 语义."""
-        if stone_branch_side == -1:
-            return 1
-        if stone_branch_side == 1:
-            return -1
+        """得到最终分支选择；stone 避让只在配置打开时覆盖路线方向."""
+        if bool(getattr(config, "STONE_BRANCH_AVOIDANCE_ENABLED", True)):
+            if stone_branch_side == -1:
+                return 1
+            if stone_branch_side == 1:
+                return -1
         if int(turn_intent) in (-1, 1):
             return int(turn_intent)
         return -1
@@ -2136,7 +2137,7 @@ class RoadSegmentor:
         return mixed, float(avoid_weight)
 
     def _build_boundary_inset_path(self, base_path, boundary, inset_x, w_seg):
-        """把控制基准切到指定边界附近；负 inset 表示边界外侧."""
+        """把控制基准切到指定边界向中线内收后的路径."""
         base = np.array(base_path, dtype=np.float32).reshape((-1, 2))
         if len(base) < 2 or boundary is None:
             return base, False
@@ -2145,14 +2146,11 @@ class RoadSegmentor:
         if boundary_xs is None or len(boundary_xs) != len(base):
             return base, False
 
-        inset = max(-20.0, float(inset_x))
+        inset = max(0.0, float(inset_x))
         to_center = base[:, 0] - boundary_xs
         direction = np.sign(to_center)
         direction[direction == 0.0] = 1.0
-        if inset >= 0.0:
-            step = np.minimum(np.abs(to_center), inset)
-        else:
-            step = np.full_like(boundary_xs, inset)
+        step = np.minimum(np.abs(to_center), inset)
 
         planned = base.copy()
         planned[:, 0] = boundary_xs + direction * step
@@ -2338,13 +2336,13 @@ class RoadSegmentor:
         rows_to_car = max(0.0, path_bottom_y - center_y)
         start_rows = max(0.0, float(getattr(config, "CAR_AVOIDANCE_START_BOUNDARY_ROWS", 115.0)))
         near_rows = max(0.0, float(getattr(config, "CAR_AVOIDANCE_NEAR_BOUNDARY_ROWS", 60.0)))
-        normal_inset = max(-20.0, float(getattr(config, "CAR_AVOIDANCE_LEFT_BOUNDARY_INSET", 20.0)))
-        near_inset = max(-20.0, float(getattr(config, "CAR_AVOIDANCE_NEAR_LEFT_BOUNDARY_INSET", normal_inset)))
+        normal_inset = max(0.0, float(getattr(config, "CAR_AVOIDANCE_LEFT_BOUNDARY_INSET", 20.0)))
+        near_inset = max(0.0, float(getattr(config, "CAR_AVOIDANCE_NEAR_LEFT_BOUNDARY_INSET", normal_inset)))
 
         if rows_to_car > start_rows:
             return 0.0, (center_y, path_bottom_y), False
 
-        # 进入避障窗口后走左边界附近路径；负数会让参考线略靠左，最多 -20 像素。
+        # 进入避障窗口后走左边界内收路径。
         inset = near_inset if rows_to_car <= near_rows else normal_inset
         return float(inset), (center_y, path_bottom_y), True
 
@@ -2729,7 +2727,10 @@ class RoadSegmentor:
 
                         if choice_left is not None and choice_right is not None:
                             candidate_pool = [choice_left, choice_right]
-                            stone_branch_side = self._estimate_stone_branch_side(planning_items, candidate_pool)
+                            if bool(getattr(config, "STONE_BRANCH_AVOIDANCE_ENABLED", True)):
+                                stone_branch_side = self._estimate_stone_branch_side(planning_items, candidate_pool)
+                            else:
+                                stone_branch_side = 0
                             if stone_branch_side == -1:
                                 best_candidate = choice_right
                                 route_boundary_side = "right"

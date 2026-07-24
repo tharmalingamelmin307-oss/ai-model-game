@@ -1104,10 +1104,7 @@ PERSON_CLEAR_MOVE_FRAMES = 2
 PERSON_CLEAR_MIN_MOVE_DX = 3.0
 # 兼容旧参数名；如果外部脚本还在改旧名，也能继续生效。
 PERSON_CLEAR_MIN_RIGHT_DX = PERSON_CLEAR_MIN_MOVE_DX
-# 行人横向放行线相对画面中线的偏移量，单位 TARGET_RES 像素。
-# 这条线先不默认绘制，留作后续调试用。
-PERSON_CLEAR_LINE_OFFSET_X = 55.0
-# 行人横向放行线在预览图上的颜色和粗细。
+# 行人横向放行线使用当前道路左右边界；下面是预览图上的颜色和粗细。
 PERSON_CLEAR_LINE_COLOR = (0, 255, 255)
 PERSON_CLEAR_LINE_THICKNESS = 2
 # 行人停车截至横线在预览图上的颜色和粗细。
@@ -1306,8 +1303,10 @@ SEG_PATH_TEMPORAL_MIN_OVERLAP_POINTS = 4
 # 当前帧没搜到路径时，短暂沿用上一帧路径的最大帧数。
 SEG_PATH_HOLD_MISSING_FRAMES = 2
 
+# 是否允许 stone 检测结果覆盖当前岔路方向。
+# 关闭后岔路只按路牌/固定序列/默认方向走，避免 stone 误检导致第一圈乱拐。
+STONE_BRANCH_AVOIDANCE_ENABLED = False
 # 估计石头更靠近左/右分支时，左右候选路径至少要拉开这么多像素才认为可比较。
-# 当前代码里石头主要还用于调试显示，这个参数暂时不直接影响正式分支选择。
 STONE_BRANCH_MIN_SEP = 12
 
 # 自底向上路径搜索参数。
@@ -1411,10 +1410,9 @@ TRACK_WIDTH_LOG_INTERVAL = 1.5
 # 让左边界尽量维持在画面中间；停车时避车状态机冻结，恢复后继续。
 # ---------------------------------------------------------------------------
 CAR_AVOIDANCE_ENABLED = True
-# 控制器追左边界附近：0 表示追左边界本身，负数表示追左边界外侧。
-# 代码里负方向最多限制到 -20 像素，避免参考线被拉得过靠外。
-CAR_AVOIDANCE_LEFT_BOUNDARY_INSET = -5.0
-CAR_AVOIDANCE_NEAR_LEFT_BOUNDARY_INSET = -5.0
+# 控制器追左边界本身，0 表示不再从左边界额外向中线内收。
+CAR_AVOIDANCE_LEFT_BOUNDARY_INSET = 0.0
+CAR_AVOIDANCE_NEAR_LEFT_BOUNDARY_INSET = 0.0
 # car 底部中心距离画面底部超过这个行数时，只锁定跟踪，不让避障拉线接管。
 # 这个值越大，越早开始让避障拉线接管。
 CAR_AVOIDANCE_START_BOUNDARY_ROWS = 170.0
