@@ -27,7 +27,7 @@ from pathlib import Path
 # 10. 主流程运行时参数
 # 11. 场景停车、行人、交通灯与 OCR 参数
 # 12. 路径搜索、稳定与调试参数
-# 13. 车辆避障、金币规划与可视化参数
+# 13. 车辆避障与可视化参数
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -69,7 +69,7 @@ JPEG_QUALITY = 75
 # 分割模型路径。
 # 当前主控链路依赖这个模型输出赛道 mask，所以它直接影响路径规划和转向控制。
 # 这里的模型默认输入尺寸是 SEG_SIZE，对应下面的 416x160。
-SEG_MODEL = str(PROJECT_ROOT / "models/seg/segv5/segv5_416x160_argmax_rk3588_int8.rknn")
+SEG_MODEL = str(PROJECT_ROOT / "models/seg/segv6/segv6_416x160_argmax_rk3588_int8.rknn")
 
 # 目标检测模型路径。
 # 当前使用的是 PP-YOLOE 的 RKNN 版本，输出后处理由 modules/detector.py 负责。
@@ -136,6 +136,7 @@ YOLO_PAUSE_OCR_TIMEOUT = 1.5
 # 检测模型类别名列表。
 # 顺序必须和训练/导出 RKNN 时的类别顺序完全一致，不能只改名字不改模型。
 # 否则会出现“框是对的，但类别解释全错”的问题。
+# "coin" 只作为模型类别占位保留，当前主流程不做金币规划。
 CLASS_NAMES = [
     "car",                  # 0
     "coin",                 # 1
@@ -191,7 +192,8 @@ SIGN_LLM_ENABLED = True
 # 语义岔路决策模式:
 # - "llm_once": 第一次看到岔路牌即第二圈，OCR + 千帆判断；第三圈再次看到岔路牌时取反
 # - "fixed_sequence": 不跑路牌 OCR/千帆；第一圈忽略岔路；第二、三圈按固定序列走
-SIGN_ROUTE_DECISION_MODE = "llm_once"
+# SIGN_ROUTE_DECISION_MODE = "llm_once"
+SIGN_ROUTE_DECISION_MODE = "fixed_sequence"
 # fixed_sequence 模式下是否跳过第一次分割岔路事件。
 # 路牌识别模式第一圈没有路牌，所以第一次看到路牌不能跳过。
 SIGN_ROUTE_SKIP_FIRST_PASS = True
@@ -201,7 +203,7 @@ SIGN_ROUTE_SKIP_FIRST_PASS = True
 SIGN_ROUTE_FIXED_FIRST_CHOICE = "LEFT"
 # 触发语义路牌停车采样的 sign 框面积阈值，单位是 TARGET_RES 坐标系像素面积。
 # 它会和 SIGN_LLM_TRIGGER_DIST、SIGN_LLM_TRIGGER_EDGE_MARGIN_RATIO 同时满足后才停车。
-SIGN_LLM_TRIGGER_AREA = 16000
+SIGN_LLM_TRIGGER_AREA = 12000
 # 触发语义路牌停车采样的 sign 截止距离，单位是 TARGET_RES 像素。
 # 路牌框底边距离画面底部小于等于该值，才认为已经足够近，可以停车采样。
 # 调大：更早停车；调小：更靠近再停车。
@@ -209,7 +211,7 @@ SIGN_LLM_TRIGGER_DIST = 500
 # 硬性停车采样条件：Y 岔路特征点距离分割平面底部小于等于该行数时，
 # 若当前帧有不贴边的 sign 框，立刻停车开始路牌 OCR/千帆，不再受 sign 面积/高度限制。
 # 单位是 SEG_SIZE 坐标系像素行。
-SIGN_LLM_FORK_POINT_TRIGGER_ROWS = 100
+SIGN_LLM_FORK_POINT_TRIGGER_ROWS = 130
 # 停车后希望采集的有效 OCR 样本数量。
 # 收满后会提交给千帆；如果超时，也可能提前提交已有样本。
 SIGN_LLM_OCR_SAMPLES = 5
@@ -886,7 +888,7 @@ CONTROL_C_DEBUG_LOG_INTERVAL = 0.5
 # ---------------------------------------------------------------------------
 # 转向模式增益
 # ---------------------------------------------------------------------------
-# 无目标控制增益：只在没有金币、没有避障车时乘到 steer_signal 上。
+# 无目标控制增益：只在没有避障车时乘到 steer_signal 上。
 # 可用于补偿无目标控制行段变短、归一化后转向偏软等情况。
 STEER_SIGNAL_NO_TARGET_GAIN = 1.0
 # ---------------------------------------------------------------------------
@@ -981,12 +983,7 @@ DEFAULT_CONTROL_DATA = {
     "car_avoidance_state_paused": False,
     "car_avoidance_left_boundary_error": None,
     "car_avoidance_left_boundary_x": None,
-    "car_avoidance_left_boundary_p_pwm": 0.0,
-    "car_avoidance_left_boundary_d_pwm": 0.0,
     "car_avoidance_boundary_inset_x": 0.0,
-    "car_avoidance_boundary_path_active": False,
-    "car_avoidance_pd_pwm": 0.0,
-    "car_avoidance_servo_bias_pwm": 0.0,
     "debug_keyboard_enabled": False,
     "debug_keyboard_stop_active": False,
     "debug_keyboard_message": "",
@@ -1410,85 +1407,23 @@ TRACK_WIDTH_LOG_INTERVAL = 1.5
 # 车辆避障控制参数
 # 这组参数工作在分割输入 `SEG_SIZE = 416x160` 的坐标系里。
 # y 方向是 160 行高度，所有 `*_ROWS` 都是“离底部多少行”的意思。
-# 当前贴回旧版车辆避障：默认走“距离 PWM 偏置 + 左边界 P 抵消”。
-# 如果关闭 CAR_AVOIDANCE_SERVO_BIAS_ENABLED，才会回到“左边界内收路径 + Stanley”。
+# 当前方案：检测到 car 后不叠加舵机偏置，只把控制参考线切到左边界，
+# 让左边界尽量维持在画面中间；停车时避车状态机冻结，恢复后继续。
 # ---------------------------------------------------------------------------
 CAR_AVOIDANCE_ENABLED = True
-# 是否启用车辆专用 PD 控制。
-CAR_AVOIDANCE_PD_ENABLED = True
-# 左边界横向 PD 的车身参考位置比例。
-# error = 固定采样窗口内平均(left_boundary_x + inset_x) - image_center_x。
-CAR_AVOIDANCE_LEFT_BOUNDARY_TARGET_RATIO = 0.50
-# 车辆 PD 固定采样行；会在 sample_y ± half_window 内平均左边界/中线。
-CAR_AVOIDANCE_PD_SAMPLE_Y = 110.0
-CAR_AVOIDANCE_PD_SAMPLE_HALF_WINDOW = 10.0
-CAR_AVOIDANCE_LEFT_BOUNDARY_PD_DEADBAND = 4.0
-# 横向 PD 绕车：固定行处巡“左边界向中线内收”的目标点。
-CAR_AVOIDANCE_LEFT_BOUNDARY_PD_P_GAIN = 0.3
-CAR_AVOIDANCE_LEFT_BOUNDARY_PD_D_GAIN = 0.05
-CAR_AVOIDANCE_LEFT_BOUNDARY_PD_MAX_PWM = 58.0
-CAR_AVOIDANCE_LEFT_BOUNDARY_PD_REVERSE_MAX_PWM = 30.0
-CAR_AVOIDANCE_LEFT_BOUNDARY_PD_MAX_STEP_UP = 14.0
-CAR_AVOIDANCE_LEFT_BOUNDARY_PD_MAX_STEP_DOWN = 28.0
-CAR_AVOIDANCE_LEFT_BOUNDARY_PD_POST_PASS_ROWS = 30.0
-CAR_AVOIDANCE_LEFT_BOUNDARY_PD_POST_PASS_ENTER_ERROR = 70.0
-CAR_AVOIDANCE_LEFT_BOUNDARY_PD_POST_PASS_EXIT_ERROR = -20.0
-CAR_AVOIDANCE_LEFT_BOUNDARY_PD_POST_PASS_HOLD_FRAMES = 6
-# 纯拉线避车：控制器追左边界本身，让左边界尽量维持在画面中间。
-CAR_AVOIDANCE_LEFT_BOUNDARY_INSET = 0.0
-CAR_AVOIDANCE_NEAR_LEFT_BOUNDARY_INSET = 0.0
-# servo_bias 模式下也给整段避车状态拉一条控制参考线；纯拉线模式下此项不参与。
-CAR_AVOIDANCE_SERVO_BIAS_PATH_ENABLED = True
-# 0 表示不用拉线，1 表示完全切到边界内收线；中间值更稳。
-CAR_AVOIDANCE_SERVO_BIAS_PATH_BLEND = 0.45
-# 关闭最终舵机 PWM 偏置，避车只通过控制参考线完成。
-CAR_AVOIDANCE_SERVO_BIAS_ENABLED = False
-CAR_AVOIDANCE_SERVO_BIAS_MODE = "distance_bias"
-CAR_AVOIDANCE_SERVO_BIAS_START_ROWS = 150.0
-CAR_AVOIDANCE_SERVO_BIAS_NEAR_ROWS = 110.0
-CAR_AVOIDANCE_SERVO_BIAS_MIN_PWM = 20.0
-CAR_AVOIDANCE_SERVO_BIAS_MAX_PWM = 60.0
-CAR_AVOIDANCE_SERVO_BIAS_SIGN = 1.0
-CAR_AVOIDANCE_SERVO_BIAS_D_GAIN_SCALE = 0.0
-# 左边界超过画面中线时，用 P 修正抵消一部分避障 PWM，避免持续向外冲。
-CAR_AVOIDANCE_LEFT_BOUNDARY_P_DEADBAND = 8.0
-CAR_AVOIDANCE_LEFT_BOUNDARY_P_GAIN = 1.2
-CAR_AVOIDANCE_LEFT_BOUNDARY_P_MAX_PWM = 120.0
-CAR_AVOIDANCE_LEFT_BOUNDARY_P_REVERSE_MAX_PWM = 55.0
-CAR_AVOIDANCE_LEFT_BOUNDARY_P_RELEASE_KEEP_FRAMES = 0
-CAR_AVOIDANCE_LEFT_BOUNDARY_P_RELEASE_DECAY = 0.25
-# 左边界误差保持区间：低于 LOW 时保留/补一点正向托回，高于 HIGH 时逐步反向拉回。
-CAR_AVOIDANCE_LEFT_BOUNDARY_RANGE_LOW_ERROR = -20.0
-CAR_AVOIDANCE_LEFT_BOUNDARY_RANGE_HIGH_ERROR = 35.0
-CAR_AVOIDANCE_LEFT_BOUNDARY_RANGE_FULL_LOW_ERROR = -60.0
-# 左边界误差滤波；越大越稳，越小越灵敏。
-CAR_AVOIDANCE_LEFT_BOUNDARY_ERROR_EMA_ALPHA = 0.55
-# 左边界被拉到太左时，即使原避障偏置已经归零，也给一点正向 PWM 托回中间。
-CAR_AVOIDANCE_LEFT_BOUNDARY_FORWARD_RECOVER_GAIN = 0.6
-CAR_AVOIDANCE_LEFT_BOUNDARY_FORWARD_RECOVER_MAX_PWM = 25.0
-# 左边界回到保持区间内后，反向拉回 PWM 的释放速度，避免继续向左拖。
-CAR_AVOIDANCE_LEFT_BOUNDARY_REVERSE_RELEASE_DECAY = 0.2
-CAR_AVOIDANCE_LEFT_BOUNDARY_REVERSE_RELEASE_DEADBAND = 4.0
-# 左边界在保持区间内时，基础避障偏置的释放速度。
-CAR_AVOIDANCE_LEFT_BOUNDARY_NEUTRAL_RELEASE_DECAY = 0.85
-# 避障 PWM 偏置每帧最大变化；CLEARING 用斜坡：刚丢目标慢收，随后逐步加快回中。
-CAR_AVOIDANCE_SERVO_BIAS_STEP_MAX_PWM = 22.0
-CAR_AVOIDANCE_SERVO_BIAS_CLEARING_STEP_START_PWM = 4.0
-CAR_AVOIDANCE_SERVO_BIAS_CLEARING_STEP_END_PWM = 16.0
-CAR_AVOIDANCE_SERVO_BIAS_CLEARING_STEP_RAMP_FRAMES = 10
-CAR_AVOIDANCE_SERVO_BIAS_CLEARING_STEP_MAX_PWM = CAR_AVOIDANCE_SERVO_BIAS_CLEARING_STEP_END_PWM
-CAR_AVOIDANCE_CLEARING_REVERSE_MAX_PWM = 35.0
+# 控制器追左边界附近：0 表示追左边界本身，负数表示追左边界外侧。
+# 代码里负方向最多限制到 -20 像素，避免参考线被拉得过靠外。
+CAR_AVOIDANCE_LEFT_BOUNDARY_INSET = -5.0
+CAR_AVOIDANCE_NEAR_LEFT_BOUNDARY_INSET = -5.0
 # car 底部中心距离画面底部超过这个行数时，只锁定跟踪，不让避障拉线接管。
 # 这个值越大，越早开始让避障拉线接管。
 CAR_AVOIDANCE_START_BOUNDARY_ROWS = 170.0
 # car 底部中心距离画面底部不超过这个行数时，使用近距离漏检帧数。
 CAR_AVOIDANCE_NEAR_BOUNDARY_ROWS = 110.0
-# car 底部中心进入这个贴底窗口后，认为正在通过/已通过，主动进入 CLEARING 回中线。
-CAR_AVOIDANCE_PASS_ROWS = 15.0
 # car 跟踪锁定。锁定主要看车框底部中心点的连续性，面积只做异常框过滤。
 # 连续命中后进入避障；短暂漏检会继续沿用锁定目标，超过允许帧数后进入 CLEARING。
 # 新 car 目标需要连续命中多少帧才锁定。
-CAR_AVOIDANCE_LOCK_HIT_FRAMES = 1
+CAR_AVOIDANCE_LOCK_HIT_FRAMES = 3
 # 锁定目标和新检测框匹配的搜索半径。
 CAR_AVOIDANCE_SEARCH_RADIUS = 90.0
 # 目标漏检期间，搜索半径随漏检帧数增加的增益。
@@ -1506,19 +1441,13 @@ CAR_AVOIDANCE_MIN_SCORE = 0.0
 CAR_AVOIDANCE_MAX_AREA = 0.0
 # 避障退出状态机。
 # 车丢失后不立刻回正，而是先进入 CLEARING。
-# CLEARING 里从近距离内收 10 开始，按赛道半宽逐步回到正常中线。
+# CLEARING 里把最后一次避车参考线逐帧混回正常循线路径。
 CAR_AVOIDANCE_CLEARING_MISS_FRAMES = 0
 # CLEARING 衰减帧数。
 CAR_AVOIDANCE_CLEARING_DECAY_FRAMES = 20
-# CLEARING 硬退出上限，避免丢车后长期挂在 PD 状态。
+# CLEARING 硬退出上限，避免丢车后长期挂在避车状态。
 CAR_AVOIDANCE_CLEARING_MAX_FRAMES = 22
-# servo bias 已基本归零后提前退出 CLEARING，恢复正常循线控制。
-CAR_AVOIDANCE_CLEARING_MIN_BIAS_DONE_FRAMES = 5
-CAR_AVOIDANCE_CLEARING_DONE_BIAS_PWM = 2.0
-# 丢车瞬间如果最后舵量已经在反向拉回，先保持几帧，防止刚过障碍就松手丢线。
-CAR_AVOIDANCE_CLEARING_PULLBACK_HOLD_FRAMES = 5
-CAR_AVOIDANCE_CLEARING_PULLBACK_HOLD_MIN_PWM = 6.0
-# 避车 PWM 偏移日志间隔。
+# 避车详细日志间隔。
 LOG_INTERVAL_CAR_AVOIDANCE_DETAIL = 1.0
 # 主分割调试图绘制风格。
 # 最终路径线颜色。
@@ -1547,15 +1476,6 @@ SEG_DEBUG_BOUNDARY_THICKNESS = 2
 SEG_DEBUG_BOTTOM_MID_COLOR = (255, 255, 0)
 # 底部车身参考点半径。
 SEG_DEBUG_BOTTOM_MID_RADIUS = 4
-# 兼容旧文件读取：coin 追踪/规划已删除，这些值只防止混版本运行时报缺配置。
-COIN_PATH_ENABLED = False
-COIN_PATH_ROI_BOTTOM_STRICT_ROWS = 0.0
-SEG_DEBUG_COIN_PATH_ENABLED = False
-SEG_DEBUG_COIN_PATH_COLOR = (0, 255, 255)
-SEG_DEBUG_COIN_PATH_DOT_RADIUS = 4
-SEG_DEBUG_COIN_BOTTOM_STRICT_LINE_ENABLED = False
-SEG_DEBUG_COIN_BOTTOM_STRICT_LINE_COLOR = (0, 0, 255)
-SEG_DEBUG_COIN_BOTTOM_STRICT_LINE_THICKNESS = 1
 # Y 岔路分界线颜色。
 SEG_DEBUG_FORK_DIVIDER_COLOR = (0, 255, 0)
 # Y 岔路分界线粗细。
@@ -1587,8 +1507,6 @@ SEG_DEBUG_TEXT_POS_CTRL = (5, 36)
 SEG_DEBUG_TEXT_POS_STONE = (5, 54)
 # 分叉/汇合调试文本位置。
 SEG_DEBUG_TEXT_POS_BRANCH = (5, 72)
-# 金币调试文本位置。
-SEG_DEBUG_TEXT_POS_COIN = (5, 90)
 # FPS 文本颜色。
 SEG_DEBUG_TEXT_COLOR_FPS = (0, 255, 0)
 # 控制量文本颜色。
@@ -1597,5 +1515,3 @@ SEG_DEBUG_TEXT_COLOR_CTRL = (0, 255, 255)
 SEG_DEBUG_TEXT_COLOR_STONE = (0, 200, 255)
 # 分叉/汇合文本颜色。
 SEG_DEBUG_TEXT_COLOR_BRANCH = (255, 200, 0)
-# 金币文本颜色。
-SEG_DEBUG_TEXT_COLOR_COIN = (0, 255, 255)
