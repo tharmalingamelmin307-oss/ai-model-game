@@ -723,16 +723,104 @@ def get_preview_host():
 def preview_index_html():
     return '''
     <html>
-    <body style="background:#000;text-align:center;margin:0;" tabindex="0">
-        <img src="/video_feed" style="max-width:100%; height:100vh; image-rendering: pixelated;">
+    <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            html, body { background:#000; margin:0; width:100%; height:100%; overflow:hidden; }
+            body { text-align:center; position:relative; }
+            #preview { width:100%; height:100vh; object-fit:contain; image-rendering:pixelated; }
+            #debug-panel {
+                position:fixed; left:10px; top:10px; z-index:2; width:220px;
+                padding:10px; color:#fff; background:rgba(20,20,20,.88);
+                border:1px solid #666; border-radius:6px; text-align:left;
+                font:14px sans-serif;
+            }
+            #debug-panel h3 { margin:0 0 8px; font-size:15px; }
+            .param { display:flex; align-items:center; gap:6px; margin:6px 0; }
+            .param label { width:78px; }
+            .param input { width:92px; box-sizing:border-box; color:#111; }
+            #debug-panel button {
+                margin:6px 4px 0 0; padding:4px 9px; color:#fff;
+                background:#333; border:1px solid #888; border-radius:4px;
+            }
+            #debug-status { min-height:18px; margin-top:5px; color:#8f8; font-size:12px; }
+        </style>
+    </head>
+    <body tabindex="0">
+        <img id="preview" src="/video_feed">
+        <div id="debug-panel">
+            <h3>B 控制调试</h3>
+            <div class="param"><label for="kp">Kp</label><input id="kp" type="number" step="0.01"></div>
+            <div class="param"><label for="kd">Kd</label><input id="kd" type="number" step="0.001"></div>
+            <div class="param"><label for="psi">Psi</label><input id="psi" type="number" step="0.01"></div>
+            <div class="param"><label for="speed">电机速度</label><input id="speed" type="number" step="1"></div>
+            <button type="button" onclick="applyParams()">应用参数</button>
+            <button type="button" onclick="driveStart()">发车</button>
+            <button type="button" onclick="driveStop()">停车</button>
+            <div id="debug-status"></div>
+        </div>
         <script>
+        const fields = ['kp', 'kd', 'psi', 'speed'];
+        function setStatus(text, ok) {
+            const node = document.getElementById('debug-status');
+            node.textContent = text || '';
+            node.style.color = ok ? '#8f8' : '#f88';
+        }
+        function fillParams(values) {
+            fields.forEach(function (name) {
+                if (values && values[name] !== undefined) {
+                    document.getElementById(name).value = values[name];
+                }
+            });
+        }
+        function loadParams() {
+            fetch('/debug_control_params')
+                .then(function (response) { return response.json(); })
+                .then(function (data) {
+                    if (!data.ok) throw new Error(data.error || '读取失败');
+                    fillParams(data.values);
+                })
+                .catch(function (error) { setStatus(error.message, false); });
+        }
+        function applyParams() {
+            const values = {};
+            fields.forEach(function (name) {
+                values[name] = Number(document.getElementById(name).value);
+            });
+            fetch('/debug_control_params', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({values: values})
+            })
+            .then(function (response) {
+                return response.json().then(function (data) {
+                    if (!response.ok || !data.ok) throw new Error(data.error || '应用失败');
+                    return data;
+                });
+            })
+            .then(function (data) {
+                fillParams(data.values);
+                setStatus('已应用', true);
+            })
+            .catch(function (error) { setStatus(error.message, false); });
+        }
+        function driveStart() {
+            fetch('/debug_drive/start', { method: 'POST' });
+            setStatus('发车', true);
+        }
+        function driveStop() {
+            fetch('/debug_drive/stop', { method: 'POST' });
+            setStatus('停车', true);
+        }
+        loadParams();
         document.body.focus();
         document.addEventListener('keydown', function (event) {
+            if (event.target && event.target.tagName === 'INPUT') return;
             const key = String(event.key || '').toLowerCase();
             if (key === 'b') {
-                fetch('/debug_drive/start', { method: 'POST' });
+                driveStart();
             } else if (key === 'e') {
-                fetch('/debug_drive/stop', { method: 'POST' });
+                driveStop();
             }
         });
         </script>

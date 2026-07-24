@@ -23,7 +23,7 @@ import threading
 import serial
 from queue import Queue
 from multiprocessing import Process, Queue as MPQueue, shared_memory, resource_tracker
-from flask import Flask, Response, render_template_string
+from flask import Flask, Response, render_template_string, request
 
 import config
 from modules.debug_tools import (
@@ -2505,6 +2505,62 @@ def ai_producer_thread():
 # ==============================================================================
 # Flask 推流
 # ==============================================================================
+def _debug_control_param_values():
+    """返回网页调试面板当前使用的 B 控制参数和速度."""
+    return {
+        "kp": float(getattr(config, "STANLEY_LATERAL_GAIN", 0.0)),
+        "kd": float(getattr(config, "STANLEY_LATERAL_D_GAIN", 0.0)),
+        "psi": float(getattr(config, "STANLEY_HEADING_GAIN", 0.0)),
+        "speed": int(round(float(getattr(config, "CONTROL_MAX_SPEED", 0.0)))),
+    }
+
+
+def _apply_debug_control_params(payload):
+    """校验并应用网页调试面板提交的参数."""
+    if not isinstance(payload, dict):
+        raise ValueError("参数格式错误")
+
+    values = payload.get("values", payload)
+    if not isinstance(values, dict):
+        raise ValueError("参数格式错误")
+
+    limits = {
+        "kp": (0.0, 3.0),
+        "kd": (0.0, 1.0),
+        "psi": (0.0, 5.0),
+        "speed": (0.0, 100.0),
+    }
+    parsed = {}
+    for name, (lower, upper) in limits.items():
+        if name not in values:
+            continue
+        try:
+            value = float(values[name])
+        except (TypeError, ValueError):
+            raise ValueError(f"{name} 不是数字")
+        if not np.isfinite(value):
+            raise ValueError(f"{name} 不是有效数字")
+        parsed[name] = max(lower, min(upper, value))
+
+    if not parsed:
+        raise ValueError("没有可更新的参数")
+
+    if "kp" in parsed:
+        config.STANLEY_LATERAL_GAIN = float(parsed["kp"])
+    if "kd" in parsed:
+        config.STANLEY_LATERAL_D_GAIN = float(parsed["kd"])
+    if "psi" in parsed:
+        config.STANLEY_HEADING_GAIN = float(parsed["psi"])
+    if "speed" in parsed:
+        speed = int(round(parsed["speed"]))
+        config.CONTROL_MIN_SPEED = speed
+        config.CONTROL_MAX_SPEED = speed
+        # B 算法的速度估计同步更新，否则调速后横向纠偏比例会不一致。
+        config.STANLEY_SPEED_ESTIMATE = float(speed)
+
+    return _debug_control_param_values()
+
+
 @app.route('/')
 def index():
     return render_template_string(preview_index_html())
@@ -2528,6 +2584,19 @@ def debug_drive_stop():
         "manual_stop_active": bool(state.get("manual_stop_active", False)),
         "message": str(state.get("message", "")),
     }
+
+
+@app.route('/debug_control_params', methods=['GET', 'POST'])
+def debug_control_params():
+    if request.method == 'GET':
+        return {"ok": True, "values": _debug_control_param_values()}
+
+    payload = request.get_json(silent=True)
+    try:
+        values = _apply_debug_control_params(payload)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc), "values": _debug_control_param_values()}, 400
+    return {"ok": True, "values": values}
 
 
 @app.route('/video_feed')
