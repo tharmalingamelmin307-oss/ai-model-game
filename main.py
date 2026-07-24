@@ -636,6 +636,7 @@ def reset_sign_route_state(state, next_state="IDLE"):
     state["sign_route_drive_started_at"] = None
     state["sign_route_fork_entered_at"] = None
     state["sign_route_single_road_frames"] = 0
+    state["sign_route_sign_gone_frames"] = 0
     state["sign_route_api_submitted"] = False
     state["sign_llm_ocr_inflight"] = False
     state["sign_llm_ocr_inflight_started_at"] = None
@@ -809,6 +810,24 @@ def reset_sign_route_after_drive(state):
     reset_sign_route_state(state, next_state=next_state)
 
 
+def update_wait_sign_gone_state(state, route_trigger_rect):
+    """等待当前路牌稳定离开，避免一帧漏检导致同一块牌重复触发."""
+    if str(state.get("sign_route_state", "IDLE")) != "WAIT_SIGN_GONE":
+        return str(state.get("sign_route_state", "IDLE"))
+    if route_trigger_rect is not None:
+        state["sign_route_sign_gone_frames"] = 0
+        return "WAIT_SIGN_GONE"
+
+    gone_frames = int(state.get("sign_route_sign_gone_frames", 0)) + 1
+    state["sign_route_sign_gone_frames"] = gone_frames
+    need_frames = max(1, int(getattr(config, "SIGN_ROUTE_SIGN_GONE_EXIT_FRAMES", 8)))
+    if gone_frames >= need_frames:
+        state["sign_route_state"] = "IDLE"
+        state["sign_route_sign_gone_frames"] = 0
+        return "IDLE"
+    return "WAIT_SIGN_GONE"
+
+
 def update_sign_route_after_seg(state, y_fork_active):
     """根据分割岔路状态推进路牌路线生命周期."""
     now = time.monotonic()
@@ -914,6 +933,7 @@ def maybe_submit_sign_llm_job(state, frame_id, force=False):
                     min_interval=0.0,
                 )
                 clear_sign_llm_state(state, keep_completed=False)
+                state["sign_route_pass_index"] = 3
                 reset_sign_route_state(state, next_state="WAIT_SIGN_GONE")
                 return False
             throttled_log(
@@ -1085,6 +1105,7 @@ def drain_sign_llm_results():
                 global_control_data["sign_llm_result"] = ""
                 clear_sign_llm_state(global_control_data, keep_completed=True)
                 global_control_data["sign_llm_error"] = fallback_error
+                global_control_data["sign_route_pass_index"] = 3
                 reset_sign_route_state(global_control_data, next_state="WAIT_SIGN_GONE")
 
         if result in ("LEFT", "RIGHT"):
@@ -1223,13 +1244,11 @@ def yolo_worker(core_id=None, worker_id=0):
             sign_llm_collecting_now = False
             with data_lock:
                 if sign_route_uses_llm():
-                    route_state = str(global_control_data.get("sign_route_state", "IDLE"))
-                    if route_state == "WAIT_SIGN_GONE" and route_trigger_rect is None:
-                        global_control_data["sign_route_state"] = "IDLE"
-                        route_state = "IDLE"
+                    route_state = update_wait_sign_gone_state(global_control_data, route_trigger_rect)
                     if route_trigger_rect is not None and route_state == "IDLE":
                         pass_index = sign_route_pass_index(global_control_data)
                         first_choice = int(global_control_data.get("sign_route_first_choice", 0))
+                        llm_used = bool(global_control_data.get("sign_route_llm_used", False))
                         if pass_index == 2 and first_choice in (-1, 1):
                             reverse_choice = -first_choice
                             global_control_data["sign_route_pass_index"] = 3
@@ -1248,18 +1267,19 @@ def yolo_worker(core_id=None, worker_id=0):
                                 state=(first_choice, reverse_choice, int(frame_id)),
                                 min_interval=0.0,
                             )
-                        elif pass_index >= 3:
+                        elif llm_used or pass_index >= 3:
                             clear_sign_llm_state(global_control_data, keep_completed=True)
                             reset_sign_route_state(global_control_data, next_state="WAIT_SIGN_GONE")
                             throttled_log(
                                 "sign_route_llm_done_ignore",
-                                f"岔路路牌序列已完成，忽略后续路牌事件: frame={frame_id} rect={route_trigger_rect}",
-                                state=(pass_index, int(frame_id)),
+                                f"路牌识别已使用过，不再启动OCR/千帆: frame={frame_id} rect={route_trigger_rect}",
+                                state=(pass_index, llm_used, int(frame_id)),
                                 min_interval=0.0,
                             )
                         else:
                             if pass_index <= 0:
                                 global_control_data["sign_route_pass_index"] = 1
+                            global_control_data["sign_route_llm_used"] = True
                             global_control_data["sign_llm_frame_id"] = int(frame_id)
                             global_control_data["sign_route_state"] = "SIGN_STOP_COLLECT"
                             global_control_data["sign_route_locked_rect"] = route_trigger_rect
@@ -2217,13 +2237,13 @@ def serial_control_thread():
         car_boundary_inset_text = f"{float(car_avoidance_boundary_inset_x):.1f}"
         car_pd_text = f"{float(car_avoidance_pd_pwm):.1f}"
 
-        if car_avoidance_active and abs(float(car_avoidance_pd_pwm)) > 0.0:
+        if car_avoidance_active and (car_avoidance_state != "FOLLOW_LANE" or abs(float(car_avoidance_boundary_inset_x)) > 0.0):
             throttled_log(
-                "car_pd_detail",
-                f">>> 避车: state={car_avoidance_state} rows={car_rows_text} "
+                "car_avoid_detail",
+                f">>> 避车(B): state={car_avoidance_state} rows={car_rows_text} "
                 f"miss={car_miss_text} clear={car_clear_text} inset={car_boundary_inset_text} "
-                f"left_x={car_left_x_text} left_e={car_left_error_text} left_p={car_left_p_text} left_d={car_left_d_text} pd={car_pd_text}",
-                state=(car_avoidance_state, car_rows_text, car_miss_text, car_clear_text, car_boundary_inset_text, car_left_x_text, car_left_error_text, car_left_p_text, car_left_d_text, car_pd_text),
+                f"left_x={car_left_x_text} left_e={car_left_error_text}",
+                state=(car_avoidance_state, car_rows_text, car_miss_text, car_clear_text, car_boundary_inset_text, car_left_x_text, car_left_error_text),
                 min_interval=float(getattr(config, "LOG_INTERVAL_CAR_AVOIDANCE_DETAIL", 1.0)),
             )
 

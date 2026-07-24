@@ -2477,7 +2477,7 @@ class RoadSegmentor:
         return self.locked_car
 
     def _car_avoidance_distance_window(self, locked_car, base):
-        """判断锁定车辆是否进入 PD 接管距离窗口."""
+        """判断锁定车辆是否进入避障拉线接管距离窗口."""
         if locked_car is None:
             return None, False
         measurement = locked_car.get("measurement")
@@ -2559,6 +2559,15 @@ class RoadSegmentor:
                 w_seg,
                 miss_frames=int(self.locked_car_miss_frames),
             )
+            if debug.get("active") and left_boundary is not None:
+                car_avoid_path, path_ok = self._build_boundary_inset_path(
+                    base_path,
+                    left_boundary,
+                    float(debug.get("boundary_inset_x", 0.0)),
+                    w_seg,
+                )
+                if path_ok:
+                    return float(debug.get("boundary_inset_x", 0.0)), debug, car_avoid_path
             return 0.0, debug, None
 
         _smooth_cx, smooth_cy = locked_car.get("bottom_center", (0.0, float(np.max(base[:, 1]))))
@@ -2571,6 +2580,15 @@ class RoadSegmentor:
                 miss_frames=int(self.locked_car_miss_frames),
             )
             debug["rows_to_bottom"] = float(rows_to_car)
+            if debug.get("active") and left_boundary is not None:
+                car_avoid_path, path_ok = self._build_boundary_inset_path(
+                    base_path,
+                    left_boundary,
+                    float(debug.get("boundary_inset_x", 0.0)),
+                    w_seg,
+                )
+                if path_ok:
+                    return float(debug.get("boundary_inset_x", 0.0)), debug, car_avoid_path
             return 0.0, debug, None
 
         if self.car_avoidance_controller.state == "PASSED_WAIT":
@@ -2588,6 +2606,15 @@ class RoadSegmentor:
                 miss_frames=int(self.locked_car_miss_frames),
             )
             debug["rows_to_bottom"] = float(rows_to_car)
+            if debug.get("active") and left_boundary is not None:
+                car_avoid_path, path_ok = self._build_boundary_inset_path(
+                    base_path,
+                    left_boundary,
+                    float(debug.get("boundary_inset_x", 0.0)),
+                    w_seg,
+                )
+                if path_ok:
+                    return float(debug.get("boundary_inset_x", 0.0)), debug, car_avoid_path
             return 0.0, debug, None
 
         y_range, boundary_ready = self._car_avoidance_distance_window(locked_car, base)
@@ -2604,6 +2631,15 @@ class RoadSegmentor:
             miss_frames=int(self.locked_car_miss_frames),
             blocked_y_range=blocked_y_range,
         )
+        if debug.get("active") and left_boundary is not None:
+            car_avoid_path, path_ok = self._build_boundary_inset_path(
+                base_path,
+                left_boundary,
+                float(debug.get("boundary_inset_x", 0.0)),
+                w_seg,
+            )
+            if path_ok:
+                return float(debug.get("boundary_inset_x", 0.0)), debug, car_avoid_path
         return 0.0, debug, None
 
     def infer_mask(self, blob_rgb_320):
@@ -2974,7 +3010,7 @@ class RoadSegmentor:
             external_boundary_side = str(external_boundary_side).lower()
             if external_boundary_side not in ("left", "right"):
                 external_boundary_side = "left"
-            avoid_control_source = "car_pd" if car_active else "none"
+            avoid_control_source = "car_avoid" if car_active else "none"
             if external_boundary_active:
                 external_boundary_pts = right_boundary_pts if external_boundary_side == "right" else left_boundary_pts
                 external_avoid_path, external_path_ok = self._build_boundary_inset_path(
@@ -2997,7 +3033,7 @@ class RoadSegmentor:
             car_boundary_path_active = (
                 car_avoid_path is not None and
                 (
-                    avoid_control_source in ("external", "external_car_pd")
+                    avoid_control_source in ("external", "external_car_pd", "car_avoid")
                 )
             )
             bypass_frame_jump = external_boundary_active
@@ -3026,6 +3062,7 @@ class RoadSegmentor:
             if car_boundary_path_active:
                 control_path_points = car_avoid_path
                 lateral_control_points = car_avoid_path
+                heading_control_points = car_avoid_path
                 if control_mode == "weighted_slope":
                     weighted_points = self.path_controller.select_control_points(
                         control_mode,
@@ -3047,25 +3084,16 @@ class RoadSegmentor:
                         control_path_points = weighted_points
                         lateral_control_points = weighted_points
                         heading_control_points = weighted_points
-            if car_active and car_path_debug is not None:
-                pd_pwm = float(car_path_debug.get("pd_pwm", 0.0))
-                direct_pwm_gain = float(config.STEER_SIGNAL_PWM_GAIN)
-                if control_mode == "stanley_band":
-                    direct_pwm_gain = float(getattr(config, "STANLEY_PWM_GAIN", 0.012))
-                elif control_mode == "control_c":
-                    direct_pwm_gain = float(getattr(config, "CONTROL_C_PWM_GAIN", 12.0))
-                steer_signal = -pd_pwm / direct_pwm_gain if abs(direct_pwm_gain) > 1e-9 else 0.0
-            else:
-                steer_signal = self.path_controller.compute_steer_signal(
-                    control_path_points,
-                    w_seg,
-                    h_seg,
-                    center_bias_x=float(getattr(config, "CONTROL_CENTER_BIAS_X", 0.0)),
-                    lateral_points=lateral_control_points,
-                    heading_points=heading_control_points,
-                    d_gain_scale=d_gain_scale,
-                )
-                steer_signal *= float(getattr(config, "STEER_SIGNAL_NO_TARGET_GAIN", 1.0))
+            steer_signal = self.path_controller.compute_steer_signal(
+                control_path_points,
+                w_seg,
+                h_seg,
+                center_bias_x=float(getattr(config, "CONTROL_CENTER_BIAS_X", 0.0)),
+                lateral_points=lateral_control_points,
+                heading_points=heading_control_points,
+                d_gain_scale=d_gain_scale,
+            )
+            steer_signal *= float(getattr(config, "STEER_SIGNAL_NO_TARGET_GAIN", 1.0))
             control_band = None
             lateral_debug_points = None
             control_mode = str(getattr(config, "STEER_CONTROL_MODE", "weighted_slope")).lower()

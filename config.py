@@ -201,7 +201,7 @@ SIGN_ROUTE_SKIP_FIRST_PASS = True
 SIGN_ROUTE_FIXED_FIRST_CHOICE = "LEFT"
 # 触发语义路牌停车采样的 sign 框面积阈值，单位是 TARGET_RES 坐标系像素面积。
 # 它会和 SIGN_LLM_TRIGGER_DIST、SIGN_LLM_TRIGGER_EDGE_MARGIN_RATIO 同时满足后才停车。
-SIGN_LLM_TRIGGER_AREA = 13000
+SIGN_LLM_TRIGGER_AREA = 16000
 # 触发语义路牌停车采样的 sign 截止距离，单位是 TARGET_RES 像素。
 # 路牌框底边距离画面底部小于等于该值，才认为已经足够近，可以停车采样。
 # 调大：更早停车；调小：更靠近再停车。
@@ -223,6 +223,9 @@ SIGN_LLM_API_TIMEOUT = 10.0
 SIGN_LLM_RESULT_MAX_AGE_FRAMES = 1500
 # 语义路线完成后，连续看到多少帧单路特征才释放 WAIT_SIGN_GONE/路线锁定。
 SIGN_ROUTE_SINGLE_ROAD_EXIT_FRAMES = 20
+# WAIT_SIGN_GONE 下连续多少帧没有达标路牌，才认为同一块路牌已经离开画面。
+# 防止 YOLO 短暂漏检一帧后，同一块牌又被当成下一次事件反复 OCR。
+SIGN_ROUTE_SIGN_GONE_EXIT_FRAMES = 8
 # 按语义路牌选定方向后，进入岔路区域至少保持方向的时间，单位秒。
 SIGN_ROUTE_MIN_FORK_HOLD_SECONDS = 5.0
 # 按语义路牌选定方向后，最长保持该路线选择的时间，单位秒。
@@ -613,14 +616,14 @@ SERVO_MIN, SERVO_MAX = 590, 910
 # SERVO_MIN, SERVO_MAX = 590, 866
 # SERVO_MIN, SERVO_MAX = 630, 910
 
-# 舵机输出低通滤波。作用在最终 servo_pwm 上，专门压车跑起来时的小幅高频抖动。
+# 舵机输出低通滤波。作用在最终 servo_pwm 上，专门压转向突变带来的机械冲击。
 # - EMA_ALPHA 越大越稳，但响应越慢；0 表示不滤波，0.35~0.65 常用。
 # - DEADBAND_PWM 表示新旧 PWM 差值小于该值时不更新，避免舵机追 1~2 个 PWM 的噪声。
 # - MAX_STEP 表示每个串口周期最多变化多少 PWM，0 表示不限制。
-SERVO_OUTPUT_FILTER_ENABLED = False
+SERVO_OUTPUT_FILTER_ENABLED = True
 SERVO_OUTPUT_EMA_ALPHA = 0.0
-SERVO_OUTPUT_DEADBAND_PWM = 0
-SERVO_OUTPUT_MAX_STEP = 0
+SERVO_OUTPUT_DEADBAND_PWM = 1
+SERVO_OUTPUT_MAX_STEP = 8
 
 # 视觉控制参考中线偏置，单位是 SEG_SIZE 坐标里的像素。
 # 舵机中心已经机械校正时保持 0；只在确认相机安装导致图像中线不是车身正前方时才小幅调。
@@ -732,7 +735,7 @@ STANLEY_LATERAL_D_GAIN =0.022 #0.022
 # D 项使用前先对 e 做 EMA 平滑。数值越大越稳，但 D 项反应越慢。
 STANLEY_LATERAL_D_EMA_ALPHA = 0.1
 # 航向误差增益 g_psi。
-STANLEY_HEADING_GAIN = 0.15#0.25
+STANLEY_HEADING_GAIN = 0.17#0.25
 # 航向误差 psi 的 EMA 平滑。只影响 STANLEY_HEADING_GAIN 非 0 时的航向项。
 # 调大：航向项更稳、更不追拟合线小抖；过大则航向抑制反应变慢。
 STANLEY_HEADING_EMA_ALPHA = 0.2
@@ -932,11 +935,13 @@ DEFAULT_CONTROL_DATA = {
     "sign_route_choice": 0,
     "sign_route_first_choice": 0,
     "sign_route_pass_index": 0,
+    "sign_route_llm_used": False,
     "post_sign_phase": False,
     "sign_route_locked_rect": None,
     "sign_route_drive_started_at": None,
     "sign_route_fork_entered_at": None,
     "sign_route_single_road_frames": 0,
+    "sign_route_sign_gone_frames": 0,
     "sign_route_api_submitted": False,
     "person_stop_active": False,
     "person_bottom_y": None,
@@ -1084,9 +1089,9 @@ PERSON_CLASS_ID_FALLBACK = 2
 # 画面上先画“停车截至横线”，它直接对应 PERSON_STOP_TRIGGER_DIST。
 # 竖向放行线后面再按调试需要打开。
 # 行人框底边距离画面底部小于该值才触发停车，单位 TARGET_RES 像素。
-PERSON_STOP_TRIGGER_DIST = 340
+PERSON_STOP_TRIGGER_DIST = 420
 # 行人框面积至少达到该值，才允许触发行人停车，单位 TARGET_RES 像素面积。
-PERSON_STOP_MIN_AREA = 7000
+PERSON_STOP_MIN_AREA = 2500
 # 行人朝目标侧连续移动并过线多少帧后，才允许从停车切到放行。
 PERSON_CLEAR_MOVE_FRAMES = 2
 # 判定“行人横向移动”的最小底部中心 x 增量。
@@ -1095,7 +1100,7 @@ PERSON_CLEAR_MIN_MOVE_DX = 3.0
 PERSON_CLEAR_MIN_RIGHT_DX = PERSON_CLEAR_MIN_MOVE_DX
 # 行人横向放行线相对画面中线的偏移量，单位 TARGET_RES 像素。
 # 这条线先不默认绘制，留作后续调试用。
-PERSON_CLEAR_LINE_OFFSET_X = 30.0
+PERSON_CLEAR_LINE_OFFSET_X = 55.0
 # 行人横向放行线在预览图上的颜色和粗细。
 PERSON_CLEAR_LINE_COLOR = (0, 255, 255)
 PERSON_CLEAR_LINE_THICKNESS = 2
@@ -1396,8 +1401,8 @@ TRACK_WIDTH_LOG_INTERVAL = 1.5
 # 车辆避障控制参数
 # 这组参数工作在分割输入 `SEG_SIZE = 416x160` 的坐标系里。
 # y 方向是 160 行高度，所有 `*_ROWS` 都是“离底部多少行”的意思。
-# 当前策略用状态机锁定 car；车辆避障单独用左边界横向 PD 控制。
-# 避障激活时，PD PWM 会接管当前帧 steer_signal；不再和 Stanley 输出混合。
+# 当前策略用状态机锁定 car；车辆避障走“固定偏移拉线 + Stanley”控制。
+# 避障激活时，控制路径会切到左边界内收线，再由 Stanley 计算 steer_signal。
 # ---------------------------------------------------------------------------
 CAR_AVOIDANCE_ENABLED = True
 # 是否启用车辆专用 PD 控制。
@@ -1413,18 +1418,20 @@ CAR_AVOIDANCE_LEFT_BOUNDARY_PD_DEADBAND = 4.0
 CAR_AVOIDANCE_LEFT_BOUNDARY_PD_P_GAIN = 0.3
 CAR_AVOIDANCE_LEFT_BOUNDARY_PD_D_GAIN = 0.05
 # 车辆较远/较近时的左边界内收量，单位 SEG_SIZE 像素。
+# 这两个值越大，避车参考线离左边界越远，实际绕行幅度越大。
 CAR_AVOIDANCE_PD_FAR_INSET_X = 25.0
-CAR_AVOIDANCE_PD_NEAR_INSET_X = 10.0
-# car 底部中心距离画面底部超过这个行数时，只锁定跟踪，不让 PD 接管。
-CAR_AVOIDANCE_START_BOUNDARY_ROWS = 125.0
+CAR_AVOIDANCE_PD_NEAR_INSET_X = 15.0
+# car 底部中心距离画面底部超过这个行数时，只锁定跟踪，不让避障拉线接管。
+# 这个值越大，越早开始让避障拉线接管。
+CAR_AVOIDANCE_START_BOUNDARY_ROWS = 150.0
 # car 底部中心距离画面底部不超过这个行数时，使用近距离漏检帧数。
-CAR_AVOIDANCE_NEAR_BOUNDARY_ROWS = 60.0
+CAR_AVOIDANCE_NEAR_BOUNDARY_ROWS = 110.0
 # car 底部中心进入这个贴底窗口后，认为正在通过/已通过，主动进入 CLEARING 回中线。
-CAR_AVOIDANCE_PASS_ROWS = 25.0
+CAR_AVOIDANCE_PASS_ROWS = 15.0
 # car 跟踪锁定。锁定主要看车框底部中心点的连续性，面积只做异常框过滤。
 # 连续命中后进入避障；短暂漏检会继续沿用锁定目标，超过允许帧数后进入 CLEARING。
 # 新 car 目标需要连续命中多少帧才锁定。
-CAR_AVOIDANCE_LOCK_HIT_FRAMES = 2
+CAR_AVOIDANCE_LOCK_HIT_FRAMES = 1
 # 锁定目标和新检测框匹配的搜索半径。
 CAR_AVOIDANCE_SEARCH_RADIUS = 90.0
 # 目标漏检期间，搜索半径随漏检帧数增加的增益。
@@ -1433,7 +1440,7 @@ CAR_AVOIDANCE_SEARCH_RADIUS_MISS_GAIN = 32.0
 CAR_AVOIDANCE_TRACK_EMA_ALPHA = 0.65
 # car 框短暂变小、被遮挡或漏检时，继续沿用最近一次锁定目标的帧数。
 # 漏 1 帧/2 帧继续正常避障，第 3 帧仍没检测到才进入 CLEARING。
-CAR_AVOIDANCE_MISS_FRAMES = 2
+CAR_AVOIDANCE_MISS_FRAMES = 3
 # 近距离也按同样规则处理，避免贴底后长期挂在避障状态。
 CAR_AVOIDANCE_NEAR_MISS_FRAMES = 2
 # car 检测最低置信度过滤；0 表示不额外过滤。
@@ -1445,9 +1452,9 @@ CAR_AVOIDANCE_MAX_AREA = 0.0
 # CLEARING 里从近距离内收 10 开始，按赛道半宽逐步回到正常中线。
 CAR_AVOIDANCE_CLEARING_MISS_FRAMES = 0
 # CLEARING 衰减帧数。
-CAR_AVOIDANCE_CLEARING_DECAY_FRAMES = 5
+CAR_AVOIDANCE_CLEARING_DECAY_FRAMES = 13
 # CLEARING 硬退出上限，避免丢车后长期挂在 PD 状态。
-CAR_AVOIDANCE_CLEARING_MAX_FRAMES = 6
+CAR_AVOIDANCE_CLEARING_MAX_FRAMES = 14
 # 避车 PWM 偏移日志间隔。
 LOG_INTERVAL_CAR_AVOIDANCE_DETAIL = 1.0
 # 主分割调试图绘制风格。
