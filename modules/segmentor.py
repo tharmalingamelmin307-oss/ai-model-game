@@ -2280,11 +2280,13 @@ class RoadSegmentor:
     def _update_locked_car(self, measurements, base):
         """按底部中心点连续性锁定同一辆车，允许短暂遮挡/漏检."""
         max_miss = max(0, int(getattr(config, "CAR_AVOIDANCE_MISS_FRAMES", 0)))
-        near_max_miss = max(max_miss, int(getattr(config, "CAR_AVOIDANCE_NEAR_MISS_FRAMES", max_miss)))
+        near_max_miss = max(0, int(getattr(config, "CAR_AVOIDANCE_NEAR_MISS_FRAMES", max_miss)))
         near_rows = max(0.0, float(getattr(config, "CAR_AVOIDANCE_NEAR_BOUNDARY_ROWS", 60.0)))
+        commit_rows = max(0.0, float(getattr(config, "CAR_AVOIDANCE_COMMIT_ROWS", 0.0)))
         hit_required = max(1, int(getattr(config, "CAR_AVOIDANCE_LOCK_HIT_FRAMES", 1)))
         search_radius = max(1.0, float(getattr(config, "CAR_AVOIDANCE_SEARCH_RADIUS", 48.0)))
         miss_gain = max(0.0, float(getattr(config, "CAR_AVOIDANCE_SEARCH_RADIUS_MISS_GAIN", 0.0)))
+        max_y_regression = max(0.0, float(getattr(config, "CAR_AVOIDANCE_MAX_Y_REGRESSION", 0.0)))
         ema_alpha = float(getattr(config, "CAR_AVOIDANCE_TRACK_EMA_ALPHA", 0.65))
         ema_alpha = float(np.clip(ema_alpha, 0.0, 0.98))
 
@@ -2292,6 +2294,11 @@ class RoadSegmentor:
             last_center = self.locked_car.get("bottom_center")
             velocity = self.locked_car.get("velocity", (0.0, 0.0))
             miss_frames = int(self.locked_car_miss_frames)
+            path_bottom_y = float(np.max(base[:, 1]))
+            rows_to_car = max(0.0, path_bottom_y - float(last_center[1]))
+            near_committed = bool(self.locked_car.get("near_committed", False)) or (
+                commit_rows > 0.0 and rows_to_car <= commit_rows
+            )
             predicted = (
                 float(last_center[0]) + float(velocity[0]),
                 float(last_center[1]) + float(velocity[1]),
@@ -2301,6 +2308,8 @@ class RoadSegmentor:
             local_matches = []
             for m in measurements:
                 mx, my = m["bottom_center"]
+                if max_y_regression > 0.0 and float(my) < float(last_center[1]) - max_y_regression:
+                    continue
                 dist = float(np.hypot(float(mx) - predicted[0], float(my) - predicted[1]))
                 if dist <= radius:
                     local_matches.append((dist, m))
@@ -2326,15 +2335,28 @@ class RoadSegmentor:
                     "velocity": smooth_velocity,
                     "hit_frames": int(self.locked_car.get("hit_frames", 0)) + 1,
                     "confirmed": int(self.locked_car.get("hit_frames", 0)) + 1 >= hit_required,
+                    "near_committed": bool(near_committed),
                 }
                 self.locked_car_miss_frames = 0
                 if not self.locked_car["confirmed"]:
                     return None
                 return self.locked_car
 
+            if near_committed and measurements and bool(self.locked_car.get("confirmed", False)):
+                path_y_min = float(np.min(base[:, 1]))
+                path_y_max = float(np.max(base[:, 1]))
+                predicted_center = (
+                    float(np.clip(predicted[0], 0.0, float(config.SEG_SIZE[0] - 1))),
+                    float(np.clip(predicted[1], path_y_min, path_y_max)),
+                )
+                self.locked_car = dict(self.locked_car)
+                self.locked_car["bottom_center"] = predicted_center
+                self.locked_car["near_committed"] = True
+                self.locked_car["miss_frames"] = 0
+                self.locked_car_miss_frames = 0
+                return self.locked_car
+
             self.locked_car_miss_frames += 1
-            path_bottom_y = float(np.max(base[:, 1]))
-            rows_to_car = max(0.0, path_bottom_y - float(last_center[1]))
             allowed_miss = near_max_miss if rows_to_car <= near_rows else max_miss
             if self.locked_car_miss_frames <= allowed_miss:
                 if not bool(self.locked_car.get("confirmed", False)):
@@ -2348,6 +2370,7 @@ class RoadSegmentor:
                 self.locked_car = dict(self.locked_car)
                 self.locked_car["bottom_center"] = predicted_center
                 self.locked_car["miss_frames"] = int(self.locked_car_miss_frames)
+                self.locked_car["near_committed"] = bool(near_committed)
                 return self.locked_car
 
             self.locked_car = None
@@ -2370,6 +2393,7 @@ class RoadSegmentor:
             "velocity": (0.0, 0.0),
             "hit_frames": 1,
             "confirmed": hit_required <= 1,
+            "near_committed": False,
         }
         self.locked_car_miss_frames = 0
         if not self.locked_car["confirmed"]:
@@ -2437,6 +2461,43 @@ class RoadSegmentor:
             debug["paused"] = True
             return 0.0, debug, None
 
+        if self.car_avoidance_state == "CLEARING" and self.car_last_avoid_path is not None:
+            self.locked_car = None
+            self.locked_car_miss_frames = 0
+            self.car_clearing_frames += 1
+            clearing_path, avoid_weight = self._build_car_clearing_path(
+                base,
+                self.car_last_avoid_path,
+                self.car_clearing_frames,
+            )
+            done_frames = max(1, int(getattr(config, "CAR_AVOIDANCE_CLEARING_DECAY_FRAMES", 8)))
+            max_clear_frames = max(
+                done_frames,
+                int(getattr(config, "CAR_AVOIDANCE_CLEARING_MAX_FRAMES", done_frames)),
+            )
+            if self.car_clearing_frames >= max_clear_frames:
+                self.car_avoidance_state = "FOLLOW_LANE"
+                self.car_clearing_frames = 0
+                self.car_last_avoid_path = None
+                self.car_last_avoid_path_is_boundary = False
+                self.car_last_boundary_inset_x = 0.0
+                debug["state"] = self.car_avoidance_state
+                debug["clear_frames"] = 0
+                return 0.0, debug, None
+
+            debug["state"] = self.car_avoidance_state
+            debug["clear_frames"] = int(self.car_clearing_frames)
+            debug["miss_frames"] = int(self.locked_car_miss_frames)
+            debug["boundary_inset_x"] = float(self.car_last_boundary_inset_x)
+            debug["boundary_strength_x"] = float(self.car_last_boundary_inset_x) * float(avoid_weight)
+            debug["boundary_path_active"] = bool(self.car_last_avoid_path_is_boundary)
+            debug["active"] = True
+            return (
+                float(debug["boundary_strength_x"]),
+                debug,
+                clearing_path if self.car_last_avoid_path_is_boundary else None,
+            )
+
         measurements = []
         for item in planning_items:
             measurement = self._car_measurement_from_item(item, w_seg, h_seg, base)
@@ -2448,41 +2509,6 @@ class RoadSegmentor:
             if self.car_avoidance_state == "AVOIDING" and self.car_last_avoid_path is not None:
                 self.car_avoidance_state = "CLEARING"
                 self.car_clearing_frames = 0
-
-            if self.car_avoidance_state == "CLEARING" and self.car_last_avoid_path is not None:
-                self.car_clearing_frames += 1
-                clearing_path, avoid_weight = self._build_car_clearing_path(
-                    base,
-                    self.car_last_avoid_path,
-                    self.car_clearing_frames,
-                )
-                done_frames = max(1, int(getattr(config, "CAR_AVOIDANCE_CLEARING_DECAY_FRAMES", 8)))
-                max_clear_frames = max(
-                    done_frames,
-                    int(getattr(config, "CAR_AVOIDANCE_CLEARING_MAX_FRAMES", done_frames)),
-                )
-                if self.car_clearing_frames >= max_clear_frames:
-                    self.car_avoidance_state = "FOLLOW_LANE"
-                    self.car_clearing_frames = 0
-                    self.car_last_avoid_path = None
-                    self.car_last_avoid_path_is_boundary = False
-                    self.car_last_boundary_inset_x = 0.0
-                    debug["state"] = self.car_avoidance_state
-                    debug["clear_frames"] = 0
-                    return 0.0, debug, None
-
-                debug["state"] = self.car_avoidance_state
-                debug["clear_frames"] = int(self.car_clearing_frames)
-                debug["miss_frames"] = int(self.locked_car_miss_frames)
-                debug["boundary_inset_x"] = float(self.car_last_boundary_inset_x)
-                debug["boundary_strength_x"] = float(self.car_last_boundary_inset_x) * float(avoid_weight)
-                debug["boundary_path_active"] = bool(self.car_last_avoid_path_is_boundary)
-                debug["active"] = True
-                return (
-                    float(debug["boundary_strength_x"]),
-                    debug,
-                    clearing_path if self.car_last_avoid_path_is_boundary else None,
-                )
             return 0.0, debug, None
 
         _smooth_cx, smooth_cy = locked_car.get("bottom_center", (0.0, float(np.max(base[:, 1]))))
@@ -2957,7 +2983,7 @@ class RoadSegmentor:
                 control_path_points,
                 w_seg,
                 h_seg,
-                center_bias_x=0.0,
+                center_bias_x=float(getattr(config, "CONTROL_CENTER_BIAS_X", 0.0)),
                 lateral_points=lateral_control_points,
             )
             if car_active:
@@ -2993,6 +3019,7 @@ class RoadSegmentor:
                     control_path_points,
                     w_seg,
                     h_seg,
+                    center_bias_x=float(getattr(config, "CONTROL_CENTER_BIAS_X", 0.0)),
                     lateral_points=lateral_control_points,
                 )
                 control_band = self.path_controller.control_band_for_mode(

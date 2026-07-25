@@ -737,7 +737,7 @@ STANLEY_LATERAL_AVG_HALF_WINDOW = 10.0
 STANLEY_LATERAL_GAIN = 0.4 #0.32
 # 横向 D 系数 Kd，作用在 EMA 后横向误差的帧间变化量 de 上。
 # 默认关闭；想试 B+d 时先从很小值开始，例如 0.040-0.045。
-STANLEY_LATERAL_D_GAIN =0.022 #0.022
+STANLEY_LATERAL_D_GAIN =0.026 #0.022
 # D 项使用前先对 e 做 EMA 平滑。数值越大越稳，但 D 项反应越慢。
 STANLEY_LATERAL_D_EMA_ALPHA = 0.3
 # 航向误差增益 g_psi。
@@ -1431,21 +1431,26 @@ CAR_AVOIDANCE_NEAR_LEFT_BOUNDARY_INSET = 0.0
 CAR_AVOIDANCE_START_BOUNDARY_ROWS = 170.0
 # car 底部中心距离画面底部不超过这个行数时，使用近距离漏检帧数。
 CAR_AVOIDANCE_NEAR_BOUNDARY_ROWS = 110.0
+# 避车提交距离：拉左线后，目标第一次进入这个距离以内，就持续左线直到 car 消失。
+CAR_AVOIDANCE_COMMIT_ROWS = 80.0
 # car 跟踪锁定。锁定主要看车框底部中心点的连续性，面积只做异常框过滤。
 # 连续命中后进入避障；短暂漏检会继续沿用锁定目标，超过允许帧数后进入 CLEARING。
 # 新 car 目标需要连续命中多少帧才锁定。
 CAR_AVOIDANCE_LOCK_HIT_FRAMES = 3
 # 锁定目标和新检测框匹配的搜索半径。
-CAR_AVOIDANCE_SEARCH_RADIUS = 90.0
+CAR_AVOIDANCE_SEARCH_RADIUS = 60.0
 # 目标漏检期间，搜索半径随漏检帧数增加的增益。
-CAR_AVOIDANCE_SEARCH_RADIUS_MISS_GAIN = 32.0
+CAR_AVOIDANCE_SEARCH_RADIUS_MISS_GAIN = 18.0
+# 锁定目标匹配保护：同一辆车正常应越来越靠近画面底部。
+# 如果新框底部 y 比上一帧有效位置向上跳超过这个值，认为可能串到别的框，先当作漏检。
+CAR_AVOIDANCE_MAX_Y_REGRESSION = 18.0
 # 锁定目标位置 EMA 平滑系数。
 CAR_AVOIDANCE_TRACK_EMA_ALPHA = 0.65
 # car 框短暂变小、被遮挡或漏检时，继续沿用最近一次锁定目标的帧数。
-# 漏 1 帧/2 帧继续正常避障，第 3 帧仍没检测到才进入 CLEARING。
-CAR_AVOIDANCE_MISS_FRAMES = 3
+# 连续看不见 car 达到这个帧数后，才进入 CLEARING 回正。
+CAR_AVOIDANCE_MISS_FRAMES = 5
 # 近距离也按同样规则处理，避免贴底后长期挂在避障状态。
-CAR_AVOIDANCE_NEAR_MISS_FRAMES = 2
+CAR_AVOIDANCE_NEAR_MISS_FRAMES = 5
 # car 检测最低置信度过滤；0 表示不额外过滤。
 CAR_AVOIDANCE_MIN_SCORE = 0.0
 # car 检测最大面积过滤；0 表示不额外过滤。
