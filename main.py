@@ -289,16 +289,15 @@ def update_person_stop_state(state, person_info, left_boundary_x, right_boundary
     missing_started_at = state.get("person_missing_started_at")
     stop_started_at = state.get("person_stop_started_at")
     max_released = bool(state.get("person_stop_max_released", False))
+    lock_bottom_y = state.get("person_lock_bottom_y")
     now = time.monotonic()
     released_by_line = False
     released_by_missing = False
 
     if person_info is not None and active:
-        target_h = float(config.TARGET_RES[1])
-        trigger_dist = float(getattr(config, "PERSON_STOP_TRIGGER_DIST", 0.0))
         bottom_y = float(person_info.get("bottom_y", 0.0))
-        dist_to_bottom = float(person_info.get("dist_to_bottom", target_h - bottom_y))
-        if trigger_dist > 0.0 and dist_to_bottom > trigger_dist:
+        row_margin = max(0.0, float(getattr(config, "PERSON_STOP_LOCK_ROW_MARGIN", 45.0)))
+        if lock_bottom_y is not None and bottom_y < float(lock_bottom_y) - row_margin:
             person_info = None
 
     if person_info is None:
@@ -337,6 +336,7 @@ def update_person_stop_state(state, person_info, left_boundary_x, right_boundary
         state["person_missing_started_at"] = missing_started_at if active else None
         state["person_stop_started_at"] = stop_started_at if active else None
         state["person_stop_max_released"] = max_released
+        state["person_lock_bottom_y"] = lock_bottom_y if active else None
         state["person_last_frame_id"] = yolo_frame_id
         if not active:
             state["person_last_bottom_center_x"] = None
@@ -439,8 +439,12 @@ def update_person_stop_state(state, person_info, left_boundary_x, right_boundary
     if active:
         if stop_started_at is None:
             stop_started_at = now
+        lock_bottom_y = bottom_y
     elif not near_bottom:
         stop_started_at = None
+        lock_bottom_y = None
+    else:
+        lock_bottom_y = None
 
     state["person_stop_active"] = active
     state["person_bottom_y"] = bottom_y
@@ -462,6 +466,7 @@ def update_person_stop_state(state, person_info, left_boundary_x, right_boundary
     state["person_missing_started_at"] = missing_started_at
     state["person_stop_started_at"] = stop_started_at
     state["person_stop_max_released"] = max_released
+    state["person_lock_bottom_y"] = lock_bottom_y
     state["person_last_frame_id"] = yolo_frame_id
     state["person_last_bottom_center_x"] = bottom_center_x
     if not prev_active and active:
@@ -2138,6 +2143,7 @@ def serial_control_thread():
             person_stop_cutoff_y = global_control_data.get("person_stop_cutoff_y")
             person_bottom_center_x = global_control_data.get("person_bottom_center_x")
             person_bottom_right_x = global_control_data.get("person_bottom_right_x")
+            person_lock_bottom_y = global_control_data.get("person_lock_bottom_y")
             person_clear_frames = int(global_control_data.get("person_clear_frames", 0))
             person_stop_event = str(global_control_data.get("person_stop_event", ""))
         debug_keyboard_state = get_debug_drive_keyboard_state()
@@ -2262,6 +2268,7 @@ def serial_control_thread():
             person_clear_line_x = None
             person_bottom_center_x = None
             person_bottom_right_x = None
+            person_lock_bottom_y = None
             person_stop_cutoff_y = None
             person_clear_frames = 0
             person_stop_event = ""
@@ -2288,6 +2295,7 @@ def serial_control_thread():
         right_boundary_text = "无" if person_right_boundary_x is None else f"{float(person_right_boundary_x):.1f}"
         road_center_text = "无" if person_road_center_x is None else f"{float(person_road_center_x):.1f}"
         clear_line_text = "无" if person_clear_line_x is None else f"{float(person_clear_line_x):.1f}"
+        lock_bottom_text = "无" if person_lock_bottom_y is None else f"{float(person_lock_bottom_y):.1f}"
         cutoff_line_text = "无" if person_stop_cutoff_y is None else f"{float(person_stop_cutoff_y):.1f}"
         center_x_text = "无" if person_bottom_center_x is None else f"{float(person_bottom_center_x):.1f}"
         right_x_text = "无" if person_bottom_right_x is None else f"{float(person_bottom_right_x):.1f}"
@@ -2347,7 +2355,8 @@ def serial_control_thread():
                     f">>> 行人: 停车待放行 area={person_area_text} "
                     f"dist={person_dist_text} left={left_boundary_text} right={right_boundary_text} "
                     f"line={clear_line_text} side={person_clear_line_side or '无'} "
-                    f"center={road_center_text} clear={person_clear_frames} cutoff_y={cutoff_line_text}"
+                    f"center={road_center_text} clear={person_clear_frames} "
+                    f"lock_y={lock_bottom_text} cutoff_y={cutoff_line_text}"
                 ),
                 state=(
                     "stop_wait_release",
@@ -2358,6 +2367,7 @@ def serial_control_thread():
                     clear_line_text,
                     person_clear_line_side,
                     person_clear_frames,
+                    lock_bottom_text,
                 ),
                 min_interval=float(getattr(config, "LOG_INTERVAL_PERSON_STOP_DETAIL", 1.0)),
             )

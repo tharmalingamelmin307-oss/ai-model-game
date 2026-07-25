@@ -1433,6 +1433,61 @@ class RoadSegmentor:
 
         return fallback_width
 
+    def _build_lateral_fusion_points(self, raw_points, left_boundary, right_boundary, w_seg, trusted_side=None):
+        """用当前帧边界宽度估计融合横向误差点，不引入历史帧滞后."""
+        if not bool(getattr(config, "PATH_LATERAL_FUSION_ENABLED", False)):
+            return None
+        if raw_points is None or left_boundary is None or right_boundary is None:
+            return None
+
+        raw = np.array(raw_points, dtype=np.float32).reshape((-1, 2))
+        if len(raw) < 2:
+            return None
+
+        alpha = float(np.clip(float(getattr(config, "PATH_LATERAL_FUSION_ALPHA", 0.0)), 0.0, 1.0))
+        if alpha <= 0.0:
+            return None
+        half_width_ratio = max(0.0, float(getattr(config, "PATH_LATERAL_FUSION_HALF_WIDTH_RATIO", 1.0)))
+        max_delta = max(0.0, float(getattr(config, "PATH_LATERAL_FUSION_MAX_DELTA", 0.0)))
+
+        side = str(trusted_side or "left").lower()
+        if side not in ("left", "right"):
+            side = "left"
+
+        ys = raw[:, 1]
+        raw_x = raw[:, 0]
+        left_xs = self._interp_path_xs(left_boundary, ys)
+        right_xs = self._interp_path_xs(right_boundary, ys)
+        if left_xs is None or right_xs is None:
+            return None
+
+        boundary_xs = right_xs if side == "right" else left_xs
+        observed_widths = np.maximum(0.0, right_xs - left_xs)
+        fixed_widths = np.array(
+            [
+                self._fixed_track_width_at_y(float(y), float(width))
+                for y, width in zip(ys, observed_widths)
+            ],
+            dtype=np.float32,
+        )
+        valid = fixed_widths > 0.0
+        if not np.any(valid):
+            return None
+
+        half_widths = 0.5 * fixed_widths * half_width_ratio
+        if side == "right":
+            boundary_center_x = boundary_xs - half_widths
+        else:
+            boundary_center_x = boundary_xs + half_widths
+
+        if max_delta > 0.0:
+            valid &= np.abs(boundary_center_x - raw_x) <= max_delta
+
+        fused_x = raw_x.copy()
+        fused_x[valid] = (1.0 - alpha) * raw_x[valid] + alpha * boundary_center_x[valid]
+        fused_x = np.clip(fused_x, 0.0, float(w_seg - 1))
+        return np.vstack((fused_x, ys)).astype(np.float32).T
+
     def _apply_merge_boundary_width(self, nodes, merge_side, guide_polyline=None):
         """单侧出现汇合尖角时，用补线重算通道边界和中心."""
         if merge_side not in ("left", "right") or not nodes:
@@ -2795,6 +2850,14 @@ class RoadSegmentor:
             if raw_lateral_x is not None:
                 raw_lateral_x = np.clip(raw_lateral_x, 0, w_seg - 1)
                 lateral_path_points = np.vstack((raw_lateral_x, dense_y)).astype(np.float32).T
+            lateral_fusion_side = fork_selected_side or route_boundary_side
+            lateral_fusion_points = self._build_lateral_fusion_points(
+                lateral_path_points,
+                left_boundary_pts,
+                right_boundary_pts,
+                w_seg,
+                trusted_side=lateral_fusion_side,
+            )
             base_path_points = path_points_orig.copy()
             car_boundary_strength_x, car_path_debug, car_avoid_path = self._update_car_avoidance_boundary_path(
                 path_points_orig,
@@ -2855,11 +2918,17 @@ class RoadSegmentor:
             self.last_path_points_orig = path_points_orig.copy()
             self.missing_path_frames = 0
             control_path_points = path_points_orig
-            lateral_control_points = lateral_path_points
+            fusion_allowed = (
+                lateral_fusion_points is not None and
+                not bool(car_active) and
+                not bool(external_boundary_active)
+            )
+            lateral_control_points = lateral_fusion_points if fusion_allowed else lateral_path_points
             control_mode = str(getattr(config, "STEER_CONTROL_MODE", "weighted_slope")).lower()
             if (
                 control_mode in ("stanley_band", "control_c") and
-                bool(getattr(config, "PATH_LATERAL_USE_FILTERED_PATH", True))
+                bool(getattr(config, "PATH_LATERAL_USE_FILTERED_PATH", True)) and
+                not fusion_allowed
             ):
                 lateral_control_points = control_path_points
             if car_boundary_path_active:

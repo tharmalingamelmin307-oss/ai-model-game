@@ -398,7 +398,7 @@ FORK_STATE_HOLD_SECONDS = 0.5
 FORK_BOUNDARY_WIDTH_ENABLED = True
 # 岔路补线使用的固定宽度比例。
 # 例如 0.9 表示补线宽度为当前 y 行标定赛道宽度的 90%；现场偏宽可调到 0.8。
-FORK_BOUNDARY_WIDTH_RATIO = 0.85
+FORK_BOUNDARY_WIDTH_RATIO = 0.75
 
 
 # ---------------------------------------------------------------------------
@@ -737,7 +737,7 @@ STANLEY_LATERAL_AVG_HALF_WINDOW = 10.0
 STANLEY_LATERAL_GAIN = 0.4 #0.32
 # 横向 D 系数 Kd，作用在 EMA 后横向误差的帧间变化量 de 上。
 # 默认关闭；想试 B+d 时先从很小值开始，例如 0.040-0.045。
-STANLEY_LATERAL_D_GAIN =0.026 #0.022
+STANLEY_LATERAL_D_GAIN =0.022 #0.022
 # D 项使用前先对 e 做 EMA 平滑。数值越大越稳，但 D 项反应越慢。
 STANLEY_LATERAL_D_EMA_ALPHA = 0.3
 # 航向误差增益 g_psi。
@@ -783,6 +783,15 @@ PATH_HEADING_USE_TRUSTED_BOUNDARY = True
 # 当前默认 False：e 使用拟合前原始中点，并在 LOOKAHEAD_Y 附近按距离加权平均。
 # True 会退回使用拟合/滤波后的控制路径。
 PATH_LATERAL_USE_FILTERED_PATH = True
+# B/C 横向误差空间融合：不用历史帧滤波，而是把“原始中点”和“可信边界推中点”融合。
+# 默认用左边界 + ratio * 半赛道宽；右岔时对称用右边界 - ratio * 半赛道宽。
+PATH_LATERAL_FUSION_ENABLED = True
+# 融合权重。0 完全用原始中点；1 完全用边界推中点。
+PATH_LATERAL_FUSION_ALPHA = 0.4
+# 边界推中点使用的半赛道宽比例。1.0 是理论中点，0.9 会略靠可信边界侧。
+PATH_LATERAL_FUSION_HALF_WIDTH_RATIO = 0.9
+# 单行保护阈值：边界推中点与原始中点相差超过该像素数时，这一行退回原始中点。
+PATH_LATERAL_FUSION_MAX_DELTA = 45.0
 
 # C 算法: 小弯/大弯参数自动过渡控制器。
 #
@@ -971,6 +980,7 @@ DEFAULT_CONTROL_DATA = {
     "person_missing_started_at": None,
     "person_stop_started_at": None,
     "person_stop_max_released": False,
+    "person_lock_bottom_y": None,
     "person_clear_frames": 0,
     "person_miss_frames": 0,
     "person_last_frame_id": -1,
@@ -1096,6 +1106,9 @@ PERSON_CLASS_ID_FALLBACK = 2
 # 竖向放行线后面再按调试需要打开。
 # 行人框底边距离画面底部小于该值才触发停车，单位 TARGET_RES 像素。
 PERSON_STOP_TRIGGER_DIST = 420
+# 行人停车后，用最后一次有效看到的底部 y 行锁定一个纵向范围。
+# 后续最靠近车身的 person 如果跳到该范围上方超过这个行数，才按丢失计时。
+PERSON_STOP_LOCK_ROW_MARGIN = 45.0
 # 行人框面积至少达到该值，才允许触发行人停车，单位 TARGET_RES 像素面积。
 PERSON_STOP_MIN_AREA = 2500
 # 行人朝目标侧连续移动并过线多少帧后，才允许从停车切到放行。
@@ -1442,9 +1455,9 @@ CAR_AVOIDANCE_MAX_AREA = 0.0
 # CLEARING 里把最后一次避车参考线逐帧混回正常循线路径。
 CAR_AVOIDANCE_CLEARING_MISS_FRAMES = 0
 # CLEARING 衰减帧数。
-CAR_AVOIDANCE_CLEARING_DECAY_FRAMES = 20
+CAR_AVOIDANCE_CLEARING_DECAY_FRAMES = 40
 # CLEARING 硬退出上限，避免丢车后长期挂在避车状态。
-CAR_AVOIDANCE_CLEARING_MAX_FRAMES = 22
+CAR_AVOIDANCE_CLEARING_MAX_FRAMES = 42
 # 避车详细日志间隔。
 LOG_INTERVAL_CAR_AVOIDANCE_DETAIL = 1.0
 # 主分割调试图绘制风格。
