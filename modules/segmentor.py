@@ -90,10 +90,13 @@ class RoadSegmentor:
         self.locked_car = None
         self.locked_car_miss_frames = 0
         self.car_avoidance_state = "FOLLOW_LANE"
+        self.car_avoidance_cycle_id = 0
         self.car_clearing_frames = 0
         self.car_last_avoid_path = None
         self.car_last_avoid_path_is_boundary = False
         self.car_last_boundary_inset_x = 0.0
+        self.last_car_avoid_log_at = 0.0
+        self.last_car_avoid_log_state = None
         self.debug_overlay = SegDebugOverlay(tuple(config.SEG_SIZE))
         self.seg_profile_logger = SegProfileLogger()
         self.last_control_c_debug_log_at = 0.0
@@ -140,6 +143,74 @@ class RoadSegmentor:
             f"{float(debug.get('heading_term', 0.0)):.2f},"
             f"{float(debug.get('ff_term', 0.0)):.2f}) "
             f"car={int(bool(car_active))}",
+            flush=True,
+        )
+
+    def _log_car_avoidance_process(self, debug, event="", force=False):
+        """打印避车状态机过程，用来定位躲车后丢线前的状态流转."""
+        if not bool(getattr(config, "CAR_AVOIDANCE_PROCESS_LOG_ENABLED", True)):
+            return
+
+        state = str(debug.get("state", self.car_avoidance_state))
+        event = str(event or debug.get("event", ""))
+        active = bool(debug.get("active", False))
+        cycle_id = int(debug.get("cycle_id", self.car_avoidance_cycle_id))
+        detected = int(debug.get("detected_cars", 0))
+        boundary_strength = float(debug.get("boundary_strength_x", 0.0))
+        signature = (
+            state,
+            event,
+            active,
+            detected,
+            int(debug.get("miss_frames", 0)),
+            int(debug.get("clear_frames", 0)),
+            bool(debug.get("boundary_path_active", False)),
+            round(boundary_strength, 1),
+        )
+
+        now = time.monotonic()
+        interval = max(0.05, float(getattr(config, "LOG_INTERVAL_CAR_AVOIDANCE_PROCESS", 0.25)))
+        if not force and signature == self.last_car_avoid_log_state and now - float(self.last_car_avoid_log_at) < interval:
+            return
+        if not force and not active and detected <= 0 and state == "FOLLOW_LANE":
+            return
+
+        self.last_car_avoid_log_state = signature
+        self.last_car_avoid_log_at = now
+
+        rows = debug.get("rows_to_bottom")
+        rows_text = "无" if rows is None else f"{float(rows):.1f}"
+        center = debug.get("locked_center")
+        center_text = "无" if center is None else f"({float(center[0]):.1f},{float(center[1]):.1f})"
+        left_x = debug.get("left_boundary_x")
+        left_x_text = "无" if left_x is None else f"{float(left_x):.1f}"
+        left_error = debug.get("left_boundary_error")
+        left_error_text = "无" if left_error is None else f"{float(left_error):.1f}"
+        stage_label = "避车过程"
+        stage_note = ""
+        line_suffix = ""
+        if event == "enter_avoiding":
+            stage_label = "避车开始"
+            stage_note = "开始"
+            line_suffix = "\033[0m"
+        elif event == "clearing":
+            stage_label = "避车回正"
+            stage_note = "回正"
+        elif event == "clear_done":
+            stage_label = "避车结束"
+            stage_note = "结束"
+            line_suffix = "\033[0m"
+        print(
+            ("\033[92m" if event in ("enter_avoiding", "clear_done") else "") +
+            f"避车#{cycle_id} {stage_label}: {stage_note} "
+            f"state={state} det={detected} locked={int(bool(debug.get('locked_confirmed', False)))} "
+            f"hits={int(debug.get('locked_hit_frames', 0))} miss={int(debug.get('miss_frames', 0))} "
+            f"clear={int(debug.get('clear_frames', 0))} rows={rows_text} center={center_text} "
+            f"inset={float(debug.get('boundary_inset_x', 0.0)):.1f} weight={float(debug.get('avoid_weight', 0.0)):.2f} "
+            f"path={int(bool(debug.get('boundary_path_active', False)))} ready={int(bool(debug.get('boundary_ready', False)))} "
+            f"active={int(active)} strength={boundary_strength:.1f} "
+            f"left_x={left_x_text} left_e={left_error_text}" +
+            line_suffix,
             flush=True,
         )
 
@@ -2441,27 +2512,39 @@ class RoadSegmentor:
             "boundary_inset_x": 0.0,
             "boundary_strength_x": 0.0,
             "boundary_path_active": False,
+            "boundary_ready": False,
+            "avoid_weight": 0.0,
             "rows_to_bottom": None,
             "left_boundary_error": None,
             "left_boundary_x": None,
+            "detected_cars": 0,
+            "locked_confirmed": False,
+            "locked_hit_frames": 0,
+            "locked_center": None,
             "miss_frames": int(self.locked_car_miss_frames),
             "state": self.car_avoidance_state,
             "clear_frames": int(self.car_clearing_frames),
             "active": False,
+            "event": "",
+            "cycle_id": int(self.car_avoidance_cycle_id),
         }
         base = np.array(base_path, dtype=np.float32).reshape((-1, 2))
         if len(base) < 2 or not bool(getattr(config, "CAR_AVOIDANCE_ENABLED", True)):
             return 0.0, debug, None
 
         if not bool(state_updates_enabled):
+            debug["cycle_id"] = int(self.car_avoidance_cycle_id)
             debug["state"] = self.car_avoidance_state
             debug["clear_frames"] = int(self.car_clearing_frames)
             debug["miss_frames"] = int(self.locked_car_miss_frames)
             debug["active"] = self.car_avoidance_state != "FOLLOW_LANE"
             debug["paused"] = True
+            debug["event"] = "paused"
+            self._log_car_avoidance_process(debug, "paused")
             return 0.0, debug, None
 
         if self.car_avoidance_state == "CLEARING" and self.car_last_avoid_path is not None:
+            debug["cycle_id"] = int(self.car_avoidance_cycle_id)
             self.locked_car = None
             self.locked_car_miss_frames = 0
             self.car_clearing_frames += 1
@@ -2483,6 +2566,8 @@ class RoadSegmentor:
                 self.car_last_boundary_inset_x = 0.0
                 debug["state"] = self.car_avoidance_state
                 debug["clear_frames"] = 0
+                debug["event"] = "clear_done"
+                self._log_car_avoidance_process(debug, "clear_done", force=True)
                 return 0.0, debug, None
 
             debug["state"] = self.car_avoidance_state
@@ -2491,7 +2576,11 @@ class RoadSegmentor:
             debug["boundary_inset_x"] = float(self.car_last_boundary_inset_x)
             debug["boundary_strength_x"] = float(self.car_last_boundary_inset_x) * float(avoid_weight)
             debug["boundary_path_active"] = bool(self.car_last_avoid_path_is_boundary)
+            debug["boundary_ready"] = bool(self.car_last_avoid_path_is_boundary)
+            debug["avoid_weight"] = float(avoid_weight)
             debug["active"] = True
+            debug["event"] = "clearing"
+            self._log_car_avoidance_process(debug, "clearing")
             return (
                 float(debug["boundary_strength_x"]),
                 debug,
@@ -2503,12 +2592,22 @@ class RoadSegmentor:
             measurement = self._car_measurement_from_item(item, w_seg, h_seg, base)
             if measurement is not None:
                 measurements.append(measurement)
+        debug["detected_cars"] = int(len(measurements))
 
+        prev_state = self.car_avoidance_state
         locked_car = self._update_locked_car(measurements, base)
         if locked_car is None:
             if self.car_avoidance_state == "AVOIDING" and self.car_last_avoid_path is not None:
                 self.car_avoidance_state = "CLEARING"
                 self.car_clearing_frames = 0
+                debug["state"] = self.car_avoidance_state
+                debug["active"] = True
+                debug["event"] = "lost_enter_clearing"
+                self._log_car_avoidance_process(debug, "lost_enter_clearing", force=True)
+            elif measurements:
+                debug["state"] = self.car_avoidance_state
+                debug["event"] = "tracking_wait_confirm"
+                self._log_car_avoidance_process(debug, "tracking_wait_confirm")
             return 0.0, debug, None
 
         _smooth_cx, smooth_cy = locked_car.get("bottom_center", (0.0, float(np.max(base[:, 1]))))
@@ -2520,8 +2619,13 @@ class RoadSegmentor:
         debug["miss_frames"] = int(self.locked_car_miss_frames)
         debug["left_boundary_error"] = None if left_boundary_error is None else float(left_boundary_error)
         debug["left_boundary_x"] = None if left_boundary_x is None else float(left_boundary_x)
+        debug["locked_confirmed"] = bool(locked_car.get("confirmed", False))
+        debug["locked_hit_frames"] = int(locked_car.get("hit_frames", 0))
+        debug["locked_center"] = (float(_smooth_cx), float(smooth_cy))
 
         inset, y_range, boundary_ready = self._car_avoidance_boundary_inset(locked_car, base)
+        debug["boundary_ready"] = bool(boundary_ready)
+        debug["boundary_inset_x"] = float(inset)
 
         if not boundary_ready:
             if self.car_avoidance_state == "AVOIDING":
@@ -2529,11 +2633,15 @@ class RoadSegmentor:
                 self.car_clearing_frames = 0
             debug["state"] = self.car_avoidance_state
             debug["clear_frames"] = int(self.car_clearing_frames)
+            debug["event"] = "locked_not_ready"
+            self._log_car_avoidance_process(debug, "locked_not_ready", force=prev_state == "AVOIDING")
             return 0.0, debug, None
 
         if y_range is not None:
             debug["blocked_y_range"] = (float(y_range[0]), float(y_range[1]))
         avoid_path, path_ok = self._build_car_left_boundary_path(base, left_boundary, inset, w_seg)
+        if prev_state != "AVOIDING":
+            self.car_avoidance_cycle_id += 1
         self.car_avoidance_state = "AVOIDING"
         self.car_clearing_frames = 0
         self.car_last_avoid_path = avoid_path.copy() if path_ok else base.copy()
@@ -2543,7 +2651,13 @@ class RoadSegmentor:
         debug["clear_frames"] = 0
         debug["boundary_inset_x"] = float(inset)
         debug["boundary_strength_x"] = float(inset)
+        debug["avoid_weight"] = 1.0
+        debug["boundary_ready"] = bool(boundary_ready)
         debug["boundary_path_active"] = bool(path_ok)
+        debug["active"] = True
+        debug["event"] = "enter_avoiding" if prev_state != "AVOIDING" else "avoiding"
+        debug["cycle_id"] = int(self.car_avoidance_cycle_id)
+        self._log_car_avoidance_process(debug, debug["event"], force=prev_state != "AVOIDING")
         debug["active"] = True
         return float(inset), debug, avoid_path if path_ok else None
 
@@ -3049,6 +3163,13 @@ class RoadSegmentor:
             "car_left_boundary_error": float(car_path_debug.get("left_boundary_error", 0.0)) if car_path_debug is not None and car_path_debug.get("left_boundary_error") is not None else None,
             "car_left_boundary_x": float(car_path_debug.get("left_boundary_x", 0.0)) if car_path_debug is not None and car_path_debug.get("left_boundary_x") is not None else None,
             "car_boundary_inset_x": float(car_path_debug.get("boundary_inset_x", 0.0)) if car_path_debug is not None else 0.0,
+            "car_detected_cars": int(car_path_debug.get("detected_cars", 0)) if car_path_debug is not None else 0,
+            "car_locked_confirmed": bool(car_path_debug.get("locked_confirmed", False)) if car_path_debug is not None else False,
+            "car_locked_hit_frames": int(car_path_debug.get("locked_hit_frames", 0)) if car_path_debug is not None else 0,
+            "car_boundary_path_active": bool(car_path_debug.get("boundary_path_active", False)) if car_path_debug is not None else False,
+            "car_avoid_weight": float(car_path_debug.get("avoid_weight", 0.0)) if car_path_debug is not None else 0.0,
+            "car_event": str(car_path_debug.get("event", "")) if car_path_debug is not None else "",
+            "car_cycle_id": int(car_path_debug.get("cycle_id", self.car_avoidance_cycle_id)) if car_path_debug is not None else int(self.car_avoidance_cycle_id),
             "external_boundary_inset_x": float(external_boundary_inset_x),
             "external_boundary_side": external_boundary_side,
             "sign_route_pending_centerline": bool(sign_route_pending and y_fork_active and fork_selected_side is None),

@@ -728,6 +728,30 @@ def sign_route_skip_first_pass():
     return bool(getattr(config, "SIGN_ROUTE_SKIP_FIRST_PASS", True))
 
 
+def fixed_route_visible_sign(current_yolo_boxes):
+    """fixed_sequence 模式下，当前 YOLO 框里是否有 sign；不看面积大小."""
+    if not fixed_route_requires_sign():
+        return True, None
+    for obj in current_yolo_boxes or []:
+        cls_id = obj.get("class_id", -1)
+        cls_name = str(obj.get("class_name", ""))
+        if cls_id != config.SIGN_CLASS_ID and cls_name != "sign":
+            continue
+        rect = obj.get("rect", [0, 0, 0, 0])
+        if len(rect) != 4:
+            continue
+        x, y, w, h = rect
+        if float(w) < 2.0 or float(h) < 2.0:
+            continue
+        return True, [x, y, w, h]
+    return False, None
+
+
+def fixed_route_requires_sign():
+    """fixed_sequence 是否只在路牌岔路口推进序列."""
+    return bool(getattr(config, "SIGN_ROUTE_FIXED_REQUIRE_SIGN", True))
+
+
 def sign_route_pass_index(state):
     try:
         return max(0, int(state.get("sign_route_pass_index", 0)))
@@ -755,8 +779,8 @@ def activate_sign_route_choice(state, choice, frame_id, locked_rect=None):
     return True
 
 
-def activate_fixed_route_on_fork_if_needed(state, y_fork_active):
-    """fixed_sequence 模式下，只依据分割岔路事件推进固定路线序列."""
+def activate_fixed_route_on_fork_if_needed(state, y_fork_active, current_yolo_boxes=None, yolo_frame_id=None):
+    """fixed_sequence 模式下，只在当前同时看见路牌和 Y 岔时推进固定路线序列."""
     if not sign_route_fixed_mode():
         return False
 
@@ -768,11 +792,34 @@ def activate_fixed_route_on_fork_if_needed(state, y_fork_active):
 
     if not bool(y_fork_active) or route_state != "IDLE":
         return False
+    sign_visible, sign_rect = fixed_route_visible_sign(current_yolo_boxes)
+    if not sign_visible:
+        throttled_log(
+            "sign_route_fixed_fork_without_sign",
+            "固定序列模式忽略普通岔路: 当前未同时看见路牌",
+            state=(
+                sign_route_pass_index(state),
+                int(yolo_frame_id) if yolo_frame_id is not None else int(global_yolo_frame_id),
+            ),
+            min_interval=1.0,
+        )
+        return False
 
     pass_index = sign_route_pass_index(state)
-    now_frame_id = int(global_yolo_frame_id)
+    now_frame_id = int(yolo_frame_id) if yolo_frame_id is not None else int(global_yolo_frame_id)
+    state["sign_route_fixed_sign_frame_id"] = now_frame_id
+    state["sign_route_fixed_sign_rect"] = None if sign_rect is None else list(sign_rect)
+    throttled_log(
+        "sign_route_fixed_sign_fork_seen",
+        f"固定序列模式检测到路牌+岔路: frame={now_frame_id} rect={sign_rect}",
+        state=(
+            now_frame_id,
+            None if sign_rect is None else tuple(int(float(v)) for v in sign_rect),
+        ),
+        min_interval=0.5,
+    )
 
-    if pass_index <= 0 and sign_route_skip_first_pass():
+    if pass_index <= 0 and sign_route_skip_first_pass() and not fixed_route_requires_sign():
         state["sign_route_pass_index"] = 1
         clear_sign_llm_state(state, keep_completed=True)
         reset_sign_route_state(state, next_state="IGNORE_FORK")
@@ -827,22 +874,30 @@ def activate_fixed_route_on_fork_if_needed(state, y_fork_active):
     reset_sign_route_state(state, next_state="IGNORE_FORK")
     throttled_log(
         "sign_route_fixed_done_ignore",
-        "固定序列模式岔路序列已完成，忽略后续岔路事件",
+        "固定序列模式第二/三圈已完成，后续路牌岔路默认走左",
         state=(pass_index, first_choice),
         min_interval=0.0,
     )
     return True
 
 
-def pending_fixed_route_choice(state):
-    """fixed_sequence 模式下，岔路尚未锁定前可预先传给分割的目标方向."""
+def pending_fixed_route_choice(state, current_yolo_boxes=None):
+    """fixed_sequence 模式下，当前看见 sign 时预先传给分割的目标方向."""
     if not sign_route_fixed_mode():
+        return 0
+    sign_visible, _ = fixed_route_visible_sign(current_yolo_boxes)
+    if not sign_visible:
         return 0
     if int(state.get("sign_route_choice", 0)) in (-1, 1):
         return 0
     if str(state.get("sign_route_state", "IDLE")) != "IDLE":
         return 0
     pass_index = sign_route_pass_index(state)
+    if pass_index <= 0 and fixed_route_requires_sign():
+        return sign_route_choice_from_label(
+            getattr(config, "SIGN_ROUTE_FIXED_FIRST_CHOICE", "LEFT"),
+            default=-1,
+        )
     if pass_index == 1:
         return sign_route_choice_from_label(
             getattr(config, "SIGN_ROUTE_FIXED_FIRST_CHOICE", "LEFT"),
@@ -878,12 +933,17 @@ def update_wait_sign_gone_state(state, route_trigger_rect):
     return "WAIT_SIGN_GONE"
 
 
-def update_sign_route_after_seg(state, y_fork_active):
+def update_sign_route_after_seg(state, y_fork_active, current_yolo_boxes=None, yolo_frame_id=None):
     """根据分割岔路状态推进路牌路线生命周期."""
     now = time.monotonic()
     route_state = str(state.get("sign_route_state", "IDLE"))
 
-    if activate_fixed_route_on_fork_if_needed(state, y_fork_active):
+    if activate_fixed_route_on_fork_if_needed(
+        state,
+        y_fork_active,
+        current_yolo_boxes=current_yolo_boxes,
+        yolo_frame_id=yolo_frame_id,
+    ):
         route_state = str(state.get("sign_route_state", "IDLE"))
 
     if route_state == "CHOICE_READY":
@@ -1253,6 +1313,7 @@ def yolo_worker(core_id=None, worker_id=0):
             pending_sign_jobs = []
             route_trigger_rect = None
             route_skip_debug = None
+            route_sign_gate_enabled = sign_route_uses_llm()
             with data_lock:
                 fork_point_trigger, fork_rows_to_bottom = sign_route_fork_point_trigger_active(global_control_data)
             for idx, obj in enumerate(objs):
@@ -1260,7 +1321,7 @@ def yolo_worker(core_id=None, worker_id=0):
                 if cls_id != config.SIGN_CLASS_ID:
                     continue
                 rect = obj.get("rect", [0, 0, 0, 0])
-                if sign_route_uses_llm() and route_trigger_rect is None:
+                if route_sign_gate_enabled and route_trigger_rect is None:
                     if fork_point_trigger:
                         should_trigger = sign_rect_edge_safe(rect)
                         trigger_skip_reason = (
@@ -1288,7 +1349,7 @@ def yolo_worker(core_id=None, worker_id=0):
             if route_trigger_rect is None and route_skip_debug is not None:
                 throttled_log(
                     "sign_route_trigger_skip",
-                    "语义路牌未触发停车: "
+                    "语义路牌未达标: "
                     f"原因={route_skip_debug['reason']} "
                     f"area={route_skip_debug['area']:.0f} "
                     f"dist={route_skip_debug['dist']:.0f} "
@@ -1782,6 +1843,13 @@ def seg_worker(core_id, worker_id=0):
             global_control_data["car_avoidance_left_boundary_error"] = car_stats.get("car_left_boundary_error")
             global_control_data["car_avoidance_left_boundary_x"] = car_stats.get("car_left_boundary_x")
             global_control_data["car_avoidance_boundary_inset_x"] = float(car_stats.get("car_boundary_inset_x", 0.0))
+            global_control_data["car_avoidance_detected_cars"] = int(car_stats.get("car_detected_cars", 0))
+            global_control_data["car_avoidance_locked_confirmed"] = bool(car_stats.get("car_locked_confirmed", False))
+            global_control_data["car_avoidance_locked_hit_frames"] = int(car_stats.get("car_locked_hit_frames", 0))
+            global_control_data["car_avoidance_boundary_path_active"] = bool(car_stats.get("car_boundary_path_active", False))
+            global_control_data["car_avoidance_avoid_weight"] = float(car_stats.get("car_avoid_weight", 0.0))
+            global_control_data["car_avoidance_event"] = str(car_stats.get("car_event", ""))
+            global_control_data["car_avoidance_cycle_id"] = int(car_stats.get("car_cycle_id", 0))
             y_fork_point = car_stats.get("y_fork_point")
             y_fork_rows_to_bottom = None
             if bool(y_fork_active) and y_fork_point is not None:
@@ -1813,7 +1881,12 @@ def seg_worker(core_id, worker_id=0):
             sign_llm_stop_active = global_control_data.get("sign_llm_stop_active", False)
             sign_llm_waiting_result = global_control_data.get("sign_llm_waiting_result", False)
             debug_keyboard_stop_active = bool(global_control_data.get("debug_keyboard_stop_active", False))
-            update_sign_route_after_seg(global_control_data, bool(y_fork_active))
+            update_sign_route_after_seg(
+                global_control_data,
+                bool(y_fork_active),
+                current_yolo_boxes=current_yolo_boxes,
+                yolo_frame_id=current_yolo_frame_id,
+            )
             route_state = str(global_control_data.get("sign_route_state", "IDLE"))
             route_choice = int(global_control_data.get("sign_route_choice", 0))
 
@@ -1894,7 +1967,7 @@ def seg_worker(core_id, worker_id=0):
                 turn_intent = global_control_data.get("turn_intent", -1)
                 sign_route_choice = int(global_control_data.get("sign_route_choice", 0))
                 if sign_route_choice not in (-1, 1):
-                    sign_route_choice = pending_fixed_route_choice(global_control_data)
+                    sign_route_choice = pending_fixed_route_choice(global_control_data, current_yolo_boxes)
                 route_state = str(global_control_data.get("sign_route_state", "IDLE"))
                 sign_route_pending = route_state in ("SIGN_STOP_COLLECT", "WAIT_API")
                 external_boundary_inset_x = 0.0
@@ -2027,7 +2100,7 @@ def seg_worker(core_id, worker_id=0):
             turn_intent = global_control_data.get("turn_intent", -1)
             sign_route_choice = int(global_control_data.get("sign_route_choice", 0))
             if sign_route_choice not in (-1, 1):
-                sign_route_choice = pending_fixed_route_choice(global_control_data)
+                sign_route_choice = pending_fixed_route_choice(global_control_data, current_yolo_boxes)
             route_state = str(global_control_data.get("sign_route_state", "IDLE"))
             sign_route_pending = route_state in ("SIGN_STOP_COLLECT", "WAIT_API")
             external_boundary_inset_x = 0.0
@@ -2129,6 +2202,13 @@ def serial_control_thread():
             car_avoidance_left_boundary_error = global_control_data.get("car_avoidance_left_boundary_error")
             car_avoidance_left_boundary_x = global_control_data.get("car_avoidance_left_boundary_x")
             car_avoidance_boundary_inset_x = float(global_control_data.get("car_avoidance_boundary_inset_x", 0.0))
+            car_avoidance_detected_cars = int(global_control_data.get("car_avoidance_detected_cars", 0))
+            car_avoidance_locked_confirmed = bool(global_control_data.get("car_avoidance_locked_confirmed", False))
+            car_avoidance_locked_hit_frames = int(global_control_data.get("car_avoidance_locked_hit_frames", 0))
+            car_avoidance_boundary_path_active = bool(global_control_data.get("car_avoidance_boundary_path_active", False))
+            car_avoidance_avoid_weight = float(global_control_data.get("car_avoidance_avoid_weight", 0.0))
+            car_avoidance_event = str(global_control_data.get("car_avoidance_event", ""))
+            car_avoidance_cycle_id = int(global_control_data.get("car_avoidance_cycle_id", 0))
             sign_llm_stop_active = bool(global_control_data.get("sign_llm_stop_active", False))
             sign_llm_collecting = bool(global_control_data.get("sign_llm_collecting", False))
             sign_llm_frame_id = int(global_control_data.get("sign_llm_frame_id", -1))
@@ -2260,6 +2340,13 @@ def serial_control_thread():
             car_avoidance_left_boundary_error = None
             car_avoidance_left_boundary_x = None
             car_avoidance_boundary_inset_x = 0.0
+            car_avoidance_detected_cars = 0
+            car_avoidance_locked_confirmed = False
+            car_avoidance_locked_hit_frames = 0
+            car_avoidance_boundary_path_active = False
+            car_avoidance_avoid_weight = 0.0
+            car_avoidance_event = ""
+            car_avoidance_cycle_id = 0
             person_dist_to_bottom = None
             person_area = None
             person_left_boundary_x = None
@@ -2304,6 +2391,8 @@ def serial_control_thread():
         car_miss_text = f"{int(car_avoidance_miss_frames)}"
         car_clear_text = f"{int(car_avoidance_clear_frames)}"
         car_pause_text = "1" if car_avoidance_state_paused else "0"
+        car_locked_text = "1" if car_avoidance_locked_confirmed else "0"
+        car_path_text = "1" if car_avoidance_boundary_path_active else "0"
         car_left_x_text = "无" if car_avoidance_left_boundary_x is None else f"{float(car_avoidance_left_boundary_x):.1f}"
         car_left_error_text = "无" if car_avoidance_left_boundary_error is None else f"{float(car_avoidance_left_boundary_error):.1f}"
         car_boundary_inset_text = f"{float(car_avoidance_boundary_inset_x):.1f}"
@@ -2311,10 +2400,28 @@ def serial_control_thread():
         if car_avoidance_active and (car_avoidance_state != "FOLLOW_LANE" or abs(float(car_avoidance_boundary_inset_x)) > 0.0):
             throttled_log(
                 "car_avoid_detail",
-                f">>> 避车(B): state={car_avoidance_state} rows={car_rows_text} "
-                f"miss={car_miss_text} clear={car_clear_text} pause={car_pause_text} inset={car_boundary_inset_text} "
+                f">>> 避车#{car_avoidance_cycle_id}(B): event={car_avoidance_event or '-'} state={car_avoidance_state} rows={car_rows_text} "
+                f"det={int(car_avoidance_detected_cars)} locked={car_locked_text} hits={int(car_avoidance_locked_hit_frames)} "
+                f"miss={car_miss_text} clear={car_clear_text} pause={car_pause_text} path={car_path_text} "
+                f"inset={car_boundary_inset_text} weight={float(car_avoidance_avoid_weight):.2f} "
                 f"left_x={car_left_x_text} left_e={car_left_error_text}",
-                state=(car_avoidance_state, car_rows_text, car_miss_text, car_clear_text, car_pause_text, car_boundary_inset_text, car_left_x_text, car_left_error_text),
+                state=(
+                    car_avoidance_cycle_id,
+                    car_avoidance_event,
+                    car_avoidance_state,
+                    car_rows_text,
+                    int(car_avoidance_detected_cars),
+                    car_locked_text,
+                    int(car_avoidance_locked_hit_frames),
+                    car_miss_text,
+                    car_clear_text,
+                    car_pause_text,
+                    car_path_text,
+                    car_boundary_inset_text,
+                    int(float(car_avoidance_avoid_weight) * 100),
+                    car_left_x_text,
+                    car_left_error_text,
+                ),
                 min_interval=float(getattr(config, "LOG_INTERVAL_CAR_AVOIDANCE_DETAIL", 1.0)),
             )
 

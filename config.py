@@ -195,12 +195,16 @@ SIGN_LLM_ENABLED = True
 # SIGN_ROUTE_DECISION_MODE = "llm_once"
 SIGN_ROUTE_DECISION_MODE = "fixed_sequence"
 # fixed_sequence 模式下是否跳过第一次分割岔路事件。
-# 路牌识别模式第一圈没有路牌，所以第一次看到路牌不能跳过。
+# 当 SIGN_ROUTE_FIXED_REQUIRE_SIGN=True 时，普通无路牌岔路不计数；
+# 第一次“路牌+岔路”直接按第二圈固定方向走，本参数不再跳过它。
 SIGN_ROUTE_SKIP_FIRST_PASS = True
 # fixed_sequence 模式下第二圈方向。
 # 默认 LEFT: 第二圈走左侧外圈，第三圈自动取反走右侧内圈。
 # 改成 RIGHT: 第二圈走右侧内圈，第三圈自动取反走左侧外圈。
 SIGN_ROUTE_FIXED_FIRST_CHOICE = "LEFT"
+# fixed_sequence 模式下，固定序列只允许在当前同时看见 sign 和 Y 岔时触发。
+# sign 只要求 YOLO 检出有效框，不再按面积或历史帧窗口匹配。
+SIGN_ROUTE_FIXED_REQUIRE_SIGN = True
 # 触发语义路牌停车采样的 sign 框面积阈值，单位是 TARGET_RES 坐标系像素面积。
 # 它会和 SIGN_LLM_TRIGGER_DIST、SIGN_LLM_TRIGGER_EDGE_MARGIN_RATIO 同时满足后才停车。
 SIGN_LLM_TRIGGER_AREA = 12000
@@ -737,7 +741,7 @@ STANLEY_LATERAL_AVG_HALF_WINDOW = 10.0
 STANLEY_LATERAL_GAIN = 0.4 #0.32
 # 横向 D 系数 Kd，作用在 EMA 后横向误差的帧间变化量 de 上。
 # 默认关闭；想试 B+d 时先从很小值开始，例如 0.040-0.045。
-STANLEY_LATERAL_D_GAIN =0.026 #0.022
+STANLEY_LATERAL_D_GAIN =0.022 #0.022
 # D 项使用前先对 e 做 EMA 平滑。数值越大越稳，但 D 项反应越慢。
 STANLEY_LATERAL_D_EMA_ALPHA = 0.3
 # 航向误差增益 g_psi。
@@ -960,6 +964,8 @@ DEFAULT_CONTROL_DATA = {
     "sign_route_y_fork_active": False,
     "sign_route_fork_point": None,
     "sign_route_fork_rows_to_bottom": None,
+    "sign_route_fixed_sign_frame_id": -1,
+    "sign_route_fixed_sign_rect": None,
     "sign_route_api_submitted": False,
     "person_stop_active": False,
     "person_bottom_y": None,
@@ -994,6 +1000,12 @@ DEFAULT_CONTROL_DATA = {
     "car_avoidance_left_boundary_error": None,
     "car_avoidance_left_boundary_x": None,
     "car_avoidance_boundary_inset_x": 0.0,
+    "car_avoidance_detected_cars": 0,
+    "car_avoidance_locked_confirmed": False,
+    "car_avoidance_locked_hit_frames": 0,
+    "car_avoidance_boundary_path_active": False,
+    "car_avoidance_avoid_weight": 0.0,
+    "car_avoidance_event": "",
     "debug_keyboard_enabled": False,
     "debug_keyboard_stop_active": False,
     "debug_keyboard_message": "",
@@ -1460,11 +1472,14 @@ CAR_AVOIDANCE_MAX_AREA = 0.0
 # CLEARING 里把最后一次避车参考线逐帧混回正常循线路径。
 CAR_AVOIDANCE_CLEARING_MISS_FRAMES = 0
 # CLEARING 衰减帧数。
-CAR_AVOIDANCE_CLEARING_DECAY_FRAMES = 40
+CAR_AVOIDANCE_CLEARING_DECAY_FRAMES = 25
 # CLEARING 硬退出上限，避免丢车后长期挂在避车状态。
-CAR_AVOIDANCE_CLEARING_MAX_FRAMES = 42
+CAR_AVOIDANCE_CLEARING_MAX_FRAMES = 26
 # 避车详细日志间隔。
 LOG_INTERVAL_CAR_AVOIDANCE_DETAIL = 1.0
+# 避车状态机过程日志，现场排查“避完车后丢线”时保持开启。
+CAR_AVOIDANCE_PROCESS_LOG_ENABLED = True
+LOG_INTERVAL_CAR_AVOIDANCE_PROCESS = 0.25
 # 主分割调试图绘制风格。
 # 最终路径线颜色。
 SEG_DEBUG_PATH_COLOR = (255, 0, 255)
