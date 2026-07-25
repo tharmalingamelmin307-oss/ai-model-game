@@ -49,6 +49,7 @@ class PathController:
         lateral_points=None,
         heading_points=None,
         d_gain_scale=1.0,
+        param_overrides=None,
     ):
         """按配置选择单一转向控制器；各控制器互不自动切换."""
         d_gain_scale = float(np.clip(float(d_gain_scale), 0.0, 1.0))
@@ -70,6 +71,7 @@ class PathController:
                 lateral_points=lateral_points,
                 heading_points=heading_points,
                 d_gain_scale=d_gain_scale,
+                param_overrides=param_overrides,
             )
             if stanley_signal is not None and np.isfinite(stanley_signal):
                 return float(stanley_signal)
@@ -326,7 +328,12 @@ class PathController:
         dx_dy = float(np.clip(dx_dy, -3.5, 3.5))
         return float(np.arctan(-dx_dy))
 
-    def _compute_stanley_band_steer_signal(self, path_points, img_w, img_h, center_bias_x=0.0, lateral_points=None, heading_points=None, d_gain_scale=1.0):
+    def _stanley_param(self, overrides, name, default):
+        if isinstance(overrides, dict) and name in overrides:
+            return overrides[name]
+        return default
+
+    def _compute_stanley_band_steer_signal(self, path_points, img_w, img_h, center_bias_x=0.0, lateral_points=None, heading_points=None, d_gain_scale=1.0, param_overrides=None):
         """算法 B: 按前视行 Stanley 公式计算转向量."""
         geom = self._compute_stanley_point_geometry(
             path_points,
@@ -352,10 +359,26 @@ class PathController:
         ff_heading_error = geom["ff_heading_error"]
 
         soft = max(1e-6, float(getattr(config, "STANLEY_SOFT", 24.0)))
-        speed_estimate = max(0.0, float(getattr(config, "STANLEY_SPEED_ESTIMATE", 0.0)))
-        lateral_gain = float(getattr(config, "STANLEY_LATERAL_GAIN", 0.028))
-        heading_gain = float(getattr(config, "STANLEY_HEADING_GAIN", 0.85))
-        d_gain = float(getattr(config, "STANLEY_LATERAL_D_GAIN", 0.0)) * float(d_gain_scale)
+        speed_estimate = max(0.0, float(self._stanley_param(
+            param_overrides,
+            "speed_estimate",
+            getattr(config, "STANLEY_SPEED_ESTIMATE", 0.0),
+        )))
+        lateral_gain = float(self._stanley_param(
+            param_overrides,
+            "lateral_gain",
+            getattr(config, "STANLEY_LATERAL_GAIN", 0.028),
+        ))
+        heading_gain = float(self._stanley_param(
+            param_overrides,
+            "heading_gain",
+            getattr(config, "STANLEY_HEADING_GAIN", 0.85),
+        ))
+        d_gain = float(self._stanley_param(
+            param_overrides,
+            "d_gain",
+            getattr(config, "STANLEY_LATERAL_D_GAIN", 0.0),
+        )) * float(d_gain_scale)
         curvature_gain = float(getattr(config, "STANLEY_CURVATURE_FF_GAIN", 0.0))
         signal_scale = float(getattr(config, "STANLEY_SIGNAL_SCALE", 10000.0))
 

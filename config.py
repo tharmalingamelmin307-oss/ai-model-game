@@ -1006,6 +1006,7 @@ DEFAULT_CONTROL_DATA = {
     "car_avoidance_boundary_path_active": False,
     "car_avoidance_avoid_weight": 0.0,
     "car_avoidance_event": "",
+    "car_avoidance_cycle_id": 0,
     "debug_keyboard_enabled": False,
     "debug_keyboard_stop_active": False,
     "debug_keyboard_message": "",
@@ -1435,9 +1436,13 @@ TRACK_WIDTH_LOG_INTERVAL = 1.5
 # 让左边界尽量维持在画面中间；停车时避车状态机冻结，恢复后继续。
 # ---------------------------------------------------------------------------
 CAR_AVOIDANCE_ENABLED = True
-# 控制器追左边界本身，0 表示不再从左边界额外向中线内收。
-CAR_AVOIDANCE_LEFT_BOUNDARY_INSET = 0.0
-CAR_AVOIDANCE_NEAR_LEFT_BOUNDARY_INSET = 0.0
+# 遇见车辆后，把左边线本身当作控制中线，不做额外内收。
+# 避车期间单独使用更慢的速度和更温和的 B 控制参数，不影响普通循线网页调参。
+CAR_AVOIDANCE_TARGET_SPEED = 50
+CAR_AVOIDANCE_STANLEY_LATERAL_GAIN = 0.35
+CAR_AVOIDANCE_STANLEY_LATERAL_D_GAIN = 0.03
+CAR_AVOIDANCE_STANLEY_HEADING_GAIN = 0.0
+CAR_AVOIDANCE_STANLEY_SPEED_ESTIMATE = CAR_AVOIDANCE_TARGET_SPEED
 # car 底部中心距离画面底部超过这个行数时，只锁定跟踪，不让避障拉线接管。
 # 这个值越大，越早开始让避障拉线接管。
 CAR_AVOIDANCE_START_BOUNDARY_ROWS = 170.0
@@ -1462,19 +1467,26 @@ CAR_AVOIDANCE_TRACK_EMA_ALPHA = 0.65
 # 连续看不见 car 达到这个帧数后，才进入 CLEARING 回正。
 CAR_AVOIDANCE_MISS_FRAMES = 5
 # 近距离也按同样规则处理，避免贴底后长期挂在避障状态。
-CAR_AVOIDANCE_NEAR_MISS_FRAMES = 5
+CAR_AVOIDANCE_NEAR_MISS_FRAMES = 2
+# car 漏检时不沿横向速度外推，避免避车参考线突然左右跳。
+# 纵向仍沿用速度预测，用于判断目标是否已经接近画面底部。
+CAR_AVOIDANCE_MISS_X_PREDICT_GAIN = 0.0
 # car 检测最低置信度过滤；0 表示不额外过滤。
 CAR_AVOIDANCE_MIN_SCORE = 0.0
 # car 检测最大面积过滤；0 表示不额外过滤。
 CAR_AVOIDANCE_MAX_AREA = 0.0
 # 避障退出状态机。
-# 车丢失后不立刻回正，而是先进入 CLEARING。
-# CLEARING 里把最后一次避车参考线逐帧混回正常循线路径。
+# 车丢失后先保持左边线一段时间，再在短窗口内切回正常循线。
 CAR_AVOIDANCE_CLEARING_MISS_FRAMES = 0
-# CLEARING 衰减帧数。
-CAR_AVOIDANCE_CLEARING_DECAY_FRAMES = 25
+# CLEARING 前段继续追左边线的帧数。
+CAR_AVOIDANCE_CLEARING_HOLD_FRAMES = 15
+# CLEARING 后段从左边线切回正常循线的帧数。
+CAR_AVOIDANCE_CLEARING_RETURN_FRAMES = 5
+# 是否在避车路径/正常循线路径切换时清空转向控制器历史。
+# Stanley/Control-C 本身依赖 EMA 历史抑制跳变，默认关闭，避免弯道切换时第一帧过冲。
+CAR_AVOIDANCE_RESET_CONTROLLER_ON_PATH_SWITCH = False
 # CLEARING 硬退出上限，避免丢车后长期挂在避车状态。
-CAR_AVOIDANCE_CLEARING_MAX_FRAMES = 26
+CAR_AVOIDANCE_CLEARING_MAX_FRAMES = 20
 # 避车详细日志间隔。
 LOG_INTERVAL_CAR_AVOIDANCE_DETAIL = 1.0
 # 避车状态机过程日志，现场排查“避完车后丢线”时保持开启。

@@ -1842,6 +1842,7 @@ def seg_worker(core_id, worker_id=0):
             global_control_data["car_avoidance_state_paused"] = bool(car_stats.get("car_state_paused", False))
             global_control_data["car_avoidance_left_boundary_error"] = car_stats.get("car_left_boundary_error")
             global_control_data["car_avoidance_left_boundary_x"] = car_stats.get("car_left_boundary_x")
+            global_control_data["car_avoidance_control_path_error"] = car_stats.get("car_control_path_error")
             global_control_data["car_avoidance_boundary_inset_x"] = float(car_stats.get("car_boundary_inset_x", 0.0))
             global_control_data["car_avoidance_detected_cars"] = int(car_stats.get("car_detected_cars", 0))
             global_control_data["car_avoidance_locked_confirmed"] = bool(car_stats.get("car_locked_confirmed", False))
@@ -1850,6 +1851,10 @@ def seg_worker(core_id, worker_id=0):
             global_control_data["car_avoidance_avoid_weight"] = float(car_stats.get("car_avoid_weight", 0.0))
             global_control_data["car_avoidance_event"] = str(car_stats.get("car_event", ""))
             global_control_data["car_avoidance_cycle_id"] = int(car_stats.get("car_cycle_id", 0))
+            global_control_data["car_avoidance_control_kp"] = car_stats.get("car_control_kp")
+            global_control_data["car_avoidance_control_kd"] = car_stats.get("car_control_kd")
+            global_control_data["car_avoidance_control_psi"] = car_stats.get("car_control_psi")
+            global_control_data["car_avoidance_control_speed_estimate"] = car_stats.get("car_control_speed_estimate")
             y_fork_point = car_stats.get("y_fork_point")
             y_fork_rows_to_bottom = None
             if bool(y_fork_active) and y_fork_point is not None:
@@ -2201,6 +2206,7 @@ def serial_control_thread():
             car_avoidance_state_paused = bool(global_control_data.get("car_avoidance_state_paused", False))
             car_avoidance_left_boundary_error = global_control_data.get("car_avoidance_left_boundary_error")
             car_avoidance_left_boundary_x = global_control_data.get("car_avoidance_left_boundary_x")
+            car_avoidance_control_path_error = global_control_data.get("car_avoidance_control_path_error")
             car_avoidance_boundary_inset_x = float(global_control_data.get("car_avoidance_boundary_inset_x", 0.0))
             car_avoidance_detected_cars = int(global_control_data.get("car_avoidance_detected_cars", 0))
             car_avoidance_locked_confirmed = bool(global_control_data.get("car_avoidance_locked_confirmed", False))
@@ -2209,6 +2215,10 @@ def serial_control_thread():
             car_avoidance_avoid_weight = float(global_control_data.get("car_avoidance_avoid_weight", 0.0))
             car_avoidance_event = str(global_control_data.get("car_avoidance_event", ""))
             car_avoidance_cycle_id = int(global_control_data.get("car_avoidance_cycle_id", 0))
+            car_avoidance_control_kp = global_control_data.get("car_avoidance_control_kp")
+            car_avoidance_control_kd = global_control_data.get("car_avoidance_control_kd")
+            car_avoidance_control_psi = global_control_data.get("car_avoidance_control_psi")
+            car_avoidance_control_speed_estimate = global_control_data.get("car_avoidance_control_speed_estimate")
             sign_llm_stop_active = bool(global_control_data.get("sign_llm_stop_active", False))
             sign_llm_collecting = bool(global_control_data.get("sign_llm_collecting", False))
             sign_llm_frame_id = int(global_control_data.get("sign_llm_frame_id", -1))
@@ -2262,6 +2272,11 @@ def serial_control_thread():
                 )
             )
             target_speed = dynamic_target_speed
+            if car_avoidance_active:
+                target_speed = min(
+                    int(target_speed),
+                    int(round(float(getattr(config, "CAR_AVOIDANCE_TARGET_SPEED", target_speed)))),
+                )
 
             stop_ready = False
             if sign_llm_stop_active:
@@ -2339,6 +2354,7 @@ def serial_control_thread():
             car_avoidance_state_paused = False
             car_avoidance_left_boundary_error = None
             car_avoidance_left_boundary_x = None
+            car_avoidance_control_path_error = None
             car_avoidance_boundary_inset_x = 0.0
             car_avoidance_detected_cars = 0
             car_avoidance_locked_confirmed = False
@@ -2347,6 +2363,10 @@ def serial_control_thread():
             car_avoidance_avoid_weight = 0.0
             car_avoidance_event = ""
             car_avoidance_cycle_id = 0
+            car_avoidance_control_kp = None
+            car_avoidance_control_kd = None
+            car_avoidance_control_psi = None
+            car_avoidance_control_speed_estimate = None
             person_dist_to_bottom = None
             person_area = None
             person_left_boundary_x = None
@@ -2395,7 +2415,12 @@ def serial_control_thread():
         car_path_text = "1" if car_avoidance_boundary_path_active else "0"
         car_left_x_text = "无" if car_avoidance_left_boundary_x is None else f"{float(car_avoidance_left_boundary_x):.1f}"
         car_left_error_text = "无" if car_avoidance_left_boundary_error is None else f"{float(car_avoidance_left_boundary_error):.1f}"
+        car_control_error_text = "无" if car_avoidance_control_path_error is None else f"{float(car_avoidance_control_path_error):.1f}"
         car_boundary_inset_text = f"{float(car_avoidance_boundary_inset_x):.1f}"
+        car_kp_text = "无" if car_avoidance_control_kp is None else f"{float(car_avoidance_control_kp):.2f}"
+        car_kd_text = "无" if car_avoidance_control_kd is None else f"{float(car_avoidance_control_kd):.2f}"
+        car_psi_text = "无" if car_avoidance_control_psi is None else f"{float(car_avoidance_control_psi):.2f}"
+        car_v_text = "无" if car_avoidance_control_speed_estimate is None else f"{float(car_avoidance_control_speed_estimate):.0f}"
 
         if car_avoidance_active and (car_avoidance_state != "FOLLOW_LANE" or abs(float(car_avoidance_boundary_inset_x)) > 0.0):
             throttled_log(
@@ -2404,7 +2429,8 @@ def serial_control_thread():
                 f"det={int(car_avoidance_detected_cars)} locked={car_locked_text} hits={int(car_avoidance_locked_hit_frames)} "
                 f"miss={car_miss_text} clear={car_clear_text} pause={car_pause_text} path={car_path_text} "
                 f"inset={car_boundary_inset_text} weight={float(car_avoidance_avoid_weight):.2f} "
-                f"left_x={car_left_x_text} left_e={car_left_error_text}",
+                f"left_x={car_left_x_text} left_e={car_left_error_text} ctrl_e={car_control_error_text} "
+                f"B=({car_kp_text},{car_kd_text},{car_psi_text}) v={car_v_text}",
                 state=(
                     car_avoidance_cycle_id,
                     car_avoidance_event,
@@ -2421,6 +2447,11 @@ def serial_control_thread():
                     int(float(car_avoidance_avoid_weight) * 100),
                     car_left_x_text,
                     car_left_error_text,
+                    car_control_error_text,
+                    car_kp_text,
+                    car_kd_text,
+                    car_psi_text,
+                    car_v_text,
                 ),
                 min_interval=float(getattr(config, "LOG_INTERVAL_CAR_AVOIDANCE_DETAIL", 1.0)),
             )
