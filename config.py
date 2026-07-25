@@ -121,9 +121,8 @@ YOLO_ACTIVE_WORKERS_AFTER_SIGN = 2
 REC_CORE = 1
 
 # 路牌 OCR 正在运行时，是否暂停 YOLO 检测。
-# True: OCR 期间 YOLO 不跑推理，避免双核 YOLO 抢 NPU；OCR 结束后自动恢复。
-# False: OCR 和 YOLO 并行跑，检测连续性更好，但 OCR 期间可能互相抢核。
-YOLO_PAUSE_DURING_OCR = True
+# 行人/车辆实时性优先，默认不暂停 YOLO；代价是 OCR 期间可能互相抢核、OCR 慢一点。
+YOLO_PAUSE_DURING_OCR = False
 
 # YOLO 因 OCR 暂停的最长时间，单位秒。
 # 超过这个时间还没收到 OCR 完成信号，就自动恢复 YOLO，避免检测 FPS 长时间为 0。
@@ -1032,11 +1031,17 @@ DEFAULT_FPS_STATS = {
 SEG_QUEUE_MAXSIZE = 1
 # YOLO 检测链路队列容量，只保留最新帧，避免检测结果过旧。
 YOLO_QUEUE_MAXSIZE = 1
+# YOLO worker 开始推理前，把队列里残留输入清到最后一帧。
+# 这样宁可少跑几帧，也不拿旧帧做人/车检测。
+YOLO_WORKER_DRAIN_LATEST_QUEUE = True
 
 # YOLO 投帧降频。Seg 是主控链路，每帧都跑；YOLO 只需要更新目标状态，
 # 不必和 Seg 抢每一帧的 NPU/CPU 时间。
 # 1 表示每帧都投；10 表示每 10 帧投 1 帧。
 YOLO_PRODUCER_FRAME_INTERVAL = 1
+# Seg 后处理真正使用 YOLO 框前，再读取一次最新检测结果。
+# 这能减少“行人框跟着旧分割帧走”的显示和停车延迟。
+SEG_POSTPROCESS_REFRESH_YOLO = True
 # OCR 队列容量。OCR 慢于检测，允许保留少量任务，但不应堆积太多旧帧。
 OCR_QUEUE_MAXSIZE = 2
 
@@ -1443,9 +1448,15 @@ CAR_AVOIDANCE_STANLEY_LATERAL_GAIN = 0.35
 CAR_AVOIDANCE_STANLEY_LATERAL_D_GAIN = 0.03
 CAR_AVOIDANCE_STANLEY_HEADING_GAIN = 0.0
 CAR_AVOIDANCE_STANLEY_SPEED_ESTIMATE = CAR_AVOIDANCE_TARGET_SPEED
-# car 底部中心距离画面底部超过这个行数时，只锁定跟踪，不让避障拉线接管。
-# 这个值越大，越早开始让避障拉线接管。
-CAR_AVOIDANCE_START_BOUNDARY_ROWS = 170.0
+# 全程最多触发几次车辆避障；0 表示不限制。
+CAR_AVOIDANCE_MAX_CYCLES = 2
+# car 底部中心距离画面底部超过这个行数时，不触发新的避车。
+# SEG 高度是 160，120 表示车框底部进入中近距离后才允许躲。
+CAR_AVOIDANCE_START_BOUNDARY_ROWS = 150.0
+# 在预览画面上画出避车触发距离线；车框底边低于蓝线才允许触发避车。
+CAR_AVOIDANCE_DISTANCE_LINE_ENABLED = True
+CAR_AVOIDANCE_DISTANCE_LINE_COLOR = (255, 0, 0)
+CAR_AVOIDANCE_DISTANCE_LINE_THICKNESS = 3
 # car 底部中心距离画面底部不超过这个行数时，使用近距离漏检帧数。
 CAR_AVOIDANCE_NEAR_BOUNDARY_ROWS = 110.0
 # 避车提交距离：拉左线后，目标第一次进入这个距离以内，就持续左线直到 car 消失。

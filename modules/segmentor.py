@@ -2554,6 +2554,38 @@ class RoadSegmentor:
         if len(base) < 2 or not bool(getattr(config, "CAR_AVOIDANCE_ENABLED", True)):
             return 0.0, debug, None
 
+        max_cycles = int(getattr(config, "CAR_AVOIDANCE_MAX_CYCLES", 0))
+        if (
+            max_cycles > 0 and
+            self.car_avoidance_state == "FOLLOW_LANE" and
+            int(self.car_avoidance_cycle_id) >= max_cycles
+        ):
+            self.locked_car = None
+            self.locked_car_miss_frames = 0
+            measurements = []
+            for item in planning_items:
+                measurement = self._car_measurement_from_item(item, w_seg, h_seg, base)
+                if measurement is not None:
+                    measurements.append(measurement)
+            debug["detected_cars"] = int(len(measurements))
+            debug["state"] = self.car_avoidance_state
+            debug["event"] = "cycle_limit"
+            if measurements:
+                throttled_log_key = "car_avoidance_cycle_limit"
+                now = time.monotonic()
+                interval = max(0.2, float(getattr(config, "LOG_INTERVAL_CAR_AVOIDANCE_PROCESS", 0.25)))
+                if (
+                    self.last_car_avoid_log_state != throttled_log_key or
+                    now - float(self.last_car_avoid_log_at) >= interval
+                ):
+                    self.last_car_avoid_log_state = throttled_log_key
+                    self.last_car_avoid_log_at = now
+                    print(
+                        f"避车次数已达上限: 已避车{int(self.car_avoidance_cycle_id)}次，忽略后续车辆 det={len(measurements)}",
+                        flush=True,
+                    )
+            return 0.0, debug, None
+
         if not bool(state_updates_enabled):
             debug["cycle_id"] = int(self.car_avoidance_cycle_id)
             debug["state"] = self.car_avoidance_state
@@ -2650,6 +2682,37 @@ class RoadSegmentor:
         debug["detected_cars"] = int(len(measurements))
 
         prev_state = self.car_avoidance_state
+        if self.locked_car is None and self.car_avoidance_state == "FOLLOW_LANE":
+            start_rows = max(0.0, float(getattr(config, "CAR_AVOIDANCE_START_BOUNDARY_ROWS", 115.0)))
+            path_bottom_y = float(np.max(base[:, 1]))
+            near_measurements = []
+            far_measurements = []
+            for measurement in measurements:
+                _cx, cy = measurement["bottom_center"]
+                rows_to_car = max(0.0, path_bottom_y - float(cy))
+                if rows_to_car <= start_rows:
+                    near_measurements.append(measurement)
+                else:
+                    far_measurements.append((rows_to_car, measurement))
+            if far_measurements and not near_measurements:
+                debug["state"] = self.car_avoidance_state
+                debug["event"] = "distance_limit"
+                nearest_rows = min(rows for rows, _measurement in far_measurements)
+                now = time.monotonic()
+                interval = max(0.2, float(getattr(config, "LOG_INTERVAL_CAR_AVOIDANCE_PROCESS", 0.25)))
+                if (
+                    self.last_car_avoid_log_state != "car_avoidance_distance_limit" or
+                    now - float(self.last_car_avoid_log_at) >= interval
+                ):
+                    self.last_car_avoid_log_state = "car_avoidance_distance_limit"
+                    self.last_car_avoid_log_at = now
+                    print(
+                        f"避车距离未到: rows={nearest_rows:.1f}>{start_rows:.1f}，暂不触发 det={len(measurements)}",
+                        flush=True,
+                    )
+                return 0.0, debug, None
+            measurements = near_measurements
+
         locked_car = self._update_locked_car(measurements, base)
         if locked_car is None:
             if self.car_avoidance_state == "AVOIDING" and self.car_last_avoid_path is not None:

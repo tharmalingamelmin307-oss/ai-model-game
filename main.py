@@ -21,7 +21,7 @@ import numpy as np
 import cv2
 import threading
 import serial
-from queue import Queue
+from queue import Queue, Empty
 from multiprocessing import Process, Queue as MPQueue, shared_memory, resource_tracker
 from flask import Flask, Response, render_template_string, request
 
@@ -110,6 +110,21 @@ def throttled_log(key, message, state=None, min_interval=None):
 def log_once(key, message):
     """同一类错误只打印一次，避免异常反复刷屏。"""
     debug_logger.log_once(key, message)
+
+
+def drain_latest_queue_item(input_queue, first_item):
+    """从最新帧队列里清到最后一个 item，避免处理排队旧帧。"""
+    latest_item = first_item
+    dropped = 0
+    while True:
+        try:
+            latest_item = input_queue.get_nowait()
+            dropped += 1
+            if latest_item is None:
+                break
+        except Empty:
+            break
+    return latest_item, dropped
 
 
 def profile_log(key, label, metrics, min_interval=None):
@@ -1281,8 +1296,19 @@ def yolo_worker(core_id=None, worker_id=0):
 
             frame_data = input_queue.get()
             t_after_get = time.perf_counter()
+            drained_input = 0
+            if bool(getattr(config, "YOLO_WORKER_DRAIN_LATEST_QUEUE", True)):
+                frame_data, drained_input = drain_latest_queue_item(input_queue, frame_data)
+            t_after_drain = time.perf_counter()
             if frame_data is None:
                 break
+            if drained_input > 0:
+                throttled_log(
+                    f"yolo_drain_latest_{worker_id}",
+                    f"YOLO[{worker_id}]丢弃排队旧输入: dropped={drained_input}",
+                    state=int(drained_input),
+                    min_interval=1.0,
+                )
 
             det_frame, vis_frame, src_size, frame_id = frame_data
             t_det_start = time.perf_counter()
@@ -1468,6 +1494,7 @@ def yolo_worker(core_id=None, worker_id=0):
                 f"YoloProfile[{worker_id}]",
                 {
                     "wait_input": t_after_get - t_loop_start,
+                    "drain_input": t_after_drain - t_after_get,
                     "det_run": t_det_end - t_det_start,
                     "update": t_update_end - t_det_end,
                     "post": t_loop_end - t_update_end,
@@ -1908,6 +1935,26 @@ def seg_worker(core_id, worker_id=0):
             current_yolo_fps = fps_stats["yolo_fps"]
 
         if rendered_img is not None:
+            if bool(getattr(config, "CAR_AVOIDANCE_DISTANCE_LINE_ENABLED", True)):
+                target_w, target_h = config.TARGET_RES
+                crop_ratio = float(getattr(config, "SEG_INPUT_CROP_TOP_RATIO", 0.0))
+                crop_ratio = max(0.0, min(0.95, crop_ratio))
+                crop_y = float(target_h) * crop_ratio
+                crop_h = max(1.0, float(target_h) - crop_y)
+                seg_h = float(config.SEG_SIZE[1])
+                start_rows = max(0.0, float(getattr(config, "CAR_AVOIDANCE_START_BOUNDARY_ROWS", 0.0)))
+                line_seg_y = float(np.clip((seg_h - 1.0) - start_rows, 0.0, seg_h - 1.0))
+                line_target_y = crop_y + (line_seg_y / seg_h) * crop_h
+                line_y = int(round(line_target_y * rendered_img.shape[0] / float(target_h)))
+                line_y = max(0, min(rendered_img.shape[0] - 1, line_y))
+                cv2.line(
+                    rendered_img,
+                    (0, line_y),
+                    (rendered_img.shape[1] - 1, line_y),
+                    getattr(config, "CAR_AVOIDANCE_DISTANCE_LINE_COLOR", (255, 0, 0)),
+                    max(1, int(getattr(config, "CAR_AVOIDANCE_DISTANCE_LINE_THICKNESS", 3))),
+                    cv2.LINE_AA,
+                )
             if person_info is not None:
                 target_w, target_h = config.TARGET_RES
                 scale_y = rendered_img.shape[0] / float(target_h)
@@ -2040,6 +2087,26 @@ def seg_worker(core_id, worker_id=0):
                 sign_route_pending,
                 debug_drive_active,
             ) = item
+
+            if bool(getattr(config, "SEG_POSTPROCESS_REFRESH_YOLO", True)):
+                with data_lock:
+                    latest_yolo_frame_id = int(global_yolo_frame_id)
+                    if latest_yolo_frame_id >= int(current_yolo_frame_id):
+                        current_yolo_boxes = [obj.copy() for obj in global_yolo_boxes]
+                        current_yolo_frame_id = latest_yolo_frame_id
+                    turn_intent = global_control_data.get("turn_intent", -1)
+                    sign_route_choice = int(global_control_data.get("sign_route_choice", 0))
+                    if sign_route_choice not in (-1, 1):
+                        sign_route_choice = pending_fixed_route_choice(global_control_data, current_yolo_boxes)
+                    route_state = str(global_control_data.get("sign_route_state", "IDLE"))
+                    sign_route_pending = route_state in ("SIGN_STOP_COLLECT", "WAIT_API")
+                    debug_keyboard_state = get_debug_drive_keyboard_state()
+                    drive_stop_active = (
+                        bool(debug_keyboard_state.get("manual_stop_active", False)) or
+                        bool(global_control_data.get("person_stop_active", False)) or
+                        bool(global_control_data.get("sign_llm_stop_active", False))
+                    )
+                    debug_drive_active = not drive_stop_active
 
             try:
                 t_post_start = time.perf_counter()
