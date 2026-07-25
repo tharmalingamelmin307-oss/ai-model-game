@@ -681,7 +681,7 @@ STEER_SIGNAL_NORMALIZED_SCALE = 2800.0
 # 默认关闭；想试 A+PD 时先从 0.05 ~ 0.25 小步加。
 STEER_SIGNAL_D_GAIN = 0
 # D 项使用前先对 A 的 steer_signal 做 EMA 平滑。数值越大越稳，但 D 项反应越慢。
-STEER_SIGNAL_D_EMA_ALPHA = 0.2
+STEER_SIGNAL_D_EMA_ALPHA = 0.1
 # A 算法航向角前馈。用路径远/近两行的 x 差估计路径朝向，提前给一点舵。
 # 这项只做小前馈，不替代 P/D；太大会让直道受远处线噪声影响而左右飘。
 STEER_SIGNAL_HEADING_FF_GAIN = 0.0
@@ -737,9 +737,9 @@ STANLEY_LATERAL_AVG_HALF_WINDOW = 10.0
 STANLEY_LATERAL_GAIN = 0.4 #0.32
 # 横向 D 系数 Kd，作用在 EMA 后横向误差的帧间变化量 de 上。
 # 默认关闭；想试 B+d 时先从很小值开始，例如 0.040-0.045。
-STANLEY_LATERAL_D_GAIN =0.022 #0.022
+STANLEY_LATERAL_D_GAIN =0.026 #0.022
 # D 项使用前先对 e 做 EMA 平滑。数值越大越稳，但 D 项反应越慢。
-STANLEY_LATERAL_D_EMA_ALPHA = 0.1
+STANLEY_LATERAL_D_EMA_ALPHA = 0.3
 # 航向误差增益 g_psi。
 STANLEY_HEADING_GAIN = 0.17#0.25
 # 航向误差 psi 的 EMA 平滑。只影响 STANLEY_HEADING_GAIN 非 0 时的航向项。
@@ -1115,7 +1115,7 @@ PERSON_DEBUG_DRAW_RELEASE_LINE = True
 # 兼容旧参数名，保留给外部脚本读取；当前主逻辑不再依赖中心带状窗口。
 PERSON_CLEAR_CENTER_WINDOW_X = 25.0
 # 行人停车后连续漏检超过这个时间就放行，单位秒。
-PERSON_STOP_MISSING_TIMEOUT_SECONDS = 2.0
+PERSON_STOP_MISSING_TIMEOUT_SECONDS = 1.0
 # 兼容保留字段；当前普通行人停车不再按时间自动释放。
 PERSON_STOP_MAX_SECONDS = 8.0
 # 兼容保留字段；当前漏检放行按 PERSON_STOP_MISSING_TIMEOUT_SECONDS 计时。

@@ -217,6 +217,7 @@ def extract_person_stop_candidate(boxes, frame_id):
             continue
 
         bottom_y = float(np.clip(y + h, 0.0, float(target_h - 1)))
+        dist_to_bottom = float(target_h) - bottom_y
         if bottom_y <= best_bottom_y:
             continue
 
@@ -230,7 +231,7 @@ def extract_person_stop_candidate(boxes, frame_id):
             "bottom_left_x": min(x1, x2),
             "bottom_center_x": 0.5 * (x1 + x2),
             "bottom_right_x": max(x1, x2),
-            "dist_to_bottom": float(target_h) - bottom_y,
+            "dist_to_bottom": dist_to_bottom,
             "area": float(area),
             "score": float(obj.get("score", 0.0)),
         }
@@ -291,6 +292,14 @@ def update_person_stop_state(state, person_info, left_boundary_x, right_boundary
     now = time.monotonic()
     released_by_line = False
     released_by_missing = False
+
+    if person_info is not None and active:
+        target_h = float(config.TARGET_RES[1])
+        trigger_dist = float(getattr(config, "PERSON_STOP_TRIGGER_DIST", 0.0))
+        bottom_y = float(person_info.get("bottom_y", 0.0))
+        dist_to_bottom = float(person_info.get("dist_to_bottom", target_h - bottom_y))
+        if trigger_dist > 0.0 and dist_to_bottom > trigger_dist:
+            person_info = None
 
     if person_info is None:
         miss_frames += 1
@@ -2319,7 +2328,7 @@ def serial_control_thread():
         elif person_stop_event == "release_missing":
             throttled_log(
                 "person_stop_event",
-                ">>> 行人: 漏检2秒放行",
+                f">>> 行人: 漏检{float(getattr(config, 'PERSON_STOP_MISSING_TIMEOUT_SECONDS', 1.0)):.1f}秒放行",
                 state=("release_missing",),
                 min_interval=0.0,
             )

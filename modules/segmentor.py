@@ -1505,6 +1505,7 @@ class RoadSegmentor:
 
         w_seg = float(config.SEG_SIZE[0] - 1)
         min_gap = max(0.0, float(getattr(config, "MERGE_GUIDE_LINE_MIN_GAP", 0.0)))
+        width_ratio = max(0.0, float(getattr(config, "FORK_BOUNDARY_WIDTH_RATIO", 1.0)))
         corrected_nodes = []
 
         for node in nodes:
@@ -1512,7 +1513,7 @@ class RoadSegmentor:
             left_x = float(node["left_x"])
             right_x = float(node["right_x"])
             observed_width = max(0.0, right_x - left_x)
-            fixed_width = self._fixed_track_width_at_y(y, observed_width)
+            fixed_width = self._fixed_track_width_at_y(y, observed_width) * width_ratio
             if fixed_width <= 0.0:
                 corrected_nodes.append(dict(node))
                 continue
