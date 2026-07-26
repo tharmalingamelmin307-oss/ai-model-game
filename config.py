@@ -191,8 +191,8 @@ SIGN_LLM_ENABLED = True
 # 语义岔路决策模式:
 # - "llm_once": 第一次看到岔路牌即第二圈，OCR + 千帆判断；第三圈再次看到岔路牌时取反
 # - "fixed_sequence": 不跑路牌 OCR/千帆；第一圈忽略岔路；第二、三圈按固定序列走
-# SIGN_ROUTE_DECISION_MODE = "llm_once"
-SIGN_ROUTE_DECISION_MODE = "fixed_sequence"
+SIGN_ROUTE_DECISION_MODE = "llm_once"
+# SIGN_ROUTE_DECISION_MODE = "fixed_sequence"
 # fixed_sequence 模式下是否跳过第一次分割岔路事件。
 # 当 SIGN_ROUTE_FIXED_REQUIRE_SIGN=True 时，普通无路牌岔路不计数；
 # 第一次“路牌+岔路”直接按第二圈固定方向走，本参数不再跳过它。
@@ -206,7 +206,7 @@ SIGN_ROUTE_FIXED_FIRST_CHOICE = "LEFT"
 SIGN_ROUTE_FIXED_REQUIRE_SIGN = True
 # 触发语义路牌停车采样的 sign 框面积阈值，单位是 TARGET_RES 坐标系像素面积。
 # 它会和 SIGN_LLM_TRIGGER_DIST、SIGN_LLM_TRIGGER_EDGE_MARGIN_RATIO 同时满足后才停车。
-SIGN_LLM_TRIGGER_AREA = 12000
+SIGN_LLM_TRIGGER_AREA = 16000
 # 触发语义路牌停车采样的 sign 截止距离，单位是 TARGET_RES 像素。
 # 路牌框底边距离画面底部小于等于该值，才认为已经足够近，可以停车采样。
 # 调大：更早停车；调小：更靠近再停车。
@@ -214,7 +214,7 @@ SIGN_LLM_TRIGGER_DIST = 500
 # 硬性停车采样条件：Y 岔路特征点距离分割平面底部小于等于该行数时，
 # 若当前帧有不贴边的 sign 框，立刻停车开始路牌 OCR/千帆，不再受 sign 面积/高度限制。
 # 单位是 SEG_SIZE 坐标系像素行。
-SIGN_LLM_FORK_POINT_TRIGGER_ROWS = 130
+SIGN_LLM_FORK_POINT_TRIGGER_ROWS = 150
 # 停车后希望采集的有效 OCR 样本数量。
 # 收满后会提交给千帆；如果超时，也可能提前提交已有样本。
 SIGN_LLM_OCR_SAMPLES = 5
@@ -737,14 +737,14 @@ STANLEY_FF_NEAR_Y = STANLEY_FF_Y_BOTTOM
 # 横向误差优先使用拟合前中心点在前视行附近的平均值，减少拟合线底部失真影响。
 STANLEY_LATERAL_AVG_HALF_WINDOW = 10.0
 # 横向误差增益 k，控制 atan(k * e / (v_s + soft)) 的纠偏力度。
-STANLEY_LATERAL_GAIN = 0.4 #0.32
+STANLEY_LATERAL_GAIN = 0.36 #0.4
 # 横向 D 系数 Kd，作用在 EMA 后横向误差的帧间变化量 de 上。
 # 默认关闭；想试 B+d 时先从很小值开始，例如 0.040-0.045。
-STANLEY_LATERAL_D_GAIN =0.022 #0.022
+STANLEY_LATERAL_D_GAIN =0.026 #0.022
 # D 项使用前先对 e 做 EMA 平滑。数值越大越稳，但 D 项反应越慢。
 STANLEY_LATERAL_D_EMA_ALPHA = 0.3
 # 航向误差增益 g_psi。
-STANLEY_HEADING_GAIN = 0.17#0.25
+STANLEY_HEADING_GAIN = 0.12#0.17
 # 航向误差 psi 的 EMA 平滑。只影响 STANLEY_HEADING_GAIN 非 0 时的航向项。
 # 调大：航向项更稳、更不追拟合线小抖；过大则航向抑制反应变慢。
 STANLEY_HEADING_EMA_ALPHA = 0.2
@@ -1132,7 +1132,7 @@ PERSON_STOP_MIN_AREA = 2500
 # 行人朝目标侧连续移动并过线多少帧后，才允许从停车切到放行。
 PERSON_CLEAR_MOVE_FRAMES = 2
 # 判定“行人横向移动”的最小底部中心 x 增量。
-PERSON_CLEAR_MIN_MOVE_DX = 3.0
+PERSON_CLEAR_MIN_MOVE_DX = 5.0
 # 兼容旧参数名；如果外部脚本还在改旧名，也能继续生效。
 PERSON_CLEAR_MIN_RIGHT_DX = PERSON_CLEAR_MIN_MOVE_DX
 # 行人横向放行线使用当前道路左右边界；下面是预览图上的颜色和粗细。
