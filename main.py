@@ -1878,6 +1878,8 @@ def seg_worker(core_id, worker_id=0):
             global_control_data["car_avoidance_avoid_weight"] = float(car_stats.get("car_avoid_weight", 0.0))
             global_control_data["car_avoidance_event"] = str(car_stats.get("car_event", ""))
             global_control_data["car_avoidance_cycle_id"] = int(car_stats.get("car_cycle_id", 0))
+            global_control_data["post_car_control_active"] = bool(car_stats.get("post_car_control_active", False))
+            global_control_data["car_control_profile"] = str(car_stats.get("car_control_profile", "NORMAL"))
             global_control_data["car_avoidance_control_kp"] = car_stats.get("car_control_kp")
             global_control_data["car_avoidance_control_kd"] = car_stats.get("car_control_kd")
             global_control_data["car_avoidance_control_psi"] = car_stats.get("car_control_psi")
@@ -2282,6 +2284,8 @@ def serial_control_thread():
             car_avoidance_avoid_weight = float(global_control_data.get("car_avoidance_avoid_weight", 0.0))
             car_avoidance_event = str(global_control_data.get("car_avoidance_event", ""))
             car_avoidance_cycle_id = int(global_control_data.get("car_avoidance_cycle_id", 0))
+            post_car_control_active = bool(global_control_data.get("post_car_control_active", False))
+            car_control_profile = str(global_control_data.get("car_control_profile", "NORMAL"))
             car_avoidance_control_kp = global_control_data.get("car_avoidance_control_kp")
             car_avoidance_control_kd = global_control_data.get("car_avoidance_control_kd")
             car_avoidance_control_psi = global_control_data.get("car_avoidance_control_psi")
@@ -2329,13 +2333,18 @@ def serial_control_thread():
                 steer_signal = 0.0
 
             # 转向量幅度越大，目标速度越低，避免高速出弯失控。
-            dynamic_target_speed = config.CONTROL_MAX_SPEED - int(
+            speed_ceiling = (
+                int(round(float(getattr(config, "POST_CAR_TARGET_SPEED", config.CONTROL_MAX_SPEED))))
+                if post_car_control_active else
+                int(config.CONTROL_MAX_SPEED)
+            )
+            dynamic_target_speed = speed_ceiling - int(
                 abs(steer_signal) * config.STEER_SIGNAL_SPEED_GAIN
             )
             dynamic_target_speed = int(
                 max(
                     config.CONTROL_MIN_SPEED,
-                    min(config.CONTROL_MAX_SPEED, dynamic_target_speed),
+                    min(speed_ceiling, dynamic_target_speed),
                 )
             )
             target_speed = dynamic_target_speed
@@ -2430,6 +2439,8 @@ def serial_control_thread():
             car_avoidance_avoid_weight = 0.0
             car_avoidance_event = ""
             car_avoidance_cycle_id = 0
+            post_car_control_active = False
+            car_control_profile = "NORMAL"
             car_avoidance_control_kp = None
             car_avoidance_control_kd = None
             car_avoidance_control_psi = None
@@ -2515,6 +2526,22 @@ def serial_control_thread():
                     car_left_x_text,
                     car_left_error_text,
                     car_control_error_text,
+                    car_kp_text,
+                    car_kd_text,
+                    car_psi_text,
+                    car_v_text,
+                ),
+                min_interval=float(getattr(config, "LOG_INTERVAL_CAR_AVOIDANCE_DETAIL", 1.0)),
+            )
+        elif post_car_control_active:
+            throttled_log(
+                "post_car_control_detail",
+                f">>> 绕车后高速(B): profile={car_control_profile} cycles={car_avoidance_cycle_id} "
+                f" B=({car_kp_text},{car_kd_text},{car_psi_text}) v={car_v_text} "
+                f"target={int(round(float(getattr(config, 'POST_CAR_TARGET_SPEED', config.CONTROL_MAX_SPEED))))}",
+                state=(
+                    car_control_profile,
+                    car_avoidance_cycle_id,
                     car_kp_text,
                     car_kd_text,
                     car_psi_text,

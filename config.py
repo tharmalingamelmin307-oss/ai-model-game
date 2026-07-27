@@ -77,7 +77,9 @@ SEG_MODEL = str(PROJECT_ROOT / "models/seg/segv6/segv6_416x160_argmax_rk3588_int
 # - YOLO_SIZE
 # - CLASS_NAMES
 # - detector.py 的输出解析逻辑
-YOLO_MODEL = str(PROJECT_ROOT / "models/det/dev6/ppyoloe_merged_512x384_split_rk3588_int8.rknn")
+# YOLO_MODEL = str(PROJECT_ROOT / "models/det/dev6/ppyoloe_merged_512x384_split_rk3588_int8.rknn")
+YOLO_MODEL = str(PROJECT_ROOT / "models/det/detv7/ppyoloe_8900_best_512x384_split_rk3588_int8.rknn")
+
 
 # OCR 检测模型路径。
 # 当前改回 det + rec 全流程时使用。
@@ -736,15 +738,8 @@ STANLEY_FF_FAR_Y = STANLEY_FF_Y_TOP
 STANLEY_FF_NEAR_Y = STANLEY_FF_Y_BOTTOM
 # 横向误差优先使用拟合前中心点在前视行附近的平均值，减少拟合线底部失真影响。
 STANLEY_LATERAL_AVG_HALF_WINDOW = 10.0
-# 横向误差增益 k，控制 atan(k * e / (v_s + soft)) 的纠偏力度。
-STANLEY_LATERAL_GAIN = 0.36 #0.4
-# 横向 D 系数 Kd，作用在 EMA 后横向误差的帧间变化量 de 上。
-# 默认关闭；想试 B+d 时先从很小值开始，例如 0.040-0.045。
-STANLEY_LATERAL_D_GAIN =0.026 #0.022
 # D 项使用前先对 e 做 EMA 平滑。数值越大越稳，但 D 项反应越慢。
 STANLEY_LATERAL_D_EMA_ALPHA = 0.3
-# 航向误差增益 g_psi。
-STANLEY_HEADING_GAIN = 0.12#0.17
 # 航向误差 psi 的 EMA 平滑。只影响 STANLEY_HEADING_GAIN 非 0 时的航向项。
 # 调大：航向项更稳、更不追拟合线小抖；过大则航向抑制反应变慢。
 STANLEY_HEADING_EMA_ALPHA = 0.2
@@ -752,8 +747,6 @@ STANLEY_HEADING_EMA_ALPHA = 0.2
 STANLEY_CURVATURE_FF_GAIN = 0.05
 # 轴距 L，单位 m。保留兼容旧配置；当前两点角度前馈不再使用它。
 STANLEY_WHEELBASE_M = 0.2
-# 速度估计 v_s。当前仅算法 B 使用。
-STANLEY_SPEED_ESTIMATE = CONTROL_MAX_SPEED
 # 横向误差软化常数。当前仅算法 B 使用。
 STANLEY_SOFT = 60.0
 # Stanley 两项相加后的整体输出缩放。
@@ -1006,6 +999,8 @@ DEFAULT_CONTROL_DATA = {
     "car_avoidance_avoid_weight": 0.0,
     "car_avoidance_event": "",
     "car_avoidance_cycle_id": 0,
+    "post_car_control_active": False,
+    "car_control_profile": "NORMAL",
     "debug_keyboard_enabled": False,
     "debug_keyboard_stop_active": False,
     "debug_keyboard_message": "",
@@ -1441,15 +1436,42 @@ TRACK_WIDTH_LOG_INTERVAL = 1.5
 # 让左边界尽量维持在画面中间；停车时避车状态机冻结，恢复后继续。
 # ---------------------------------------------------------------------------
 CAR_AVOIDANCE_ENABLED = True
-# 遇见车辆后，把左边线本身当作控制中线，不做额外内收。
-# 避车期间单独使用更慢的速度和更温和的 B 控制参数，不影响普通循线网页调参。
-CAR_AVOIDANCE_TARGET_SPEED = 50
-CAR_AVOIDANCE_STANLEY_LATERAL_GAIN = 0.36
-CAR_AVOIDANCE_STANLEY_LATERAL_D_GAIN = 0.026
-CAR_AVOIDANCE_STANLEY_HEADING_GAIN = 0.12
+
+# ---------------------------------------------------------------------------
+# Stanley B 三档现场调参区
+# 每档依次是 P（横向）、D（横向变化）、psi（航向）和对应速度。
+
+# 1. 普通巡线
+STANLEY_LATERAL_GAIN = 0.31
+STANLEY_LATERAL_D_GAIN = 0.018
+STANLEY_HEADING_GAIN = 0.3
+STANLEY_SPEED_ESTIMATE = CONTROL_MAX_SPEED
+
+# 2. 正在避车（AVOIDING / CLEARING）
+CAR_AVOIDANCE_TARGET_SPEED = 60
+CAR_AVOIDANCE_STANLEY_LATERAL_GAIN = 0.31
+CAR_AVOIDANCE_STANLEY_LATERAL_D_GAIN = 0.018
+CAR_AVOIDANCE_STANLEY_HEADING_GAIN = 0.3
 CAR_AVOIDANCE_STANLEY_SPEED_ESTIMATE = CAR_AVOIDANCE_TARGET_SPEED
+
+# 3. 绕完两辆车并完成回正后高速巡线
+POST_CAR_TARGET_SPEED = 70
+POST_CAR_STANLEY_LATERAL_GAIN = 0.31
+POST_CAR_STANLEY_LATERAL_D_GAIN = 0.018
+POST_CAR_STANLEY_HEADING_GAIN = 0.3
+POST_CAR_STANLEY_SPEED_ESTIMATE = POST_CAR_TARGET_SPEED
+# ---------------------------------------------------------------------------
+
+# 遇见车辆后，把左边线本身当作控制中线，不做额外内收。
 # 全程最多触发几次车辆避障；0 表示不限制。
 CAR_AVOIDANCE_MAX_CYCLES = 2
+
+# 绕完指定数量的车辆并完成回正后，切到第三套独立的高速巡线参数。
+# 三套 B 控制参数分别是：普通巡线 STANLEY_*、避车 CAR_AVOIDANCE_*、
+# 绕车后高速巡线 POST_CAR_*。第二辆车的 AVOIDING/CLEARING 期间仍使用避车参数，
+# 只有 CLEARING 完成回到 FOLLOW_LANE 后才启用本组。
+POST_CAR_CONTROL_ENABLED = True
+POST_CAR_CONTROL_AFTER_CYCLES = 2
 # car 底部中心距离画面底部超过这个行数时，不触发新的避车。
 # SEG 高度是 160，120 表示车框底部进入中近距离后才允许躲。
 CAR_AVOIDANCE_START_BOUNDARY_ROWS = 150.0

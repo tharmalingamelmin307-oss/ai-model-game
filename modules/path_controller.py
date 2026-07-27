@@ -40,6 +40,37 @@ class PathController:
         self.reset_stanley_band()
         self.reset_control_c()
 
+    def select_stanley_control_profile(self, car_active=False, car_state="FOLLOW_LANE", car_cycle_id=0):
+        """选择普通、避车或绕车后的 Stanley 参数组."""
+        if bool(car_active):
+            return "CAR_AVOIDANCE"
+
+        after_cycles = max(1, int(getattr(config, "POST_CAR_CONTROL_AFTER_CYCLES", 2)))
+        if (
+            bool(getattr(config, "POST_CAR_CONTROL_ENABLED", True)) and
+            str(car_state) == "FOLLOW_LANE" and
+            int(car_cycle_id) >= after_cycles
+        ):
+            return "POST_CAR"
+        return "NORMAL"
+
+    def stanley_param_overrides_for_profile(self, profile):
+        """返回非普通 Stanley 档位的独立 P/D/psi/速度参数."""
+        profile = str(profile).upper()
+        if profile == "CAR_AVOIDANCE":
+            prefix = "CAR_AVOIDANCE_STANLEY_"
+        elif profile == "POST_CAR":
+            prefix = "POST_CAR_STANLEY_"
+        else:
+            return None
+
+        return {
+            "lateral_gain": float(getattr(config, prefix + "LATERAL_GAIN", getattr(config, "STANLEY_LATERAL_GAIN", 0.0))),
+            "d_gain": float(getattr(config, prefix + "LATERAL_D_GAIN", getattr(config, "STANLEY_LATERAL_D_GAIN", 0.0))),
+            "heading_gain": float(getattr(config, prefix + "HEADING_GAIN", getattr(config, "STANLEY_HEADING_GAIN", 0.0))),
+            "speed_estimate": float(getattr(config, prefix + "SPEED_ESTIMATE", getattr(config, "STANLEY_SPEED_ESTIMATE", 0.0))),
+        }
+
     def compute_steer_signal(
         self,
         path_points,

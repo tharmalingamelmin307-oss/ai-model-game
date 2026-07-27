@@ -3154,6 +3154,12 @@ class RoadSegmentor:
             car_state = "FOLLOW_LANE"
             if car_path_debug is not None:
                 car_state = str(car_path_debug.get("state", "FOLLOW_LANE"))
+            control_profile = self.path_controller.select_stanley_control_profile(
+                car_active=car_active,
+                car_state=car_state,
+                car_cycle_id=self.car_avoidance_cycle_id,
+            )
+            post_car_control_active = control_profile == "POST_CAR"
             car_boundary_path_active = (
                 car_avoid_path is not None and
                 (
@@ -3222,14 +3228,11 @@ class RoadSegmentor:
             ):
                 self.path_controller.reset()
             self.last_control_path_source = control_path_source
-            control_param_overrides = None
-            if car_active and control_mode == "stanley_band":
-                control_param_overrides = {
-                    "lateral_gain": float(getattr(config, "CAR_AVOIDANCE_STANLEY_LATERAL_GAIN", getattr(config, "STANLEY_LATERAL_GAIN", 0.0))),
-                    "d_gain": float(getattr(config, "CAR_AVOIDANCE_STANLEY_LATERAL_D_GAIN", getattr(config, "STANLEY_LATERAL_D_GAIN", 0.0))),
-                    "heading_gain": float(getattr(config, "CAR_AVOIDANCE_STANLEY_HEADING_GAIN", getattr(config, "STANLEY_HEADING_GAIN", 0.0))),
-                    "speed_estimate": float(getattr(config, "CAR_AVOIDANCE_STANLEY_SPEED_ESTIMATE", getattr(config, "STANLEY_SPEED_ESTIMATE", 0.0))),
-                }
+            control_param_overrides = (
+                self.path_controller.stanley_param_overrides_for_profile(control_profile)
+                if control_mode == "stanley_band" else
+                None
+            )
             steer_signal = self.path_controller.compute_steer_signal(
                 control_path_points,
                 w_seg,
@@ -3273,12 +3276,24 @@ class RoadSegmentor:
                 ):
                     self.path_controller.reset()
                 self.last_control_path_source = "normal"
+                control_profile = self.path_controller.select_stanley_control_profile(
+                    car_active=False,
+                    car_state=self.car_avoidance_state,
+                    car_cycle_id=self.car_avoidance_cycle_id,
+                )
+                post_car_control_active = control_profile == "POST_CAR"
+                control_param_overrides = (
+                    self.path_controller.stanley_param_overrides_for_profile(control_profile)
+                    if control_mode == "stanley_band" else
+                    None
+                )
                 steer_signal = self.path_controller.compute_steer_signal(
                     control_path_points,
                     w_seg,
                     h_seg,
                     center_bias_x=float(getattr(config, "CONTROL_CENTER_BIAS_X", 0.0)),
                     lateral_points=lateral_control_points,
+                    param_overrides=control_param_overrides,
                 )
                 control_band = self.path_controller.control_band_for_mode(
                     control_mode,
@@ -3316,6 +3331,8 @@ class RoadSegmentor:
             "car_avoid_weight": float(car_path_debug.get("avoid_weight", 0.0)) if car_path_debug is not None else 0.0,
             "car_event": str(car_path_debug.get("event", "")) if car_path_debug is not None else "",
             "car_cycle_id": int(car_path_debug.get("cycle_id", self.car_avoidance_cycle_id)) if car_path_debug is not None else int(self.car_avoidance_cycle_id),
+            "post_car_control_active": bool(post_car_control_active) if 'post_car_control_active' in locals() else False,
+            "car_control_profile": str(control_profile) if 'control_profile' in locals() else "NORMAL",
             "car_control_kp": float(control_param_overrides.get("lateral_gain", 0.0)) if 'control_param_overrides' in locals() and control_param_overrides is not None else None,
             "car_control_kd": float(control_param_overrides.get("d_gain", 0.0)) if 'control_param_overrides' in locals() and control_param_overrides is not None else None,
             "car_control_psi": float(control_param_overrides.get("heading_gain", 0.0)) if 'control_param_overrides' in locals() and control_param_overrides is not None else None,

@@ -17,7 +17,7 @@
 - [汇合判断](./config.py#L373)
 - [固定宽度与规划类别](./config.py#L478)
 - [路径搜索、稳定与调试](./config.py#L1007)
-- [车辆避障、金币规划与分割画面](./config.py#L1131)
+- [车辆避障与分割画面](./config.py#L1131)
 - [README 参数说明](#参数调试索引)
 - [README 常用调参入口](#常用调参入口)
 - [项目结构](#项目结构)
@@ -38,7 +38,7 @@
 │   ├── detector.py        # PP-YOLOE 检测封装与后处理
 │   ├── ocr_system.py      # OCR det + rec 封装
 │   ├── path_controller.py # 图像路径点到 steer_signal 的 A/B/C 控制器
-│   └── segmentor.py       # 分割、路径搜索、金币规划、避车状态机
+│   └── segmentor.py       # 分割、路径搜索、避车状态机
 └── utils/
     └── image_proc.py      # OCR 文字框透视拉正工具
 ```
@@ -126,7 +126,7 @@
 
 - `modules/detector.py` 输出的检测框统一映射到 `TARGET_RES`
 - `ocr_worker()` 跑 OCR 时使用的是同帧 `TARGET_RES` 大图
-- `modules/segmentor.py` 内部会把检测框从 `TARGET_RES` 映射到 `SEG_SIZE`，供 `coin / car / stone` 等规划逻辑使用
+- `modules/segmentor.py` 内部会把检测框从 `TARGET_RES` 映射到 `SEG_SIZE`，供 `car / stone` 等规划逻辑使用
 
 ## 模块与链路说明
 
@@ -229,17 +229,16 @@
 - `limit_sign`
   先用通用 OCR 识别，再从结果里提取数字字符
 
-### 5. `sign` 语义路牌逻辑
+### 5. `sign` 语义路牌与固定序列逻辑
 
-启用 `SIGN_LLM_ENABLED` 后，`sign` 不再在行驶中直接 OCR 生效，而是走一次性停车状态机：
+`SIGN_ROUTE_DECISION_MODE` 控制岔路策略：
 
-1. 未停车前只看 YOLO 检测框，不对 `sign` 做 OCR。
-2. 当 `sign` 面积达到 `SIGN_LLM_TRIGGER_AREA` 且不贴边时，车辆进入停车采样状态。
-3. 停车后才把 `sign` 投给 OCR，连续收集 `SIGN_LLM_OCR_SAMPLES` 条有效 OCR 文本。
-4. 收满样本后停止继续 `sign` OCR，把样本提交给千帆独立进程。
-5. 千帆返回 `LEFT / RIGHT` 时写入 `turn_intent` 并放行。
-6. 千帆超时、异常或返回无效内容时，不重试本次路牌流程，按石头优先 / 默认左路放行。
-7. 同一块路牌保持在画面内时不会再次触发；等路牌离开或面积不达标后，才允许下一次新事件。
+- `llm_once`: 第一圈没有路牌，不触发岔路路牌逻辑；第一次看到岔路牌即第二圈，路牌达标后停车采样 OCR，并把样本提交千帆；千帆返回 `LEFT / RIGHT` 后锁定本次方向；第三圈再遇到路牌时不 OCR、不请求千帆，直接对第二圈方向取反。
+- `fixed_sequence`: 不启动路牌 OCR/千帆线程；默认只在同一时刻看见 `sign` 和分割 Y 岔时推进固定序列，且 `sign` 不看面积；第二圈按 `SIGN_ROUTE_FIXED_FIRST_CHOICE` 走，第三圈自动取反。
+
+方向编码保持一致：`LEFT` 表示左侧外圈，`RIGHT` 表示右侧内圈。`SIGN_ROUTE_FIXED_FIRST_CHOICE` 默认是 `LEFT`，即第二圈左外圈、第三圈右内圈；改成 `RIGHT` 后顺序互换。
+
+两种模式都复用原有 `CHOICE_READY -> IN_FORK -> WAIT_SIGN_GONE/IDLE` 的路线锁定和补线状态机，避免同一岔路内左右支路反复跳变。
 
 `turn_intent` 会被 `segmentor.py` 在分叉路径选择时使用。分叉选择优先级是：
 
@@ -296,7 +295,7 @@
 14. 如果没有明确石头干预，则使用语义路牌状态机写入的 `turn_intent`；没有有效结果时默认偏向左支
 15. 对最终路径做多项式拟合
 16. 对拟合系数做 EMA 平滑
-17. 结合金币规划和避车状态机选择控制路径或避车基准线
+17. 结合避车状态机选择控制路径或避车基准线
 18. 调用 `modules/path_controller.py`，按 `STEER_CONTROL_MODE` 将路径转换成单一 `steer_signal`
 19. 调用 `modules/debug_tools.py` 渲染调试画线、文字和网页预览相关输出
 
@@ -313,8 +312,8 @@
   算法 A。对控制路径点计算“路径点到底部中点连线斜率”，再按行号做远近加权平均。这个模式简单、抗噪，适合作为基线对照。
 - `stanley_band`
   算法 B。按前视行 Stanley 公式计算：
-  `atan(k * e / (v_s + soft)) + g_psi * psi + g_ff * atan(L * kappa)`。
-  横向误差、航向误差和曲率前馈可以使用不同的前视行。
+  `atan(k * e / (v_s + soft)) + g_psi * psi + g_ff * psi_ff`。
+  当前普通巡线优先用处理后的左右边界中点做控制路径，航向和前馈都用两点之间的角度，不再依赖二次拟合曲率。
 - `control_c`
   算法 C。当前默认模式。线性 PD + 航向抑制：
   `control = Kp * e + Kd * (e - e_last) - Kyaw * psi`。
@@ -333,19 +332,13 @@
 
 ### 8. 车辆避障逻辑
 
-当前避障不是“检测到车就一路加大左偏，丢车就立刻回正”，而是一个轻量状态机：
+当前车辆控制有三套互相独立的 B 控制参数：
 
-1. 先锁定同一辆车，锁定依据主要看车框底部中心点连续性
-2. 进入避障后，把控制基准线切到左边界向中线内收后的路径
-3. 普通阶段使用 `CAR_AVOIDANCE_LEFT_BOUNDARY_INSET`，近距离使用 `CAR_AVOIDANCE_NEAR_LEFT_BOUNDARY_INSET`
-4. 如果绕行途中车框短暂丢失，不立即回正，而是先进入 `CLEARING`
-5. `CLEARING` 会保留上一条绕车基准线，再按帧数逐渐回到普通巡线中心
+1. 普通巡线使用 `STANLEY_*`
+2. `AVOIDING / CLEARING` 使用 `CAR_AVOIDANCE_STANLEY_*` 和 `CAR_AVOIDANCE_TARGET_SPEED`
+3. 绕完 `POST_CAR_CONTROL_AFTER_CYCLES` 辆车且回正完成后，使用 `POST_CAR_STANLEY_*` 和 `POST_CAR_TARGET_SPEED`
 
-这套做法的目的很直接：
-
-- 避免“看不见车就立刻回正”导致车尾擦碰
-- 避免收尾时一下回正过头
-- 避免车框短暂漏检导致避障状态抖动
+避车状态机会先锁定同一辆车，把左边界作为控制路径；丢失车辆后先保持避车路径，再在 `CLEARING` 窗口逐步混回正常路径。第三套参数只在第二辆车的 `CLEARING` 完成、状态回到 `FOLLOW_LANE` 后启用，不会提前影响第二次避车。
 
 ### 9. 红绿灯与斑马线逻辑
 
@@ -371,16 +364,19 @@
 3. 如果行人框底边到画面底部距离小于 `PERSON_STOP_TRIGGER_DIST`
 4. 再检查行人框面积是否大于 `PERSON_STOP_MIN_AREA`
 5. 两个条件都满足才进入 `person_stop_active`，串口速度强制置零
-6. 停车期间持续观察行人框底部中心点
-7. 若 `PERSON_AVOID_ENABLED=True`，则当行人底部中心连续朝目标方向移动 `PERSON_CLEAR_MOVE_FRAMES` 帧，且进入中线附近 50px 带，解除停车并进入绕行
-8. 绕行时控制基准线切到边界向中线内收，默认使用左边界 `PERSON_AVOID_LEFT_BOUNDARY_INSET`
-9. 若 `PERSON_AVOID_USE_CAR_SIDE=True`，则 car 在左时用右边界内收，car 在右或未判定时用左边界内收
-10. 绕行期间行人连续漏检并保持 `PERSON_AVOID_EXIT_HOLD_FRAMES` 帧后结束绕行
+6. 画面上先画一条“停车截至横线”，它对应 `PERSON_STOP_TRIGGER_DIST`
+7. 停车期间继续观察行人框底部中心点判断横向运动方向
+8. 若行人持续朝同一方向移动，并且对应侧底角越过中线偏移 `PERSON_CLEAR_LINE_OFFSET_X` 的放行线，连续满足 `PERSON_CLEAR_MOVE_FRAMES` 帧，则解除停车
+9. 如果停车后连续 `PERSON_STOP_MISSING_TIMEOUT_SECONDS` 秒看不到行人，也解除停车
+10. 放行后直接恢复正常寻中线
+11. 当前行人逻辑只保留停车、观察、过线/漏检放行这一套状态机
 
 关键点：
 
 - 触发停车只看“底部是否靠近”，不先要求行人在路径 ROI 内
-- 绕行使用当前选中路径的左边界，岔路和汇合时跟随当前选择的那条路
+- 放行是有锁的：一旦满足条件并解除停车，同一轮靠近过程中不会在下一帧又重新停住
+- 短暂漏检仍保持停车，连续漏检满 2 秒才放行
+- 预览图上会先画出这条停车截至横线，竖向放行线后面再按调试需要打开
 - 同一帧 YOLO 结果不会被流水线重复计入“连续左移帧”
 - 页面上会显示 `STOP_BY_PERSON`，终端会打印行人底边距离、底边右端、左边界和连续左移放行帧数
 
@@ -490,7 +486,7 @@ target_speed = 0                                # 若红/黄灯停车或行人�
 - [运行态、队列与日志](#运行态队列与日志)
 - [场景停车与 OCR 后处理](#场景停车与-ocr-后处理)
 - [路径搜索、稳定与调试](#路径搜索稳定与调试)
-- [车辆避障、金币规划与分割画面](#车辆避障金币规划与分割画面)
+- [车辆避障与分割画面](#车辆避障与分割画面)
 
 ### 基础运行与模型
 
@@ -523,8 +519,13 @@ target_speed = 0                                # 若红/黄灯停车或行人�
 | `LIMIT_SIGN_APPLY_MIN_AREA` | 限速牌从历史观察切到正式生效的面积门槛 |
 | `OCR_SIGN_EDGE_MARGIN_RATIO` | 路牌框距离画面边缘的安全边距比例 |
 | `OCR_MIN_SCORE` | OCR 文本进入主逻辑的最低平均置信度 |
-| `SIGN_LLM_ENABLED` | 是否启用语义路牌停车、多次 OCR、千帆综合判定 |
-| `SIGN_LLM_TRIGGER_AREA` | sign 面积达到多少且不贴边后触发停车采样，当前默认 6000 |
+| `SIGN_ROUTE_DECISION_MODE` | 岔路策略：`llm_once` 为第二圈 OCR/千帆、第三圈取反；`fixed_sequence` 为固定序列 |
+| `SIGN_ROUTE_SKIP_FIRST_PASS` | 固定序列模式下是否忽略第一次分割岔路事件；路牌模式第一次看到路牌不跳过 |
+| `SIGN_ROUTE_FIXED_FIRST_CHOICE` | 固定序列第二圈方向，默认 `LEFT` 表示左侧外圈 |
+| `SIGN_ROUTE_FIXED_REQUIRE_SIGN` | 固定序列是否要求同一时刻看见 `sign` 和 Y 岔；开启时 sign 不看面积 |
+| `SIGN_LLM_ENABLED` | `llm_once` 模式下是否启用语义路牌停车、多次 OCR、千帆综合判定 |
+| `SIGN_LLM_FORK_POINT_TRIGGER_ROWS` | Y 岔特征点距分割平面底部多少行内提前停车 OCR，默认 `100`；仍要求 sign 不贴边 |
+| `SIGN_LLM_TRIGGER_AREA` | sign 面积达到多少且不贴边后触发停车采样，当前默认 16000 |
 | `SIGN_LLM_OCR_SAMPLES` | 停车后收集多少条有效 OCR 结果再发给千帆 |
 | `SIGN_LLM_MIN_VALID_SAMPLES` | 保留参数；当前语义路牌流程要求收满 `SIGN_LLM_OCR_SAMPLES` 条有效样本 |
 | `SIGN_LLM_COLLECT_TIMEOUT` / `SIGN_LLM_API_TIMEOUT` | OCR 采集超时保留参数 / 千帆 API 超时 |
@@ -578,6 +579,9 @@ target_speed = 0                                # 若红/黄灯停车或行人�
 | `FORK_INNER_OPEN_MAX_STEP_REGRESSION` | 允许的单步回退上限 |
 | `FORK_INNER_OPEN_MAX_MISS_ROWS` | 张开过程中允许缺失的最大行数 |
 | `FORK_TRUNK_SUPPORT_*` | Y 岔路分叉点到底部主干线附近的 mask 支撑约束 |
+| `FORK_BOUNDARY_WIDTH_ENABLED` | 岔路区域是否按目标方向外侧边界补另一侧边界；当前只在无路牌路线任务时启用，默认左路会拟合左边界斜率后平移补右边 |
+| `FORK_BOUNDARY_HOLD_SECONDS` | 无路牌岔路补线方向的保持时间；当前为 0.5 秒 |
+| `BOUNDARY_PATCH_HALF_WIDTH_RATIO` | 岔路/汇合补线时控制中线距离可信边界的半宽比例；当前为 0.9 |
 
 ### 汇合判断
 
@@ -600,11 +604,12 @@ target_speed = 0                                # 若红/黄灯停车或行人�
 | `MERGE_GUIDE_LINE_Y_MIN` / `MERGE_GUIDE_LINE_Y_MAX` | 汇合补线允许的 y 范围 |
 | `MERGE_GUIDE_LINE_MIN_GAP` | 补线与对侧边界的最小保护间距 |
 | `MERGE_GUIDE_LINE_THICKNESS` | 汇合补线绘制粗细 |
+| `BOUNDARY_PATCH_HALF_WIDTH_RATIO` | 汇合 guide 与补线重算边界时使用的半宽比例；当前为 0.9 |
 | `MERGE_STATE_CONFIRM_FRAMES` | 汇合连续命中多少帧才进入状态 |
 | `MERGE_STATE_EXIT_BOTTOM_ROWS` | 汇合退出时检查底部多少行 |
 | `MERGE_STATE_EXIT_WIDTH_THRESH` | 底部宽度恢复到多少才允许退出 |
 | `MERGE_STATE_EXIT_CONFIRM_FRAMES` | 汇合退出条件连续满足帧数 |
-| `MERGE_STATE_EXIT_NO_EDGE_Y_TOP` / `MERGE_STATE_EXIT_NO_EDGE_Y_BOTTOM` | 无边缘退出检查范围 |
+| `MERGE_STATE_EXIT_NO_EDGE_Y_TOP` / `MERGE_STATE_EXIT_NO_EDGE_Y_BOTTOM` | 汇合补线侧原始边界无贴边退出检查范围；补左线只看左边，补右线只看右边 |
 | `MERGE_EDGE_TRACE_*` | 贴边侧八邻域方向特征，用作汇合判断的额外 OR 条件 |
 
 ### 固定宽度与规划类别
@@ -625,13 +630,13 @@ target_speed = 0                                # 若红/黄灯停车或行人�
 | `SERIAL_PORT` | 下位机串口设备名 |
 | `BAUD_RATE` | 串口波特率 |
 | `CONTROL_MIN_SPEED` / `CONTROL_MAX_SPEED` | 串口线程目标速度范围 |
-| `STEER_SIGNAL_SPEED_GAIN` | 根据转向幅度动态降速的增益 |
+| `STEER_SIGNAL_SPEED_GAIN` | 根据转向幅度动态降速的增益，0 表示关闭 |
 | `CONTROL_SPEED_SMOOTH_ENABLED` | 是否启用目标速度平滑 |
 | `CONTROL_SPEED_MAX_STEP_UP` / `CONTROL_SPEED_MAX_STEP_DOWN` | 速度单帧最大上升/下降步长 |
 | **公共舵机输出** |  |
 | `SERVO_CENTER` | 舵机中位 PWM |
 | `SERVO_MIN` / `SERVO_MAX` | 舵机 PWM 安全上下限 |
-| `SERVO_OUTPUT_FILTER_ENABLED` | 是否启用最终舵机 PWM 输出滤波 |
+| `SERVO_OUTPUT_FILTER_ENABLED` | 是否启用最终舵机 PWM 输出滤波，缓和大幅打角冲击 |
 | `SERVO_OUTPUT_EMA_ALPHA` | 舵机输出 EMA 平滑系数，0 表示不滤波 |
 | `SERVO_OUTPUT_DEADBAND_PWM` | 舵机输出死区，小于该 PWM 差值时不更新 |
 | `SERVO_OUTPUT_MAX_STEP` | 舵机每个控制周期最大 PWM 步长，0 表示不限制 |
@@ -642,33 +647,34 @@ target_speed = 0                                # 若红/黄灯停车或行人�
 | `STEER_SIGNAL_ROW_WEIGHT_GAMMA` | 路径点远近权重指数 |
 | `STEER_SIGNAL_NORMALIZED_SCALE` | 归一化 steer_signal 的整体放大系数 |
 | `WEIGHTED_SLOPE_SAMPLE_ROW_MIN` / `WEIGHTED_SLOPE_SAMPLE_ROW_MAX` | `weighted_slope` 普通巡线时使用的独立 y 行取样范围 |
-| **算法 B: `stanley_band`** | 前视行 Stanley 公式：横向误差 + 航向误差 + 曲率前馈 |
+| `PATH_HEADING_USE_TRUSTED_BOUNDARY` | B/C 的 `psi` 和 `psi_ff` 是否使用可信边界；默认左边界，右岔用右边界，等待路牌结果拉线时用中间拉线，汇合用真实对侧边界 |
+| `PATH_LATERAL_USE_FILTERED_PATH` | B/C 的横向误差 `e` 是否使用拟合后路径；当前为 `False`，使用拟合前中点加权计算 |
+| **算法 B: `stanley_band`** | 前视行 Stanley 公式：横向误差 + 两点航向角 + 两点角度前馈 |
 | `STANLEY_PWM_GAIN` | `stanley_band` 专用 PWM 映射增益 |
+| `STANLEY_USE_BOUNDARY_MIDPOINTS` | B 方案旧的边界中点开关，仅兼容保留，不再参与主流程 |
 | `STANLEY_LOOKAHEAD_Y` | 算横向误差 `e` 的前视行，`SEG_SIZE` 坐标系里 y 越小看得越远 |
-| `STANLEY_HEADING_LOOKAHEAD_Y` | 算航向误差 `psi` 的前视行 |
-| `STANLEY_CURVATURE_LOOKAHEAD_Y` | 算曲率前馈 `kappa` 的前视行 |
-| `STANLEY_LATERAL_AVG_HALF_WINDOW` | 横向误差取拟合前中心点平均时的半窗口高度 |
+| `STANLEY_HEADING_Y_TOP` / `STANLEY_HEADING_Y_BOTTOM` | 算航向误差 `psi` 的近中距离区域 |
+| `STANLEY_FF_Y_TOP` / `STANLEY_FF_Y_BOTTOM` | 算前馈角 `psi_ff` 的远处区域，应和航向区域分开 |
+| `STANLEY_LATERAL_AVG_HALF_WINDOW` | 横向误差取拟合前中心点加权平均时的半窗口高度 |
 | `STANLEY_LATERAL_GAIN` | Stanley 横向误差增益 |
 | `STANLEY_HEADING_GAIN` | Stanley 航向误差增益 |
-| `STANLEY_CURVATURE_FF_GAIN` | Stanley 曲率前馈增益 |
-| `STANLEY_WHEELBASE_M` | 轴距，当前配置为 `0.20m` |
+| `STANLEY_CURVATURE_FF_GAIN` | Stanley 两点角度前馈增益，保留旧名兼容配置 |
+| `STANLEY_WHEELBASE_M` | 轴距，保留旧配置兼容；当前两点角度前馈不使用它 |
 | `STANLEY_SPEED_ESTIMATE` / `STANLEY_SOFT` | Stanley 横向项分母里的速度估计和软化常数 |
 | `STANLEY_SIGNAL_SCALE` | Stanley 输出整体缩放；越大舵机幅度越大 |
-| `STANLEY_MIN_FIT_POINTS` | Stanley 拟合最低点数；不足时当前模式输出 0，不切换到其它控制器 |
+| `STANLEY_MIN_FIT_POINTS` | Stanley 控制路径最低点数；不足时当前模式输出 0，不切换到其它控制器 |
 | **算法 C: `control_c`** | 线性 PD + 航向抑制：`Kp*e + Kd*de - Kyaw*psi` |
 | `CONTROL_C_PWM_GAIN` | `control_c` 专用 PWM 映射增益；只影响最终舵机幅度，不改变 C 内部 P/D/航向比例 |
 | `CONTROL_C_LOOKAHEAD_Y` | 横向误差 `e` 的取样行；y 越小看得越远，反应更早但可能更抖 |
 | `CONTROL_C_HEADING_LOOKAHEAD_Y` | 航向误差 `psi` 的取样行；通常先和横向行一致，想提前抑制大弯可取更远 |
-| `CONTROL_C_LATERAL_AVG_HALF_WINDOW` | 横向误差取拟合前中心点平均时的半窗口高度；越大越稳但越钝 |
+| `CONTROL_C_LATERAL_AVG_HALF_WINDOW` | 横向误差取拟合前中心点加权平均时的半窗口高度；越大越稳但越钝 |
 | `CONTROL_C_LATERAL_GAIN` | 横向 P 系数 `Kp`；调大回中更快，过大容易左右摆 |
 | `CONTROL_C_LATERAL_D_GAIN` | 横向 D 系数 `Kd`；调大压过冲/慢摆，过大容易细碎抖 |
 | `CONTROL_C_LATERAL_D_EMA_ALPHA` | D 项前的横向误差 EMA 平滑；越大越稳但反应更慢 |
 | `CONTROL_C_HEADING_GAIN` | 航向抑制系数 `Kyaw`，以 `-Kyaw*psi` 使用；只做阻尼，过大会和横向项打架 |
 | `CONTROL_C_MIN_FIT_POINTS` | C 算法拟合最低点数；不足时当前模式输出 0，不切换到其它控制器 |
-| **模式增益** | 普通巡线、coin、car 等模式对最终控制量的额外修正 |
+| **模式增益** | 普通巡线、car 等模式对最终控制量的额外修正 |
 | `STEER_SIGNAL_NO_TARGET_GAIN` | 普通巡线模式控制增益 |
-| `STEER_SIGNAL_COIN_GAIN` | coin 路径 active 时控制增益 |
-| `STEER_SIGNAL_CAR_GAIN` | car 避障 active 时控制增益 |
 | `SERIAL_TIMEOUT` | 串口读写超时 |
 | `SERIAL_PACKET_HEADER` / `SERIAL_PACKET_TAIL` | 串口协议包头包尾 |
 | `CONTROL_LOOP_SLEEP` | 串口控制循环 sleep |
@@ -712,15 +718,11 @@ target_speed = 0                                # 若红/黄灯停车或行人�
 | `TRAFFIC_LIGHT_RED_CLASS_ID_FALLBACK` / `TRAFFIC_LIGHT_GREEN_CLASS_ID_FALLBACK` / `TRAFFIC_LIGHT_YELLOW_CLASS_ID_FALLBACK` | 交通灯回退 id |
 | `PERSON_STOP_TRIGGER_DIST` | 行人底边距画面底部多近时触发停车 |
 | `PERSON_STOP_MIN_AREA` | 行人框面积至少多大才允许触发停车 |
-| `PERSON_STOP_MAX_SECONDS` | 行人停车状态最长保持多少秒 |
-| `PERSON_AVOID_ENABLED` | 是否启用行人绕行分支 |
-| `PERSON_CLEAR_MOVE_FRAMES` | 行人朝目标侧连续移动多少帧才允许进入绕行 |
-| `PERSON_CLEAR_MIN_MOVE_DX` | 单帧横移最小像素量 |
-| `PERSON_CLEAR_CENTER_WINDOW_X` | 进入绕行前必须落入的中线侧向窗口宽度 |
-| `PERSON_AVOID_USE_CAR_SIDE` | 是否按 car 左右动态选择行人绕行边界 |
-| `PERSON_AVOID_DEFAULT_BOUNDARY_SIDE` | 关闭动态选择时的默认绕行边界 |
-| `PERSON_AVOID_LEFT_BOUNDARY_INSET` / `PERSON_AVOID_RIGHT_BOUNDARY_INSET` | 行人绕行时左/右边界向中线内收量 |
-| `PERSON_AVOID_EXIT_MISSING_FRAMES` / `PERSON_AVOID_EXIT_HOLD_FRAMES` | 行人绕行退出漏检与保持帧数 |
+| `PERSON_STOP_MAX_SECONDS` | 兼容保留字段，当前行人停车不再按时间自动释放 |
+| `PERSON_STOP_MISSING_TIMEOUT_SECONDS` | 行人停车后连续漏检多少秒才放行 |
+| `PERSON_CLEAR_MOVE_FRAMES` | 行人朝目标侧连续移动多少帧才允许放行 |
+| `PERSON_CLEAR_MIN_MOVE_DX` | 判定横向移动的最小像素量 |
+| `PERSON_CLEAR_LINE_OFFSET_X` | 行人放行线相对当前车道中线的横向偏移 |
 | `LIMIT_SIGN_EFFECTIVE_SPEED_OFFSET` | 限速牌识别值生效前扣掉的保守余量 |
 | `OCR_MATCH_INIT_DIST` | OCR 文本框匹配检测框时的初始最大距离 |
 | `OCR_DET_INPUT_SIZE` | OCR det 输入尺寸 |
@@ -734,7 +736,7 @@ target_speed = 0                                # 若红/黄灯停车或行人�
 |---|---|
 | `SEG_EMA_ALPHA` | 路径拟合系数 EMA 历史权重 |
 | `SEG_PATH_STABILITY_ENABLED` | 是否启用相邻帧路径稳定约束 |
-| `SEG_PATH_MAX_FRAME_X_JUMP` | 最终路径每帧最大横向移动 |
+| `SEG_PATH_MAX_FRAME_X_JUMP` | 最终路径每帧最大横向移动，0 表示关闭 |
 | `SEG_PATH_TEMPORAL_SCORE_GAIN` | 候选路径相对上一帧偏移扣分权重 |
 | `SEG_PATH_TEMPORAL_SOFT_MAX_JUMP` | 软跳变阈值 |
 | `SEG_PATH_TEMPORAL_EXCESS_SCORE_GAIN` | 超出软阈值部分的额外扣分 |
@@ -766,46 +768,42 @@ target_speed = 0                                # 若红/黄灯停车或行人�
 | `SEG_PATH_CENTER_PENALTY_GAIN` | 偏离局部中心扣分权重 |
 | `SEG_PATH_TOP_TIER_SCORE_GAP` | 最终候选池分数差范围 |
 | `SEG_PATH_DENSE_SAMPLES` | 最终路径重采样点数 |
-| `COIN_PATH_CONTROL_FIRST_SEGMENT_ONLY` | coin active 时控制是否只看底部到首个 coin 的段 |
-| `COIN_PATH_CONTROL_BAND_HEIGHT` | coin 控制接管窗口高度 |
-| `COIN_PATH_CONTROL_REFERENCE_ROWS` | coin 距离相关增益参考距离 |
 | `TRACK_WIDTH_LOG_INTERVAL` | 赛道宽度日志节流间隔 |
 
-### 车辆避障、金币规划与分割画面
+### 车辆避障与分割画面
 
 | 参数 | 用途 |
 |---|---|
 | `CAR_AVOIDANCE_ENABLED` | 是否启用 car 避障状态机 |
-| `CAR_AVOIDANCE_LEFT_BOUNDARY_INSET` | 锁定 car 后，左边界向中线内收的普通绕车基准 |
-| `CAR_AVOIDANCE_NEAR_BOUNDARY_ROWS` / `CAR_AVOIDANCE_NEAR_LEFT_BOUNDARY_INSET` | 近距离判定窗口和对应左边界内收量 |
-| `CAR_AVOIDANCE_LOCK_HIT_FRAMES` | car 连续命中多少帧才确认锁定 |
+| `CAR_AVOIDANCE_SERVO_BIAS_ENABLED` | 是否启用旧版最终舵机 PWM 偏置，当前为启用 |
+| `CAR_AVOIDANCE_SERVO_BIAS_MODE` | 旧版避障偏置模式，当前为 `distance_bias` |
+| `CAR_AVOIDANCE_SERVO_BIAS_MIN_PWM` / `CAR_AVOIDANCE_SERVO_BIAS_MAX_PWM` | car 由远到近时额外叠加的 PWM 偏置范围，当前为 `20/60` |
+| `CAR_AVOIDANCE_LEFT_BOUNDARY_TARGET_RATIO` | 左边界修正目标位置，当前为画面中线 `0.50` |
+| `CAR_AVOIDANCE_LEFT_BOUNDARY_P_GAIN` / `CAR_AVOIDANCE_LEFT_BOUNDARY_P_MAX_PWM` | 左边界过中线时抵消避障偏置的 P 修正，当前为 `1.2/120` |
+| `CAR_AVOIDANCE_LEFT_BOUNDARY_P_REVERSE_MAX_PWM` | 左边界 P 修正允许的最大反向拉回 PWM，当前为 `55` |
+| `CAR_AVOIDANCE_LEFT_BOUNDARY_RANGE_LOW_ERROR` / `CAR_AVOIDANCE_LEFT_BOUNDARY_RANGE_HIGH_ERROR` | 左边界误差保持区间，当前为 `-20/35` |
+| `CAR_AVOIDANCE_LEFT_BOUNDARY_RANGE_FULL_LOW_ERROR` | 左边界偏左时旧避障正向偏置释放到最低的阈值，当前为 `-60` |
+| `CAR_AVOIDANCE_LEFT_BOUNDARY_ERROR_EMA_ALPHA` | 左边界误差滤波，避免单帧跳点触发大反打，当前为 `0.55` |
+| `CAR_AVOIDANCE_LEFT_BOUNDARY_FORWARD_RECOVER_GAIN` / `CAR_AVOIDANCE_LEFT_BOUNDARY_FORWARD_RECOVER_MAX_PWM` | 左边界过度偏左时补回中间的正向托回 PWM，当前为 `0.6/25` |
+| `CAR_AVOIDANCE_LEFT_BOUNDARY_REVERSE_RELEASE_DECAY` / `CAR_AVOIDANCE_LEFT_BOUNDARY_REVERSE_RELEASE_DEADBAND` | 回到保持区间后反向拉回 PWM 的释放速度，当前为 `0.2/4` |
+| `CAR_AVOIDANCE_LEFT_BOUNDARY_NEUTRAL_RELEASE_DECAY` | 左边界在保持区间内时，基础避障偏置的释放速度，当前为 `0.85` |
+| `CAR_AVOIDANCE_SERVO_BIAS_STEP_MAX_PWM` / `CAR_AVOIDANCE_SERVO_BIAS_CLEARING_STEP_MAX_PWM` | 避障 PWM 偏置每帧最大变化，当前为 `22/14` |
+| `CAR_AVOIDANCE_CLEARING_REVERSE_MAX_PWM` | CLEARING 阶段最大反向拉回 PWM，当前为 `35` |
+| `CAR_AVOIDANCE_LEFT_BOUNDARY_INSET` / `CAR_AVOIDANCE_NEAR_LEFT_BOUNDARY_INSET` | 关闭 servo_bias 后，边界路径模式的远/近左边界内收目标，当前为 `25/10` |
+| `CAR_AVOIDANCE_START_BOUNDARY_ROWS` | 车辆开始接管的距离窗口，当前为 150 |
+| `CAR_AVOIDANCE_NEAR_BOUNDARY_ROWS` | 近距离漏检判定窗口 |
+| `CAR_AVOIDANCE_PASS_ROWS` | car 贴近底部多少行内主动进入 CLEARING，当前为 15 |
+| `CAR_AVOIDANCE_LOCK_HIT_FRAMES` | car 连续命中多少帧才确认锁定，当前为 1 |
 | `CAR_AVOIDANCE_SEARCH_RADIUS` | car 跟踪匹配搜索半径 |
 | `CAR_AVOIDANCE_SEARCH_RADIUS_MISS_GAIN` | car 漏检时搜索半径扩大增益 |
+| `CAR_AVOIDANCE_NEAR_MISS_FRAMES` | 近距离 car 遮挡/贴底时允许连续漏检帧数，当前与普通漏检一致 |
 | `CAR_AVOIDANCE_TRACK_EMA_ALPHA` | car 底部中心跟踪 EMA 权重 |
-| `CAR_AVOIDANCE_MISS_FRAMES` | car 锁定后允许连续漏检帧数 |
+| `CAR_AVOIDANCE_MISS_FRAMES` | car 锁定后允许连续漏检帧数，漏 1/2 帧继续正常避障 |
 | `CAR_AVOIDANCE_MIN_SCORE` | car 避障最低置信度 |
 | `CAR_AVOIDANCE_MAX_AREA` | car 最大面积过滤，0 表示关闭 |
-| `CAR_AVOIDANCE_CLEARING_MISS_FRAMES` | CLEARING 起步时保持绕车基准线的帧数 |
-| `CAR_AVOIDANCE_CLEARING_DECAY_FRAMES` | CLEARING 绕车基准线衰减帧数 |
-| `CAR_AVOIDANCE_CLEARING_RESIDUAL_KEEP` | CLEARING 初期绕车基准线保留比例 |
-| `CAR_AVOIDANCE_CLEARING_DONE_RESIDUAL` | CLEARING 结束残余比例门槛 |
-| `CAR_AVOIDANCE_FIXED_BOUNDARY_HEIGHT_THRESH` | 触发贴右下近距离边界基准的车框高度阈值 |
-| `CAR_AVOIDANCE_FIXED_BOUNDARY_RIGHT_MARGIN` / `CAR_AVOIDANCE_FIXED_BOUNDARY_BOTTOM_MARGIN` | 贴右/贴底判定边距 |
-| `CAR_AVOIDANCE_COIN_ALLOW_BOTTOM_ROWS` | AVOIDING 时允许 coin 位于车辆阻挡区底部附近的行数 |
-| `CAR_AVOIDANCE_CLEARING_COIN_SAFE_ROWS` | CLEARING 时 coin 必须靠底的安全行数 |
-| `COIN_PATH_ENABLED` | 是否启用 coin 分段路径规划 |
-| `COIN_PATH_ROI_Y_MIN` | 新 coin 锁定的最小 y 行 |
-| `COIN_PATH_ROI_BOTTOM_STRICT_ROWS` | coin 底部严格区高度 |
-| `COIN_PATH_BOTTOM_HALF_WIDTH_SCALE` | 底部严格区半宽缩放 |
-| `COIN_PATH_EDGE_REJECT_ENABLED` / `COIN_PATH_EDGE_REJECT_MARGIN` | 是否过滤贴边 coin 以及贴边边距 |
-| `COIN_PATH_MASK_RADIUS` | coin 点附近必须存在 mask 的半径 |
-| `COIN_PATH_HALF_WIDTH_SCALE` | coin 横向合法区域半宽缩放 |
-| `COIN_PATH_BYPASS_FRAME_JUMP` | coin/car active 时是否跳过路径横跳限幅 |
-| `COIN_TRACK_MAX_MISS_FRAMES` | coin 锁定后允许漏检帧数 |
-| `COIN_TRACK_SEARCH_RADIUS` | coin 锁定匹配搜索半径 |
-| `COIN_TRACK_MAX_AREA` | coin 最大面积过滤 |
-| `COIN_TRACK_EAT_Y_MARGIN` | coin 靠近底部多少认为已吃到 |
-| `COIN_TRACK_BOTTOM_TOO_CLOSE_ROWS` | 新 coin 太贴底时跳过的行数 |
+| `CAR_AVOIDANCE_CLEARING_MISS_FRAMES` | CLEARING 起步额外保持帧数，当前为 0 |
+| `CAR_AVOIDANCE_CLEARING_DECAY_FRAMES` | CLEARING 从左边界内收 10 推到中线的帧数，当前为 5 |
+| `CAR_AVOIDANCE_CLEARING_MAX_FRAMES` | CLEARING 硬退出上限，避免丢车后长期挂在 PD 状态 |
 | `SEG_DEBUG_PATH_COLOR` / `SEG_DEBUG_PATH_THICKNESS` | 最终路径颜色和粗细 |
 | `SEG_DEBUG_DRAW_CANDIDATE_PATHS` | 是否绘制候选路径 |
 | `SEG_DEBUG_DRAW_BOUNDARIES` | 是否绘制左右边界 |
@@ -817,13 +815,9 @@ target_speed = 0                                # 若红/黄灯停车或行人�
 | `SEG_DEBUG_BOTTOM_MID_COLOR` / `SEG_DEBUG_BOTTOM_MID_RADIUS` | 底部参考点颜色和半径 |
 | `SEG_DEBUG_FORK_DIVIDER_COLOR` / `SEG_DEBUG_FORK_DIVIDER_THICKNESS` | Y 岔路分界线颜色和粗细 |
 | `SEG_DEBUG_MERGE_GUIDE_COLOR` / `SEG_DEBUG_MERGE_GUIDE_THICKNESS` | 汇合引导线颜色和粗细 |
-| `SEG_DEBUG_COIN_PATH_ENABLED` | 是否绘制 coin 规划路径 |
-| `SEG_DEBUG_COIN_PATH_COLOR` / `SEG_DEBUG_COIN_PATH_DOT_RADIUS` | coin 路径颜色和锚点半径 |
-| `SEG_DEBUG_COIN_BOTTOM_STRICT_LINE_ENABLED` | 是否绘制 coin 底部严格区线 |
-| `SEG_DEBUG_COIN_BOTTOM_STRICT_LINE_COLOR` / `SEG_DEBUG_COIN_BOTTOM_STRICT_LINE_THICKNESS` | coin 严格区线颜色和粗细 |
 | `SEG_DEBUG_TEXT_FONT_SCALE` / `SEG_DEBUG_TEXT_THICKNESS` | Seg 调试文字字号和粗细 |
-| `SEG_DEBUG_TEXT_POS_FPS` / `SEG_DEBUG_TEXT_POS_CTRL` / `SEG_DEBUG_TEXT_POS_STONE` / `SEG_DEBUG_TEXT_POS_BRANCH` / `SEG_DEBUG_TEXT_POS_COIN` | Seg 调试文字位置 |
-| `SEG_DEBUG_TEXT_COLOR_FPS` / `SEG_DEBUG_TEXT_COLOR_CTRL` / `SEG_DEBUG_TEXT_COLOR_STONE` / `SEG_DEBUG_TEXT_COLOR_BRANCH` / `SEG_DEBUG_TEXT_COLOR_COIN` | Seg 调试文字颜色 |
+| `SEG_DEBUG_TEXT_POS_FPS` / `SEG_DEBUG_TEXT_POS_CTRL` / `SEG_DEBUG_TEXT_POS_STONE` / `SEG_DEBUG_TEXT_POS_BRANCH` | Seg 调试文字位置 |
+| `SEG_DEBUG_TEXT_COLOR_FPS` / `SEG_DEBUG_TEXT_COLOR_CTRL` / `SEG_DEBUG_TEXT_COLOR_STONE` / `SEG_DEBUG_TEXT_COLOR_BRANCH` | Seg 调试文字颜色 |
 
 ### 主预览图绘制
 
@@ -1056,14 +1050,14 @@ SegProfile infer=21.1ms prep=0.3ms search=13.7ms fit=5.2ms render=1.2ms queue_wa
 | 平均 `render` | `4.0ms` | `2.1ms` |
 | 平均 `total` | `49.8ms` | `42.9ms` |
 | 平均终端 `est` | `20.5fps` | `23.6fps` |
-| 规划适配 | 方形输入，包含较多上半图远处信息 | 宽屏下半图，横向更细，更适合金币、障碍物和近处路径规划 |
+| 规划适配 | 方形输入，包含较多上半图远处信息 | 宽屏下半图，横向更细，更适合障碍物和近处路径规划 |
 
 这次对比的结论：
 
 - 当前 `416x160` 不是明显降低了 NPU 推理耗时；`infer` 基本仍在 `20ms` 左右
 - 端到端 `total` 从历史约 `49.8ms` 降到当前约 `42.9ms`，主要收益来自渲染和部分后处理
 - 页面 `Seg FPS` 能到 `37-38fps`，说明流水线吞吐更高；但车辆“看见到反应”的延迟仍主要看 `SegProfile total`
-- 虽然速度提升没有输入面积变化看起来那么大，但 `416x160` 对后续金币分段、障碍物绕行和近处 ROI 规划更合适
+- 虽然速度提升没有输入面积变化看起来那么大，但 `416x160` 对障碍物绕行和近处 ROI 规划更合适
 
 因此：
 
