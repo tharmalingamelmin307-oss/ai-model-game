@@ -6,8 +6,8 @@
    - seg_queues: 按赛程阶段送给一个或多个分割 / 路径规划线程
    - yolo_queues: 轮流送给多个目标检测线程
 3. yolo_worker 只负责检测；如果检测到 sign，再把 OCR 任务异步送入 ocr_queue。
-4. ocr_worker 单独占用一个 NPU 核，对整张 TARGET_RES 图执行 OCR det + rec，
-   再把识别结果按中心点回匹配到 sign 检测框。
+4. ocr_worker 对整张 TARGET_RES 图执行 OCR，再把识别结果按中心点回匹配到 sign 检测框。
+   OCR 后端可在本地 RKNN 和百度云 API 之间切换。
 5. seg_worker 读取当前最新的检测结果与 turn_intent，生成控制量和预览图。
 6. serial_control_thread 将控制量打包后发给下位机。
 7. Flask 读取 global_preview_frame，并调用 debug_tools 编码成 MJPEG 提供网页预览。
@@ -39,7 +39,8 @@ from modules.debug_tools import (
 )
 from modules.segmentor import RoadSegmentor
 from modules.detector import YOLODetector
-from modules.ocr_system import OCRRecognizer
+from modules.baidu_ocr_api import BaiduOCRRecognizer
+from modules.ocr_system import OCRRecognizer as LocalOCRRecognizer
 from modules.qianfan_client import request_road_choice
 try:
     from utils.rknn_quiet import install_rknn_warning_filter
@@ -1127,6 +1128,20 @@ def mark_sign_ocr_done():
         global_control_data["sign_llm_ocr_inflight_started_at"] = None
 
 
+def create_ocr_recognizer():
+    """Create the configured OCR backend while keeping the worker interface stable."""
+    backend = str(getattr(config, "OCR_BACKEND", "local")).strip().lower()
+    if backend in ("baidu", "baidu_api", "api", "cloud"):
+        return BaiduOCRRecognizer(
+            timeout=float(getattr(config, "BAIDU_OCR_TIMEOUT", 10.0)),
+            image_format=str(getattr(config, "BAIDU_OCR_IMAGE_FORMAT", ".jpg")),
+            jpeg_quality=int(getattr(config, "BAIDU_OCR_JPEG_QUALITY", 90)),
+        )
+    if backend in ("local", "rknn", "rknn_local"):
+        return LocalOCRRecognizer(core_id=config.REC_CORE)
+    raise RuntimeError(f"unsupported OCR_BACKEND: {backend}")
+
+
 def sign_llm_worker():
     """千帆语义判定独立进程，避免网络请求阻塞视觉/串口线程."""
     while True:
@@ -1559,7 +1574,11 @@ def ocr_worker():
 
             if ocr is None:
                 try:
-                    ocr = OCRRecognizer(core_id=config.REC_CORE)
+                    ocr = create_ocr_recognizer()
+                    log_once(
+                        "ocr_backend",
+                        f"OCR后端启动: {getattr(config, 'OCR_BACKEND', 'local')}",
+                    )
                 except Exception as e:
                     log_once("ocr_init_error", f"OCR启动失败: {e}")
                     mark_sign_ocr_done()

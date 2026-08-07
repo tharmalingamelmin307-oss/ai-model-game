@@ -95,6 +95,19 @@ REC_MODEL_PATH = str(PROJECT_ROOT / "models/ocr/ppocrv4_rec_fp16.rknn")
 # 如果更换 OCR 模型，这份字典往往也要一起换。
 DICT_PATH = str(PROJECT_ROOT / "models/ocr/keys.txt")
 
+# OCR 后端选择。
+# - "baidu_api": 把内存中的整张 TARGET_RES 图发给百度云 OCR，释放板端 NPU 的 OCR 压力
+# - "local": 使用下面的 OCR RKNN det + rec 模型
+OCR_BACKEND = "baidu_api"
+
+# 百度 OCR API 请求参数。
+# 密钥从项目根目录 .env 读取:
+#   BAIDU_OCR_API_KEY=...
+#   BAIDU_OCR_SECRET_KEY=...
+BAIDU_OCR_TIMEOUT = 10.0
+BAIDU_OCR_IMAGE_FORMAT = ".jpg"
+BAIDU_OCR_JPEG_QUALITY = 90
+
 
 # ---------------------------------------------------------------------------
 # NPU 核心分配
