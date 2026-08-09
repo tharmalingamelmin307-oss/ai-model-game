@@ -11,9 +11,8 @@
 当前路径选择策略的核心优先级是:
 1. 先在 mask 中寻找可行路径；若存在明显岔路，再先做分叉分区
 2. 路径必须从图像底部触达区域起步，悬空候选会被直接丢弃
-3. 如果检测到 `stone`，优先绕开石头所在分支
-4. 否则默认偏向左支
-5. OCR 语义转向当前仅预留输入，暂不参与最终分支选择
+3. 优先使用语义路牌或固定策略给出的分支方向
+4. 没有有效分支方向时默认偏向左支
 """
 
 import cv2
@@ -77,6 +76,9 @@ class RoadSegmentor:
             "car_active": False,
             "car_state": "FOLLOW_LANE",
             "car_rows_to_bottom": None,
+            "car_boundary_side": "",
+            "car_boundary_x": None,
+            "car_boundary_error": None,
         }
         self.merge_state_active = False
         self.merge_state_hit_frames = 0
@@ -91,6 +93,7 @@ class RoadSegmentor:
         self.locked_car_miss_frames = 0
         self.car_avoidance_state = "FOLLOW_LANE"
         self.car_avoidance_cycle_id = 0
+        self.car_avoidance_boundary_side = None
         self.car_clearing_frames = 0
         self.car_last_avoid_path = None
         self.car_last_avoid_path_is_boundary = False
@@ -166,6 +169,7 @@ class RoadSegmentor:
             int(debug.get("miss_frames", 0)),
             int(debug.get("clear_frames", 0)),
             bool(debug.get("boundary_path_active", False)),
+            str(debug.get("boundary_side", "") or ""),
             round(boundary_strength, 1),
         )
 
@@ -183,10 +187,12 @@ class RoadSegmentor:
         rows_text = "无" if rows is None else f"{float(rows):.1f}"
         center = debug.get("locked_center")
         center_text = "无" if center is None else f"({float(center[0]):.1f},{float(center[1]):.1f})"
-        left_x = debug.get("left_boundary_x")
-        left_x_text = "无" if left_x is None else f"{float(left_x):.1f}"
-        left_error = debug.get("left_boundary_error")
-        left_error_text = "无" if left_error is None else f"{float(left_error):.1f}"
+        boundary_side = str(debug.get("boundary_side", "") or "").upper() or "无"
+        nearest_side = str(debug.get("nearest_boundary_side", "") or "").upper() or "无"
+        boundary_x = debug.get("boundary_x")
+        boundary_x_text = "无" if boundary_x is None else f"{float(boundary_x):.1f}"
+        boundary_error = debug.get("boundary_error")
+        boundary_error_text = "无" if boundary_error is None else f"{float(boundary_error):.1f}"
         control_error = debug.get("control_path_error")
         control_error_text = "无" if control_error is None else f"{float(control_error):.1f}"
         stage_label = "避车过程"
@@ -212,7 +218,8 @@ class RoadSegmentor:
             f"inset={float(debug.get('boundary_inset_x', 0.0)):.1f} weight={float(debug.get('avoid_weight', 0.0)):.2f} "
             f"path={int(bool(debug.get('boundary_path_active', False)))} ready={int(bool(debug.get('boundary_ready', False)))} "
             f"active={int(active)} "
-            f"left_x={left_x_text} left_e={left_error_text} ctrl_e={control_error_text}" +
+            f"side={boundary_side} nearest={nearest_side} boundary_x={boundary_x_text} "
+            f"boundary_e={boundary_error_text} ctrl_e={control_error_text}" +
             line_suffix,
             flush=True,
         )
@@ -2074,94 +2081,8 @@ class RoadSegmentor:
 
         return left_repr, right_repr, True
 
-    def _estimate_stone_branch_side(self, planning_items, candidate_paths):
-        """估计石头更接近哪一侧候选分支.
-
-        返回:
-        -1: 更接近左支
-         1: 更接近右支
-         0: 无法稳定判断
-        """
-        stone_items = self._get_stone_avoid_items(planning_items)
-        if not stone_items or len(candidate_paths) < 2:
-            return 0
-
-        left_candidate = min(candidate_paths, key=lambda c: c["avg_x"])
-        right_candidate = max(candidate_paths, key=lambda c: c["avg_x"])
-
-        if left_candidate is right_candidate:
-            return 0
-
-        vote = 0
-        for item in stone_items:
-            seg_box = np.array(item["seg_box"], dtype=np.float32)
-            stone_center = np.mean(seg_box, axis=0)
-            stone_x = float(stone_center[0])
-            stone_y = float(stone_center[1])
-
-            left_x = self._path_x_at_y(left_candidate, stone_y)
-            right_x = self._path_x_at_y(right_candidate, stone_y)
-
-            if abs(right_x - left_x) < config.STONE_BRANCH_MIN_SEP:
-                continue
-
-            if abs(stone_x - left_x) <= abs(stone_x - right_x):
-                vote -= 1
-            else:
-                vote += 1
-
-        if vote < 0:
-            return -1
-        if vote > 0:
-            return 1
-        return 0
-
-    def _get_stone_avoid_items(self, planning_items):
-        """筛出参与分支避让的石头检测结果."""
-        return [
-            item for item in planning_items
-            if item.get("class_name") == "stone" and item.get("seg_box") is not None
-        ]
-
-    def _estimate_stone_side_by_fork_divider(self, planning_items, fork_point, mask_shape):
-        """按 Y 分叉切分线判断石头位于左区还是右区.
-
-        这个判断和 _split_mask_by_fork 使用同一条“分叉特征点垂直向下”分界线，
-        比较适合已经确认 Y 型分叉的场景。
-        """
-        stone_items = self._get_stone_avoid_items(planning_items)
-        if not stone_items or fork_point is None:
-            return 0
-
-        fork_x = float(fork_point[0])
-        min_sep = float(config.STONE_BRANCH_MIN_SEP)
-
-        vote = 0
-        for item in stone_items:
-            seg_box = np.array(item["seg_box"], dtype=np.float32)
-            stone_center = np.mean(seg_box, axis=0)
-            stone_x = float(stone_center[0])
-
-            if abs(stone_x - fork_x) < min_sep:
-                continue
-            if stone_x < fork_x:
-                vote -= 1
-            else:
-                vote += 1
-
-        if vote < 0:
-            return -1
-        if vote > 0:
-            return 1
-        return 0
-
-    def _resolve_preferred_turn(self, stone_branch_side, turn_intent=-1):
-        """得到最终分支选择；stone 避让只在配置打开时覆盖路线方向."""
-        if bool(getattr(config, "STONE_BRANCH_AVOIDANCE_ENABLED", True)):
-            if stone_branch_side == -1:
-                return 1
-            if stone_branch_side == 1:
-                return -1
+    def _resolve_preferred_turn(self, turn_intent=-1):
+        """得到最终分支选择；没有有效语义方向时默认走左支."""
         if int(turn_intent) in (-1, 1):
             return int(turn_intent)
         return -1
@@ -2198,7 +2119,6 @@ class RoadSegmentor:
 
         这些目标当前主要用于:
         - 调试显示
-        - `stone` 与分支左右关系判断
         暂时不会像 cost map 那样直接侵蚀主路径。
         """
         planning_items = []
@@ -2295,9 +2215,17 @@ class RoadSegmentor:
         planned[:, 0] = np.clip(planned[:, 0], 0.0, float(w_seg - 1))
         return planned.astype(np.float32), True
 
+    def _build_car_boundary_path(self, base_path, boundary, inset_x, w_seg):
+        """按选定边界生成避车参考线."""
+        return self._build_boundary_inset_path(base_path, boundary, inset_x, w_seg)
+
     def _build_car_left_boundary_path(self, base_path, left_boundary, inset_x, w_seg):
         """避车时把左边线本身当作控制中线。"""
-        return self._build_boundary_inset_path(base_path, left_boundary, 0.0, w_seg)
+        return self._build_car_boundary_path(base_path, left_boundary, 0.0, w_seg)
+
+    def _build_car_right_boundary_path(self, base_path, right_boundary, inset_x, w_seg):
+        """避车时把右边线本身当作控制中线。"""
+        return self._build_car_boundary_path(base_path, right_boundary, 0.0, w_seg)
 
     def _car_control_path_error_for_debug(self, path_points, w_seg):
         """返回避车参考线在 Stanley 前视行上的实际控制误差."""
@@ -2320,6 +2248,37 @@ class RoadSegmentor:
         if xs is None or len(xs) == 0:
             return None
         return float(xs[0])
+
+    def _select_car_avoidance_boundary_side(self, locked_car, left_boundary, right_boundary):
+        """根据车辆更靠近哪条边界，选择更空的一侧做避车参考线.
+
+        返回:
+        - avoid_side: "left" / "right"
+        - boundary_x: 当前选中边界在车所在 y 的 x 值
+        - boundary_error: boundary_x - 画面中线
+        - nearest_side: 车辆更接近的边界侧；None 表示无法判断
+        """
+        if locked_car is None:
+            return "left", None, None, None
+
+        _smooth_cx, smooth_cy = locked_car.get("bottom_center", (0.0, 0.0))
+        car_x = float(_smooth_cx)
+        left_x = self._boundary_x_at_y(left_boundary, float(smooth_cy)) if left_boundary is not None else None
+        right_x = self._boundary_x_at_y(right_boundary, float(smooth_cy)) if right_boundary is not None else None
+        target_x = float(config.SEG_SIZE[0]) * 0.5
+
+        if left_x is not None and right_x is not None:
+            left_dist = abs(car_x - float(left_x))
+            right_dist = abs(float(right_x) - car_x)
+            if left_dist <= right_dist:
+                return "right", float(right_x), float(right_x) - target_x, "left"
+            return "left", float(left_x), float(left_x) - target_x, "right"
+
+        if left_x is not None:
+            return "left", float(left_x), float(left_x) - target_x, "left"
+        if right_x is not None:
+            return "right", float(right_x), float(right_x) - target_x, "right"
+        return "left", None, None, None
 
     def _car_measurement_from_item(self, item, w_seg, h_seg, base):
         """从 car 检测框提取用于跟踪和避障的稳定几何量."""
@@ -2515,7 +2474,7 @@ class RoadSegmentor:
         if rows_to_car > start_rows:
             return 0.0, (center_y, path_bottom_y), False
 
-        # 进入避障窗口后，把左边线本身当作控制中线。
+        # 进入避障窗口后，把选定侧边界本身当作控制中线。
         return 0.0, (center_y, path_bottom_y), True
 
     def _update_car_avoidance_boundary_path(
@@ -2525,19 +2484,26 @@ class RoadSegmentor:
         w_seg,
         h_seg,
         left_boundary=None,
+        right_boundary=None,
         state_updates_enabled=True,
     ):
-        """检测到 car 时锁定同一辆车，并把控制参考线切到左边界."""
+        """检测到 car 时锁定同一辆车，并把控制参考线切到更空的一侧边界."""
         debug = {
             "blocked_y_range": None,
             "boundary_inset_x": 0.0,
             "boundary_strength_x": 0.0,
             "boundary_path_active": False,
             "boundary_ready": False,
+            "boundary_side": self.car_avoidance_boundary_side,
+            "boundary_x": None,
+            "boundary_error": None,
+            "nearest_boundary_side": None,
             "avoid_weight": 0.0,
             "rows_to_bottom": None,
             "left_boundary_error": None,
             "left_boundary_x": None,
+            "right_boundary_error": None,
+            "right_boundary_x": None,
             "control_path_error": None,
             "detected_cars": 0,
             "locked_confirmed": False,
@@ -2551,6 +2517,7 @@ class RoadSegmentor:
             "cycle_id": int(self.car_avoidance_cycle_id),
         }
         base = np.array(base_path, dtype=np.float32).reshape((-1, 2))
+        prev_state = self.car_avoidance_state
         if len(base) < 2 or not bool(getattr(config, "CAR_AVOIDANCE_ENABLED", True)):
             return 0.0, debug, None
 
@@ -2586,6 +2553,18 @@ class RoadSegmentor:
                     )
             return 0.0, debug, None
 
+        def _build_avoid_path_for_side(boundary_side, inset_value=0.0):
+            if boundary_side == "right":
+                if right_boundary is not None:
+                    return self._build_car_right_boundary_path(base, right_boundary, inset_value, w_seg)
+                if left_boundary is not None:
+                    return self._build_car_left_boundary_path(base, left_boundary, inset_value, w_seg)
+            if left_boundary is not None:
+                return self._build_car_left_boundary_path(base, left_boundary, inset_value, w_seg)
+            if right_boundary is not None:
+                return self._build_car_right_boundary_path(base, right_boundary, inset_value, w_seg)
+            return base, False
+
         if not bool(state_updates_enabled):
             debug["cycle_id"] = int(self.car_avoidance_cycle_id)
             debug["state"] = self.car_avoidance_state
@@ -2604,18 +2583,15 @@ class RoadSegmentor:
             self.car_clearing_frames += 1
             current_avoid_path = self.car_last_avoid_path
             current_path_ok = bool(self.car_last_avoid_path_is_boundary)
-            if left_boundary is not None:
-                candidate_path, candidate_ok = self._build_car_left_boundary_path(
-                    base,
-                    left_boundary,
-                    self.car_last_boundary_inset_x,
-                    w_seg,
-                )
-                if candidate_ok:
-                    current_avoid_path = candidate_path
-                    current_path_ok = True
-                    self.car_last_avoid_path = candidate_path.copy()
-                    self.car_last_avoid_path_is_boundary = True
+            candidate_path, candidate_ok = _build_avoid_path_for_side(
+                self.car_avoidance_boundary_side,
+                self.car_last_boundary_inset_x,
+            )
+            if candidate_ok:
+                current_avoid_path = candidate_path
+                current_path_ok = True
+                self.car_last_avoid_path = candidate_path.copy()
+                self.car_last_avoid_path_is_boundary = True
             clearing_path, avoid_weight = self._build_car_clearing_path(
                 base,
                 current_avoid_path,
@@ -2642,6 +2618,7 @@ class RoadSegmentor:
                 self.car_last_avoid_path = None
                 self.car_last_avoid_path_is_boundary = False
                 self.car_last_boundary_inset_x = 0.0
+                self.car_avoidance_boundary_side = None
                 debug["state"] = self.car_avoidance_state
                 debug["clear_frames"] = 0
                 debug["miss_frames"] = int(self.locked_car_miss_frames)
@@ -2650,6 +2627,7 @@ class RoadSegmentor:
                 debug["boundary_path_active"] = False
                 debug["boundary_ready"] = False
                 debug["avoid_weight"] = 0.0
+                debug["boundary_side"] = ""
                 debug["active"] = False
                 debug["event"] = "clear_done"
                 debug["clear_timeout"] = bool(clear_timeout)
@@ -2661,6 +2639,7 @@ class RoadSegmentor:
             debug["miss_frames"] = int(self.locked_car_miss_frames)
             debug["boundary_inset_x"] = float(self.car_last_boundary_inset_x)
             debug["boundary_strength_x"] = float(self.car_last_boundary_inset_x) * float(avoid_weight)
+            debug["boundary_side"] = self.car_avoidance_boundary_side or ""
             debug["boundary_path_active"] = bool(current_path_ok)
             debug["boundary_ready"] = bool(current_path_ok)
             debug["avoid_weight"] = float(avoid_weight)
@@ -2681,7 +2660,6 @@ class RoadSegmentor:
                 measurements.append(measurement)
         debug["detected_cars"] = int(len(measurements))
 
-        prev_state = self.car_avoidance_state
         if self.locked_car is None and self.car_avoidance_state == "FOLLOW_LANE":
             start_rows = max(0.0, float(getattr(config, "CAR_AVOIDANCE_START_BOUNDARY_ROWS", 115.0)))
             path_bottom_y = float(np.max(base[:, 1]))
@@ -2731,15 +2709,35 @@ class RoadSegmentor:
         _smooth_cx, smooth_cy = locked_car.get("bottom_center", (0.0, float(np.max(base[:, 1]))))
         rows_to_car = max(0.0, float(np.max(base[:, 1])) - float(smooth_cy))
         left_boundary_x = self._boundary_x_at_y(left_boundary, float(smooth_cy)) if left_boundary is not None else None
+        right_boundary_x = self._boundary_x_at_y(right_boundary, float(smooth_cy)) if right_boundary is not None else None
         target_x = float(w_seg) * 0.5
         left_boundary_error = None if left_boundary_x is None else float(left_boundary_x) - target_x
+        right_boundary_error = None if right_boundary_x is None else float(right_boundary_x) - target_x
         debug["rows_to_bottom"] = float(rows_to_car)
         debug["miss_frames"] = int(self.locked_car_miss_frames)
         debug["left_boundary_error"] = None if left_boundary_error is None else float(left_boundary_error)
         debug["left_boundary_x"] = None if left_boundary_x is None else float(left_boundary_x)
+        debug["right_boundary_error"] = None if right_boundary_error is None else float(right_boundary_error)
+        debug["right_boundary_x"] = None if right_boundary_x is None else float(right_boundary_x)
         debug["locked_confirmed"] = bool(locked_car.get("confirmed", False))
         debug["locked_hit_frames"] = int(locked_car.get("hit_frames", 0))
         debug["locked_center"] = (float(_smooth_cx), float(smooth_cy))
+
+        resolved_side, boundary_x, boundary_error, nearest_side = self._select_car_avoidance_boundary_side(
+            locked_car,
+            left_boundary,
+            right_boundary,
+        )
+        if prev_state != "AVOIDING" or self.car_avoidance_boundary_side not in ("left", "right"):
+            self.car_avoidance_boundary_side = resolved_side
+        selected_side = self.car_avoidance_boundary_side if self.car_avoidance_boundary_side in ("left", "right") else resolved_side
+        if selected_side != resolved_side:
+            boundary_x = right_boundary_x if selected_side == "right" else left_boundary_x
+            boundary_error = None if boundary_x is None else float(boundary_x) - target_x
+        debug["boundary_side"] = selected_side
+        debug["boundary_x"] = None if boundary_x is None else float(boundary_x)
+        debug["boundary_error"] = None if boundary_error is None else float(boundary_error)
+        debug["nearest_boundary_side"] = nearest_side
 
         inset, y_range, boundary_ready = self._car_avoidance_boundary_inset(locked_car, base)
         debug["boundary_ready"] = bool(boundary_ready)
@@ -2752,6 +2750,7 @@ class RoadSegmentor:
                 self.car_last_avoid_path = None
                 self.car_last_avoid_path_is_boundary = False
                 self.car_last_boundary_inset_x = 0.0
+                self.car_avoidance_boundary_side = None
             debug["state"] = self.car_avoidance_state
             debug["clear_frames"] = int(self.car_clearing_frames)
             debug["event"] = "locked_not_ready"
@@ -2760,7 +2759,7 @@ class RoadSegmentor:
 
         if y_range is not None:
             debug["blocked_y_range"] = (float(y_range[0]), float(y_range[1]))
-        avoid_path, path_ok = self._build_car_left_boundary_path(base, left_boundary, inset, w_seg)
+        avoid_path, path_ok = _build_avoid_path_for_side(selected_side, inset)
         if prev_state != "AVOIDING":
             self.car_avoidance_cycle_id += 1
         self.car_avoidance_state = "AVOIDING"
@@ -2774,6 +2773,7 @@ class RoadSegmentor:
         debug["boundary_strength_x"] = float(inset)
         debug["avoid_weight"] = 1.0
         debug["boundary_ready"] = bool(boundary_ready)
+        debug["boundary_side"] = selected_side
         debug["boundary_path_active"] = bool(path_ok)
         debug["control_path_error"] = self._car_control_path_error_for_debug(avoid_path, w_seg) if path_ok else None
         debug["active"] = True
@@ -2882,7 +2882,7 @@ class RoadSegmentor:
             y_fork_info = {"active": False, "fork_point": None, "split_rows": 0}
         else:
             y_fork_info = self._detect_y_fork(search_mask)
-        fork_bottom_mid = self._road_bottom_midpoint(search_mask)
+        fork_bottom_mid = None
         branch_pair_count_max = 0
         branch_support_rows = 0
         t_search_end = time.perf_counter()
@@ -2897,6 +2897,7 @@ class RoadSegmentor:
         candidate_right_orig = None
         y_fork_active = False
         fork_active = False
+        pending_centerline_active = False
         best_path = None
         best_nodes = None
         fork_selected_side = None
@@ -2913,7 +2914,6 @@ class RoadSegmentor:
         if preferred_turn_default not in (-1, 1):
             preferred_turn_default = -1
         route_boundary_side = None
-        stone_branch_side = 0
         car_path_debug = None
         car_avoid_path = None
         car_active = False
@@ -2965,16 +2965,9 @@ class RoadSegmentor:
                 candidate_left_orig = np.array(left_best["path"], dtype=np.float32).reshape((-1, 1, 2))
                 candidate_right_orig = np.array(right_best["path"], dtype=np.float32).reshape((-1, 1, 2))
 
-                candidate_pool = [left_best, right_best]
-                stone_branch_side = self._estimate_stone_side_by_fork_divider(
-                    planning_items,
-                    y_fork_info.get("fork_point"),
-                    search_mask.shape,
-                )
-                if stone_branch_side == 0:
-                    stone_branch_side = self._estimate_stone_branch_side(planning_items, candidate_pool)
                 fork_center_candidate = None
                 if bool(sign_route_pending):
+                    fork_bottom_mid = self._road_bottom_midpoint(search_mask)
                     fork_center_candidate = self._build_fork_centerline_candidate(
                         search_mask,
                         y_fork_info.get("fork_point"),
@@ -2983,8 +2976,9 @@ class RoadSegmentor:
                 if fork_center_candidate is not None:
                     best_candidate = fork_center_candidate
                     fork_selected_side = None
+                    pending_centerline_active = True
                 else:
-                    preferred_turn = self._resolve_preferred_turn(stone_branch_side, preferred_turn_default)
+                    preferred_turn = self._resolve_preferred_turn(preferred_turn_default)
                     best_candidate = right_best if preferred_turn == 1 else left_best
                     fork_selected_side = "right" if preferred_turn == 1 else "left"
                 best_path = best_candidate["path"]
@@ -3044,18 +3038,7 @@ class RoadSegmentor:
                                 choice_right = rightmost
 
                         if choice_left is not None and choice_right is not None:
-                            candidate_pool = [choice_left, choice_right]
-                            if bool(getattr(config, "STONE_BRANCH_AVOIDANCE_ENABLED", True)):
-                                stone_branch_side = self._estimate_stone_branch_side(planning_items, candidate_pool)
-                            else:
-                                stone_branch_side = 0
-                            if stone_branch_side == -1:
-                                best_candidate = choice_right
-                                route_boundary_side = "right"
-                            elif stone_branch_side == 1:
-                                best_candidate = choice_left
-                                route_boundary_side = "left"
-                            elif preferred_turn_default == -1:
+                            if preferred_turn_default == -1:
                                 best_candidate = choice_left
                                 route_boundary_side = "left"
                             elif preferred_turn_default == 1:
@@ -3070,14 +3053,15 @@ class RoadSegmentor:
         if best_path is not None:
             guide_polyline = None if merge_guide_info is None else merge_guide_info.get("guide_polyline")
             fit_nodes = self._apply_merge_boundary_width(best_nodes, merge_side, guide_polyline)
+            fork_width_side = fork_selected_side or route_boundary_side
             if (
                 bool(getattr(config, "FORK_BOUNDARY_WIDTH_ENABLED", True)) and
                 merge_side not in ("left", "right") and
-                (fork_selected_side or route_boundary_side) in ("left", "right")
+                fork_width_side in ("left", "right")
             ):
                 fit_nodes = self._apply_fork_boundary_width(
                     fit_nodes,
-                    fork_selected_side or route_boundary_side,
+                    fork_width_side,
                 )
             fit_path = np.array([node["pt"] for node in fit_nodes], dtype=np.float32)
             node_x = fit_path[:, 0]
@@ -3095,8 +3079,29 @@ class RoadSegmentor:
 
             current_coeffs = self._fit_path_poly_coeffs(node_y, node_x)
 
-            # 4. 时域一阶低通滤波 (EMA)，赋予路径物理连贯惯性，消除分叉口反复横跳
-            if self.last_poly_coeffs is not None and len(self.last_poly_coeffs) == len(current_coeffs):
+            # 岔路首次确认时，上一帧通常还是公共中线。若继续把公共中线
+            # 以 EMA 混入目标支路，会出现“先沿分界线、再切入支路”的现象。
+            # 只在进入目标支路的切换帧跳过一次 EMA，普通路径仍保持平滑。
+            current_fork_side = fork_selected_side or route_boundary_side
+            previous_fork_side = (
+                self.last_branch_stats.get("fork_selected_side") or
+                self.last_branch_stats.get("route_boundary_side")
+            )
+            branch_route_switch = (
+                current_fork_side in ("left", "right") and
+                (
+                    previous_fork_side != current_fork_side or
+                    (
+                        bool(y_fork_active) and
+                        not bool(self.last_branch_stats.get("y_fork_active", False))
+                    )
+                )
+            )
+            if (
+                not branch_route_switch and
+                self.last_poly_coeffs is not None and
+                len(self.last_poly_coeffs) == len(current_coeffs)
+            ):
                 poly_coeffs = self.ema_alpha * self.last_poly_coeffs + (1.0 - self.ema_alpha) * current_coeffs
             else:
                 poly_coeffs = current_coeffs
@@ -3127,6 +3132,7 @@ class RoadSegmentor:
                 w_seg,
                 h_seg,
                 left_boundary=left_boundary_pts,
+                right_boundary=right_boundary_pts,
                 state_updates_enabled=bool(debug_drive_active),
             )
             car_active = car_path_debug is not None and car_path_debug.get("active")
@@ -3310,6 +3316,10 @@ class RoadSegmentor:
             "branch_support_rows": int(branch_support_rows),
             "fork_active": bool(fork_active),
             "y_fork_active": bool(y_fork_active),
+            "y_fork_point": y_fork_info.get("fork_point") if y_fork_active else None,
+            "y_fork_split_rows": int(y_fork_info.get("split_rows", 0)) if y_fork_active else 0,
+            "fork_selected_side": fork_selected_side,
+            "route_boundary_side": route_boundary_side,
             "merge_side": merge_side,
             "merge_state_active": bool(self.merge_state_active),
             "merge_state_hit_frames": int(self.merge_state_hit_frames),
@@ -3320,6 +3330,10 @@ class RoadSegmentor:
             "car_miss_frames": int(car_path_debug.get("miss_frames", 0)) if car_path_debug is not None else 0,
             "car_clear_frames": int(car_path_debug.get("clear_frames", 0)) if car_path_debug is not None else 0,
             "car_state_paused": bool(car_path_debug.get("paused", False)) if car_path_debug is not None else False,
+            "car_boundary_side": str(car_path_debug.get("boundary_side", "")) if car_path_debug is not None else "",
+            "car_boundary_error": float(car_path_debug.get("boundary_error", 0.0)) if car_path_debug is not None and car_path_debug.get("boundary_error") is not None else None,
+            "car_boundary_x": float(car_path_debug.get("boundary_x", 0.0)) if car_path_debug is not None and car_path_debug.get("boundary_x") is not None else None,
+            "car_nearest_boundary_side": str(car_path_debug.get("nearest_boundary_side", "")) if car_path_debug is not None else "",
             "car_left_boundary_error": float(car_path_debug.get("left_boundary_error", 0.0)) if car_path_debug is not None and car_path_debug.get("left_boundary_error") is not None else None,
             "car_left_boundary_x": float(car_path_debug.get("left_boundary_x", 0.0)) if car_path_debug is not None and car_path_debug.get("left_boundary_x") is not None else None,
             "car_control_path_error": float(car_path_debug.get("control_path_error", 0.0)) if car_path_debug is not None and car_path_debug.get("control_path_error") is not None else None,
@@ -3339,7 +3353,7 @@ class RoadSegmentor:
             "car_control_speed_estimate": float(control_param_overrides.get("speed_estimate", 0.0)) if 'control_param_overrides' in locals() and control_param_overrides is not None else None,
             "external_boundary_inset_x": float(external_boundary_inset_x),
             "external_boundary_side": external_boundary_side,
-            "sign_route_pending_centerline": bool(sign_route_pending and y_fork_active and fork_selected_side is None),
+            "sign_route_pending_centerline": bool(pending_centerline_active),
         }
         self._store_main_overlay(
             pts_final_orig,
@@ -3350,9 +3364,9 @@ class RoadSegmentor:
             candidate_left_pts=candidate_left_orig,
             candidate_right_pts=candidate_right_orig,
             merge_guide_pts=None if merge_guide_info is None else merge_guide_info.get("guide_polyline"),
-            fork_point=y_fork_info.get("fork_point") if y_fork_active else None,
+            fork_point=y_fork_info.get("fork_point") if pending_centerline_active else None,
             control_band=control_band if 'control_band' in locals() else None,
-            bottom_mid=fork_bottom_mid if y_fork_active else None,
+            bottom_mid=fork_bottom_mid if pending_centerline_active else None,
         )
         t_fit_end = time.perf_counter()
 
@@ -3417,7 +3431,6 @@ class RoadSegmentor:
             steer_signal=steer_signal,
             servo_pwm=servo_pwm,
             branch_stats=self.last_branch_stats,
-            stone_branch_side=stone_branch_side if 'stone_branch_side' in locals() else None,
         )
         t_render_end = time.perf_counter()
         preprocess_s = t_preprocess_end - t_preprocess_start
@@ -3453,6 +3466,7 @@ class RoadSegmentor:
         external_boundary_inset_x=0.0,
         external_boundary_side="left",
         sign_route_pending=False,
+        debug_drive_active=True,
     ):
         """兼容旧串行调用：推理和后处理在同一个线程里连续执行."""
         t_total_start = time.perf_counter()
@@ -3469,4 +3483,5 @@ class RoadSegmentor:
             external_boundary_inset_x=external_boundary_inset_x,
             external_boundary_side=external_boundary_side,
             sign_route_pending=sign_route_pending,
+            debug_drive_active=debug_drive_active,
         )

@@ -222,15 +222,15 @@ SIGN_ROUTE_SKIP_FIRST_PASS = True
 SIGN_ROUTE_FIXED_REQUIRE_SIGN = True
 # 触发语义路牌停车采样的 sign 框面积阈值，单位是 TARGET_RES 坐标系像素面积。
 # 它会和 SIGN_LLM_T0RIGGER_DIST、SIGN_LLM_TRIGGER_EDGE_MARGIN_RATIO 同时满足后才停车。
-SIGN_LLM_TRIGGER_AREA = 10000 #17000
+SIGN_LLM_TRIGGER_AREA = 12000 #16000
 # 触发语义路牌停车采样的 sign 截止距离，单位是 TARGET_RES 像素。
 # 路牌框底边距离画面底部小于等于该值，才认为已经足够近，可以停车采样。
 # 调大：更早停车；调小：更靠近再停车。
-SIGN_LLM_TRIGGER_DIST = 600  #500
+SIGN_LLM_TRIGGER_DIST = 600
 # 硬性停车采样条件：Y 岔路特征点距离分割平面底部小于等于该行数时，
 # 若当前帧有不贴边的 sign 框，立刻停车开始路牌 OCR/千帆，不再受 sign 面积/高度限制。
 # 单位是 SEG_SIZE 坐标系像素行。
-SIGN_LLM_FORK_POINT_TRIGGER_ROWS = 160 #150
+SIGN_LLM_FORK_POINT_TRIGGER_ROWS = 150
 # 停车后希望采集的有效 OCR 样本数量。
 # 收满后会提交给千帆；如果超时，也可能提前提交已有样本。
 SIGN_LLM_OCR_SAMPLES = 5
@@ -276,7 +276,6 @@ CLASS_MIN_SCORES = {
     "car": 0.50,
     "person": 0.50,
     "door": 0.50,
-    "stone": 0.50,
     "sign": 0.50,
     "start": 0.50,
     "stop": 0.50,
@@ -586,11 +585,10 @@ SEG_FIXED_WIDTHS_320_SMOOTH = [
 PATH_LOCK_FORK_MIN_SEP = 36.0
 
 # 会被映射到分割平面里的“规划相关类别”。
-# car 用于避车状态机，stone 用于分支选择，其它类别预留给场景逻辑。
+# car 用于避车状态机，其它类别预留给场景逻辑。
 PLANNING_CLASS_NAMES = (
     "car",
     "person",
-    "stone",
     "door",
 )
 
@@ -1003,6 +1001,9 @@ DEFAULT_CONTROL_DATA = {
     "car_avoidance_miss_frames": 0,
     "car_avoidance_clear_frames": 0,
     "car_avoidance_state_paused": False,
+    "car_avoidance_boundary_side": "",
+    "car_avoidance_boundary_x": None,
+    "car_avoidance_boundary_error": None,
     "car_avoidance_left_boundary_error": None,
     "car_avoidance_left_boundary_x": None,
     "car_avoidance_boundary_inset_x": 0.0,
@@ -1343,12 +1344,6 @@ SEG_PATH_TEMPORAL_MIN_OVERLAP_POINTS = 4
 # 当前帧没搜到路径时，短暂沿用上一帧路径的最大帧数。
 SEG_PATH_HOLD_MISSING_FRAMES = 2
 
-# 是否允许 stone 检测结果覆盖当前岔路方向。
-# 关闭后岔路只按路牌/固定序列/默认方向走，避免 stone 误检导致第一圈乱拐。
-STONE_BRANCH_AVOIDANCE_ENABLED = False
-# 估计石头更靠近左/右分支时，左右候选路径至少要拉开这么多像素才认为可比较。
-STONE_BRANCH_MIN_SEP = 12
-
 # 自底向上路径搜索参数。
 # 这些值决定了 mask 搜索的采样密度、连通判定和候选路径数量上限。
 # 如果分叉口容易漏掉某一支，或直道上路径抖动明显，优先看这里。
@@ -1446,8 +1441,8 @@ TRACK_WIDTH_LOG_INTERVAL = 1.5
 # 车辆避障控制参数
 # 这组参数工作在分割输入 `SEG_SIZE = 416x160` 的坐标系里。
 # y 方向是 160 行高度，所有 `*_ROWS` 都是“离底部多少行”的意思。
-# 当前方案：检测到 car 后不叠加舵机偏置，只把控制参考线切到左边界，
-# 让左边界尽量维持在画面中间；停车时避车状态机冻结，恢复后继续。
+# 当前方案：检测到 car 并锁定后，比较车框底部中心更靠近左边界还是右边界，
+# 选择更空的一侧边界作为避车控制参考线；停车时避车状态机冻结，恢复后继续。
 # ---------------------------------------------------------------------------
 CAR_AVOIDANCE_ENABLED = True
 
@@ -1456,9 +1451,9 @@ CAR_AVOIDANCE_ENABLED = True
 # 每档依次是 P（横向）、D（横向变化）、psi（航向）和对应速度。
 
 # 1. 普通巡线
-STANLEY_LATERAL_GAIN = 0.3
-STANLEY_LATERAL_D_GAIN = 0.018
-STANLEY_HEADING_GAIN = 0.26
+STANLEY_LATERAL_GAIN = 0.28
+STANLEY_LATERAL_D_GAIN = 0.015
+STANLEY_HEADING_GAIN = 0.33
 STANLEY_SPEED_ESTIMATE = CONTROL_MAX_SPEED
 
 # # 2. 正在避车（AVOIDING / CLEARING）
@@ -1470,16 +1465,16 @@ STANLEY_SPEED_ESTIMATE = CONTROL_MAX_SPEED
 
 # 2. 正在避车（AVOIDING / CLEARING）
 CAR_AVOIDANCE_TARGET_SPEED = 75
-CAR_AVOIDANCE_STANLEY_LATERAL_GAIN = 0.3
-CAR_AVOIDANCE_STANLEY_LATERAL_D_GAIN = 0.018
-CAR_AVOIDANCE_STANLEY_HEADING_GAIN = 0.26
+CAR_AVOIDANCE_STANLEY_LATERAL_GAIN = 0.28
+CAR_AVOIDANCE_STANLEY_LATERAL_D_GAIN = 0.015
+CAR_AVOIDANCE_STANLEY_HEADING_GAIN = 0.33
 CAR_AVOIDANCE_STANLEY_SPEED_ESTIMATE = CAR_AVOIDANCE_TARGET_SPEED
 
 # 3. 绕完两辆车并完成回正后高速巡线75
 POST_CAR_TARGET_SPEED = 75
-POST_CAR_STANLEY_LATERAL_GAIN = 0.3
-POST_CAR_STANLEY_LATERAL_D_GAIN = 0.018  #0.02
-POST_CAR_STANLEY_HEADING_GAIN = 0.26
+POST_CAR_STANLEY_LATERAL_GAIN = 0.28
+POST_CAR_STANLEY_LATERAL_D_GAIN = 0.015
+POST_CAR_STANLEY_HEADING_GAIN = 0.33
 POST_CAR_STANLEY_SPEED_ESTIMATE = POST_CAR_TARGET_SPEED
 
 
@@ -1491,9 +1486,8 @@ POST_CAR_STANLEY_SPEED_ESTIMATE = POST_CAR_TARGET_SPEED
 # POST_CAR_STANLEY_SPEED_ESTIMATE = POST_CAR_TARGET_SPEED
 # ---------------------------------------------------------------------------
 
-# 遇见车辆后，把左边线本身当作控制中线，不做额外内收。
 # 全程最多触发几次车辆避障；0 表示不限制。
-CAR_AVOIDANCE_MAX_CYCLES = 2
+CAR_AVOIDANCE_MAX_CYCLES = 5
 
 # 绕完指定数量的车辆并完成回正后，切到第三套独立的高速巡线参数。
 # 三套 B 控制参数分别是：普通巡线 STANLEY_*、避车 CAR_AVOIDANCE_*、
@@ -1510,7 +1504,7 @@ CAR_AVOIDANCE_DISTANCE_LINE_COLOR = (255, 0, 0)
 CAR_AVOIDANCE_DISTANCE_LINE_THICKNESS = 3
 # car 底部中心距离画面底部不超过这个行数时，使用近距离漏检帧数。
 CAR_AVOIDANCE_NEAR_BOUNDARY_ROWS = 110.0
-# 避车提交距离：拉左线后，目标第一次进入这个距离以内，就持续左线直到 car 消失。
+# 避车提交距离：目标第一次进入这个距离以内后，就持续沿选定侧边界直到 car 消失。
 CAR_AVOIDANCE_COMMIT_ROWS = 80.0
 # car 跟踪锁定。锁定主要看车框底部中心点的连续性，面积只做异常框过滤。
 # 连续命中后进入避障；短暂漏检会继续沿用锁定目标，超过允许帧数后进入 CLEARING。
@@ -1538,11 +1532,11 @@ CAR_AVOIDANCE_MIN_SCORE = 0.0
 # car 检测最大面积过滤；0 表示不额外过滤。
 CAR_AVOIDANCE_MAX_AREA = 0.0
 # 避障退出状态机。
-# 车丢失后先保持左边线一段时间，再在短窗口内切回正常循线。
+# 车丢失后先保持选定侧边界一段时间，再在短窗口内切回正常循线。
 CAR_AVOIDANCE_CLEARING_MISS_FRAMES = 0
-# CLEARING 前段继续追左边线的帧数。
+# CLEARING 前段继续追选定侧边界的帧数。
 CAR_AVOIDANCE_CLEARING_HOLD_FRAMES = 15
-# CLEARING 后段从左边线切回正常循线的帧数。
+# CLEARING 后段从选定侧边界切回正常循线的帧数。
 CAR_AVOIDANCE_CLEARING_RETURN_FRAMES = 5
 # 是否在避车路径/正常循线路径切换时清空转向控制器历史。
 # Stanley/Control-C 本身依赖 EMA 历史抑制跳变，默认关闭，避免弯道切换时第一帧过冲。
@@ -1599,7 +1593,7 @@ SEG_DEBUG_CONTROL_BAND_THICKNESS = 2
 # 这些信息主要用于现场快速确认：
 # - Seg / YOLO FPS
 # - 当前 steer_signal 与估算舵机 PWM
-# - 石头分支判断的调试文本
+# - 分叉/汇合状态
 # 调试文字字号。
 SEG_DEBUG_TEXT_FONT_SCALE = 0.8
 # 调试文字线宽。
@@ -1608,15 +1602,15 @@ SEG_DEBUG_TEXT_THICKNESS = 1
 SEG_DEBUG_TEXT_POS_FPS = (5, 18)
 # steer_signal / PWM 文本位置。
 SEG_DEBUG_TEXT_POS_CTRL = (5, 36)
-# 石头分支判断文本位置。
-SEG_DEBUG_TEXT_POS_STONE = (5, 54)
 # 分叉/汇合调试文本位置。
-SEG_DEBUG_TEXT_POS_BRANCH = (5, 72)
+SEG_DEBUG_TEXT_POS_BRANCH = (5, 54)
+# 兼容旧版调试绘制函数；当前主流程不再绘制 stone 状态。
+SEG_DEBUG_TEXT_POS_STONE = SEG_DEBUG_TEXT_POS_BRANCH
 # FPS 文本颜色。
 SEG_DEBUG_TEXT_COLOR_FPS = (0, 255, 0)
 # 控制量文本颜色。
 SEG_DEBUG_TEXT_COLOR_CTRL = (0, 255, 255)
-# 石头文本颜色。
-SEG_DEBUG_TEXT_COLOR_STONE = (0, 200, 255)
 # 分叉/汇合文本颜色。
 SEG_DEBUG_TEXT_COLOR_BRANCH = (255, 200, 0)
+# 兼容旧版调试绘制函数；当前主流程不再绘制 stone 状态。
+SEG_DEBUG_TEXT_COLOR_STONE = SEG_DEBUG_TEXT_COLOR_BRANCH

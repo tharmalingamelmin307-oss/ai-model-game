@@ -336,7 +336,7 @@ class SegDebugOverlay:
             "merge_guide": None,
             "fork_point": None,
             "control_band": None,
-            "bottom_mid": (0.0, 0.0),
+            "bottom_mid": None,
             "base_size": tuple(base_size),
         }
 
@@ -354,8 +354,6 @@ class SegDebugOverlay:
         control_band=None,
         bottom_mid=None,
     ):
-        if bottom_mid is None:
-            bottom_mid = (float(img_w) / 2.0, float(img_h) - 1.0)
         self.overlay = {
             "path": None if path_pts is None else np.array(path_pts, dtype=np.float32).copy(),
             "left": None if left_pts is None else np.array(left_pts, dtype=np.float32).copy(),
@@ -365,7 +363,7 @@ class SegDebugOverlay:
             "merge_guide": None if merge_guide_pts is None else np.array(merge_guide_pts, dtype=np.float32).copy(),
             "fork_point": None if fork_point is None else (float(fork_point[0]), float(fork_point[1])),
             "control_band": control_band,
-            "bottom_mid": (float(bottom_mid[0]), float(bottom_mid[1])),
+            "bottom_mid": None if bottom_mid is None else (float(bottom_mid[0]), float(bottom_mid[1])),
             "base_size": (int(img_w), int(img_h)),
         }
 
@@ -437,9 +435,9 @@ class SegDebugOverlay:
             except Exception:
                 pass
 
-        bottom_mid = overlay.get("bottom_mid", (float(base_w) / 2.0, float(base_h) - 1.0))
+        bottom_mid = overlay.get("bottom_mid")
         fork_point = overlay.get("fork_point")
-        if fork_point is not None:
+        if fork_point is not None and bottom_mid is not None:
             fork_pt = _scale_point(fork_point)
             fork_bottom_pt = _scale_point(bottom_mid)
             cv2.line(
@@ -450,11 +448,12 @@ class SegDebugOverlay:
                 max(1, int(round(config.SEG_DEBUG_FORK_DIVIDER_THICKNESS * scale))),
                 cv2.LINE_AA,
             )
-        cv2.circle(image, _scale_point(bottom_mid), bottom_mid_radius, config.SEG_DEBUG_BOTTOM_MID_COLOR, -1)
+        if bottom_mid is not None:
+            cv2.circle(image, _scale_point(bottom_mid), bottom_mid_radius, config.SEG_DEBUG_BOTTOM_MID_COLOR, -1)
         return image
 
 
-def draw_seg_status_text(ai_view, fps_stats, steer_signal, servo_pwm, branch_stats, stone_branch_side=None):
+def draw_seg_status_text(ai_view, fps_stats, steer_signal, servo_pwm, branch_stats):
     """绘制 Seg 调试文字."""
     cv2.putText(
         ai_view,
@@ -472,22 +471,6 @@ def draw_seg_status_text(ai_view, fps_stats, steer_signal, servo_pwm, branch_sta
         1,
         config.SEG_DEBUG_TEXT_FONT_SCALE,
         config.SEG_DEBUG_TEXT_COLOR_CTRL,
-        config.SEG_DEBUG_TEXT_THICKNESS,
-    )
-    stone_side_text = "UNK"
-    if stone_branch_side == -1:
-        stone_side_text = "LEFT"
-    elif stone_branch_side == 1:
-        stone_side_text = "RIGHT"
-    elif stone_branch_side is not None:
-        stone_side_text = "NONE"
-    cv2.putText(
-        ai_view,
-        f"Stone:{stone_side_text}",
-        config.SEG_DEBUG_TEXT_POS_STONE,
-        1,
-        config.SEG_DEBUG_TEXT_FONT_SCALE,
-        config.SEG_DEBUG_TEXT_COLOR_STONE,
         config.SEG_DEBUG_TEXT_THICKNESS,
     )
     cv2.putText(

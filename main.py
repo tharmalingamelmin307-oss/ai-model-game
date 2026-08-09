@@ -763,6 +763,29 @@ def fixed_route_visible_sign(current_yolo_boxes):
     return False, None
 
 
+def current_frame_has_visible_sign(current_yolo_boxes):
+    """当前帧是否真的看见了可用 sign 框."""
+    for obj in current_yolo_boxes or []:
+        cls_id = obj.get("class_id", -1)
+        cls_name = str(obj.get("class_name", ""))
+        if cls_id != config.SIGN_CLASS_ID and cls_name != "sign":
+            continue
+        rect = obj.get("rect", [0, 0, 0, 0])
+        if len(rect) != 4:
+            continue
+        _x, _y, w, h = rect
+        if float(w) >= 2.0 and float(h) >= 2.0:
+            return True
+    return False
+
+
+def sign_route_pending_centerline_active(route_state, current_yolo_boxes):
+    """只有当前还看见路牌时，未决任务才临时走分叉中心线."""
+    if str(route_state) not in ("SIGN_STOP_COLLECT", "WAIT_API"):
+        return False
+    return current_frame_has_visible_sign(current_yolo_boxes)
+
+
 def fixed_route_requires_sign():
     """fixed_sequence 是否只在路牌岔路口推进序列."""
     return bool(getattr(config, "SIGN_ROUTE_FIXED_REQUIRE_SIGN", True))
@@ -1886,6 +1909,9 @@ def seg_worker(core_id, worker_id=0):
             global_control_data["car_avoidance_miss_frames"] = int(car_stats.get("car_miss_frames", 0))
             global_control_data["car_avoidance_clear_frames"] = int(car_stats.get("car_clear_frames", 0))
             global_control_data["car_avoidance_state_paused"] = bool(car_stats.get("car_state_paused", False))
+            global_control_data["car_avoidance_boundary_side"] = str(car_stats.get("car_boundary_side", ""))
+            global_control_data["car_avoidance_boundary_x"] = car_stats.get("car_boundary_x")
+            global_control_data["car_avoidance_boundary_error"] = car_stats.get("car_boundary_error")
             global_control_data["car_avoidance_left_boundary_error"] = car_stats.get("car_left_boundary_error")
             global_control_data["car_avoidance_left_boundary_x"] = car_stats.get("car_left_boundary_x")
             global_control_data["car_avoidance_control_path_error"] = car_stats.get("car_control_path_error")
@@ -2034,6 +2060,7 @@ def seg_worker(core_id, worker_id=0):
                 break
             blob_rgb_320, preview_frame = unpack_seg_item(seg_item)
 
+            drain_sign_llm_results()
             with data_lock:
                 current_yolo_boxes = [obj.copy() for obj in global_yolo_boxes]
                 current_yolo_frame_id = int(global_yolo_frame_id)
@@ -2042,7 +2069,7 @@ def seg_worker(core_id, worker_id=0):
                 if sign_route_choice not in (-1, 1):
                     sign_route_choice = pending_fixed_route_choice(global_control_data, current_yolo_boxes)
                 route_state = str(global_control_data.get("sign_route_state", "IDLE"))
-                sign_route_pending = route_state in ("SIGN_STOP_COLLECT", "WAIT_API")
+                sign_route_pending = sign_route_pending_centerline_active(route_state, current_yolo_boxes)
                 external_boundary_inset_x = 0.0
                 external_boundary_side = "left"
                 debug_keyboard_state = get_debug_drive_keyboard_state()
@@ -2110,6 +2137,7 @@ def seg_worker(core_id, worker_id=0):
             ) = item
 
             if bool(getattr(config, "SEG_POSTPROCESS_REFRESH_YOLO", True)):
+                drain_sign_llm_results()
                 with data_lock:
                     latest_yolo_frame_id = int(global_yolo_frame_id)
                     if latest_yolo_frame_id >= int(current_yolo_frame_id):
@@ -2120,7 +2148,7 @@ def seg_worker(core_id, worker_id=0):
                     if sign_route_choice not in (-1, 1):
                         sign_route_choice = pending_fixed_route_choice(global_control_data, current_yolo_boxes)
                     route_state = str(global_control_data.get("sign_route_state", "IDLE"))
-                    sign_route_pending = route_state in ("SIGN_STOP_COLLECT", "WAIT_API")
+                    sign_route_pending = sign_route_pending_centerline_active(route_state, current_yolo_boxes)
                     debug_keyboard_state = get_debug_drive_keyboard_state()
                     drive_stop_active = (
                         bool(debug_keyboard_state.get("manual_stop_active", False)) or
@@ -2187,6 +2215,7 @@ def seg_worker(core_id, worker_id=0):
 
         total_start = time.perf_counter()
         t_lock_start = time.perf_counter()
+        drain_sign_llm_results()
         with data_lock:
             current_yolo_boxes = [obj.copy() for obj in global_yolo_boxes]
             current_yolo_frame_id = int(global_yolo_frame_id)
@@ -2195,7 +2224,7 @@ def seg_worker(core_id, worker_id=0):
             if sign_route_choice not in (-1, 1):
                 sign_route_choice = pending_fixed_route_choice(global_control_data, current_yolo_boxes)
             route_state = str(global_control_data.get("sign_route_state", "IDLE"))
-            sign_route_pending = route_state in ("SIGN_STOP_COLLECT", "WAIT_API")
+            sign_route_pending = sign_route_pending_centerline_active(route_state, current_yolo_boxes)
             external_boundary_inset_x = 0.0
             external_boundary_side = "left"
             debug_keyboard_state = get_debug_drive_keyboard_state()
@@ -2292,6 +2321,9 @@ def serial_control_thread():
             car_avoidance_miss_frames = int(global_control_data.get("car_avoidance_miss_frames", 0))
             car_avoidance_clear_frames = int(global_control_data.get("car_avoidance_clear_frames", 0))
             car_avoidance_state_paused = bool(global_control_data.get("car_avoidance_state_paused", False))
+            car_avoidance_boundary_side = str(global_control_data.get("car_avoidance_boundary_side", ""))
+            car_avoidance_boundary_x = global_control_data.get("car_avoidance_boundary_x")
+            car_avoidance_boundary_error = global_control_data.get("car_avoidance_boundary_error")
             car_avoidance_left_boundary_error = global_control_data.get("car_avoidance_left_boundary_error")
             car_avoidance_left_boundary_x = global_control_data.get("car_avoidance_left_boundary_x")
             car_avoidance_control_path_error = global_control_data.get("car_avoidance_control_path_error")
@@ -2447,6 +2479,9 @@ def serial_control_thread():
             car_avoidance_miss_frames = 0
             car_avoidance_clear_frames = 0
             car_avoidance_state_paused = False
+            car_avoidance_boundary_side = ""
+            car_avoidance_boundary_x = None
+            car_avoidance_boundary_error = None
             car_avoidance_left_boundary_error = None
             car_avoidance_left_boundary_x = None
             car_avoidance_control_path_error = None
@@ -2510,8 +2545,9 @@ def serial_control_thread():
         car_pause_text = "1" if car_avoidance_state_paused else "0"
         car_locked_text = "1" if car_avoidance_locked_confirmed else "0"
         car_path_text = "1" if car_avoidance_boundary_path_active else "0"
-        car_left_x_text = "无" if car_avoidance_left_boundary_x is None else f"{float(car_avoidance_left_boundary_x):.1f}"
-        car_left_error_text = "无" if car_avoidance_left_boundary_error is None else f"{float(car_avoidance_left_boundary_error):.1f}"
+        car_side_text = str(car_avoidance_boundary_side or "").upper() or "无"
+        car_boundary_x_text = "无" if car_avoidance_boundary_x is None else f"{float(car_avoidance_boundary_x):.1f}"
+        car_boundary_error_text = "无" if car_avoidance_boundary_error is None else f"{float(car_avoidance_boundary_error):.1f}"
         car_control_error_text = "无" if car_avoidance_control_path_error is None else f"{float(car_avoidance_control_path_error):.1f}"
         car_boundary_inset_text = f"{float(car_avoidance_boundary_inset_x):.1f}"
         car_kp_text = "无" if car_avoidance_control_kp is None else f"{float(car_avoidance_control_kp):.2f}"
@@ -2526,7 +2562,8 @@ def serial_control_thread():
                 f"det={int(car_avoidance_detected_cars)} locked={car_locked_text} hits={int(car_avoidance_locked_hit_frames)} "
                 f"miss={car_miss_text} clear={car_clear_text} pause={car_pause_text} path={car_path_text} "
                 f"inset={car_boundary_inset_text} weight={float(car_avoidance_avoid_weight):.2f} "
-                f"left_x={car_left_x_text} left_e={car_left_error_text} ctrl_e={car_control_error_text} "
+                f"side={car_side_text} boundary_x={car_boundary_x_text} boundary_e={car_boundary_error_text} "
+                f"ctrl_e={car_control_error_text} "
                 f"B=({car_kp_text},{car_kd_text},{car_psi_text}) v={car_v_text}",
                 state=(
                     car_avoidance_cycle_id,
@@ -2542,8 +2579,9 @@ def serial_control_thread():
                     car_path_text,
                     car_boundary_inset_text,
                     int(float(car_avoidance_avoid_weight) * 100),
-                    car_left_x_text,
-                    car_left_error_text,
+                    car_side_text,
+                    car_boundary_x_text,
+                    car_boundary_error_text,
                     car_control_error_text,
                     car_kp_text,
                     car_kd_text,
