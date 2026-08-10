@@ -154,7 +154,9 @@ def print_runtime_config_summary():
         f"SIGN_ROUTE_SKIP_FIRST_PASS={getattr(config, 'SIGN_ROUTE_SKIP_FIRST_PASS', None)} "
         f"SIGN_ROUTE_FIXED_FIRST_CHOICE={getattr(config, 'SIGN_ROUTE_FIXED_FIRST_CHOICE', None)} "
         f"SIGN_LLM_FORK_POINT_TRIGGER_ROWS={getattr(config, 'SIGN_LLM_FORK_POINT_TRIGGER_ROWS', None)} "
-        f"CAR_AVOIDANCE_START_BOUNDARY_ROWS={getattr(config, 'CAR_AVOIDANCE_START_BOUNDARY_ROWS', None)} "
+        f"CAR_AVOIDANCE_SWITCH_MIN_BOTTOM_Y={getattr(config, 'CAR_AVOIDANCE_SWITCH_MIN_BOTTOM_Y', None)} "
+        f"CAR_AVOIDANCE_SIDE_MIN_ROAD_WIDTH={getattr(config, 'CAR_AVOIDANCE_SIDE_MIN_ROAD_WIDTH', None)} "
+        f"CAR_AVOIDANCE_SIDE_ROAD_CENTER_Y={getattr(config, 'CAR_AVOIDANCE_SIDE_ROAD_CENTER_Y', None)} "
         f"CAR_AVOIDANCE_NEAR_BOUNDARY_ROWS={getattr(config, 'CAR_AVOIDANCE_NEAR_BOUNDARY_ROWS', None)}",
         flush=True,
     )
@@ -1054,7 +1056,7 @@ def enqueue_sign_llm_job(frame_id, samples):
 
 
 def maybe_submit_sign_llm_job(state, frame_id, force=False):
-    """收够停车 OCR 样本后，把样本发给 LLM 进程."""
+    """收够停车 OCR 样本或超时后，把已有有效样本发给 LLM 进程."""
     if (
         state.get("sign_llm_waiting_result", False) or
         state.get("sign_route_api_submitted", False) or
@@ -1065,29 +1067,33 @@ def maybe_submit_sign_llm_job(state, frame_id, force=False):
     attempts = int(state.get("sign_llm_attempts", len(samples)))
     valid_samples = [sample for sample in samples if str(sample.get("text", "")).strip()]
     sample_need = max(1, int(getattr(config, "SIGN_LLM_OCR_SAMPLES", 10)))
-    min_valid = max(1, int(getattr(config, "SIGN_LLM_MIN_VALID_SAMPLES", 3)))
+    min_valid = 1
     enough_full = len(valid_samples) >= sample_need
     enough_min = (attempts >= sample_need or force) and len(valid_samples) >= min_valid
     ready = enough_full or enough_min
     if not ready:
         if attempts >= sample_need or force:
-            if attempts >= sample_need:
-                state["sign_llm_error"] = (
-                    f"not_enough_valid_samples:{len(valid_samples)}/{min_valid}"
-                )
-                throttled_log(
-                    "sign_llm_collect_failed",
-                    f"语义路牌OCR采样结束但有效样本不足，释放状态机: valid={len(valid_samples)} min={min_valid} attempts={attempts}",
-                    state=(len(valid_samples), attempts),
-                    min_interval=0.0,
-                )
-                clear_sign_llm_state(state, keep_completed=False)
-                state["sign_route_pass_index"] = 3
-                reset_sign_route_state(state, next_state="WAIT_SIGN_GONE")
-                return False
+            reason = (
+                f"collect_timeout_not_enough_valid_samples:{len(valid_samples)}/{min_valid}"
+                if force else
+                f"not_enough_valid_samples:{len(valid_samples)}/{min_valid}"
+            )
+            throttled_log(
+                "sign_llm_collect_failed",
+                f"语义路牌OCR采样结束但没有有效样本，释放状态机: "
+                f"valid={len(valid_samples)} attempts={attempts} force={int(force)}",
+                state=(len(valid_samples), attempts, int(force)),
+                min_interval=0.0,
+            )
+            clear_sign_llm_state(state, keep_completed=False)
+            state["sign_llm_error"] = reason
+            state["sign_route_pass_index"] = 3
+            reset_sign_route_state(state, next_state="WAIT_SIGN_GONE")
+            return False
+        else:
             throttled_log(
                 "sign_llm_not_enough_valid",
-                f"语义路牌OCR有效样本不足，继续采集: valid={len(valid_samples)} min={min_valid} need={sample_need} attempts={attempts}",
+                f"语义路牌OCR继续采集: valid={len(valid_samples)} need={sample_need} attempts={attempts}",
                 state=(len(valid_samples), attempts),
                 min_interval=0.5,
             )
@@ -1989,8 +1995,12 @@ def seg_worker(core_id, worker_id=0):
                 crop_y = float(target_h) * crop_ratio
                 crop_h = max(1.0, float(target_h) - crop_y)
                 seg_h = float(config.SEG_SIZE[1])
-                start_rows = max(0.0, float(getattr(config, "CAR_AVOIDANCE_START_BOUNDARY_ROWS", 0.0)))
-                line_seg_y = float(np.clip((seg_h - 1.0) - start_rows, 0.0, seg_h - 1.0))
+                switch_rows = max(0.0, float(getattr(
+                    config,
+                    "CAR_AVOIDANCE_SWITCH_MIN_BOTTOM_Y",
+                    seg_h - 1.0,
+                )))
+                line_seg_y = float(np.clip((seg_h - 1.0) - switch_rows, 0.0, seg_h - 1.0))
                 line_target_y = crop_y + (line_seg_y / seg_h) * crop_h
                 line_y = int(round(line_target_y * rendered_img.shape[0] / float(target_h)))
                 line_y = max(0, min(rendered_img.shape[0] - 1, line_y))
@@ -2368,9 +2378,13 @@ def serial_control_thread():
                     collect_timeout = float(getattr(config, "SIGN_LLM_COLLECT_TIMEOUT", 3.0))
                     force_submit = (
                         started_at is not None and
+                        collect_timeout > 0.0 and
                         time.monotonic() - float(started_at) >= collect_timeout
                     )
-                    if maybe_submit_sign_llm_job(global_control_data, sign_llm_frame_id, force=force_submit):
+                    submitted = maybe_submit_sign_llm_job(global_control_data, sign_llm_frame_id, force=force_submit)
+                    sign_llm_collecting = bool(global_control_data.get("sign_llm_collecting", False))
+                    sign_llm_stop_active = bool(global_control_data.get("sign_llm_stop_active", False))
+                    if submitted:
                         sign_llm_collecting = False
                         sign_llm_stop_active = True
                         throttled_log(

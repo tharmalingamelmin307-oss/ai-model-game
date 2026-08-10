@@ -2249,36 +2249,106 @@ class RoadSegmentor:
             return None
         return float(xs[0])
 
+    def _car_road_width_at_y(self, left_boundary, right_boundary, y):
+        """返回车底边所在 y 的左右边界和路宽。"""
+        left_x = self._boundary_x_at_y(left_boundary, float(y)) if left_boundary is not None else None
+        right_x = self._boundary_x_at_y(right_boundary, float(y)) if right_boundary is not None else None
+        if left_x is None or right_x is None:
+            return left_x, right_x, None
+        return left_x, right_x, max(0.0, float(right_x) - float(left_x))
+
     def _select_car_avoidance_boundary_side(self, locked_car, left_boundary, right_boundary):
-        """根据车辆更靠近哪条边界，选择更空的一侧做避车参考线.
+        """根据车框底边几何选择更空的一侧做避车参考线.
 
         返回:
         - avoid_side: "left" / "right"
         - boundary_x: 当前选中边界在车所在 y 的 x 值
         - boundary_error: boundary_x - 画面中线
         - nearest_side: 车辆更接近的边界侧；None 表示无法判断
+        - side_source: 本次选边主要依据
+        - confidence: 0.0-1.0 的选边可信度
         """
         if locked_car is None:
-            return "left", None, None, None
+            return "left", None, None, None, "none", 0.0
 
         _smooth_cx, smooth_cy = locked_car.get("bottom_center", (0.0, 0.0))
+        measurement = locked_car.get("measurement", {}) or {}
         car_x = float(_smooth_cx)
-        left_x = self._boundary_x_at_y(left_boundary, float(smooth_cy)) if left_boundary is not None else None
-        right_x = self._boundary_x_at_y(right_boundary, float(smooth_cy)) if right_boundary is not None else None
+        left_x, right_x, road_width = self._car_road_width_at_y(left_boundary, right_boundary, float(smooth_cy))
         target_x = float(config.SEG_SIZE[0]) * 0.5
+        road_center_y = float(getattr(config, "CAR_AVOIDANCE_SIDE_ROAD_CENTER_Y", 150.0))
+        road_center_margin = max(1.0, float(getattr(config, "CAR_AVOIDANCE_SIDE_ROAD_CENTER_MARGIN_X", 12.0)))
+        boundary_min_diff = max(0.0, float(getattr(config, "CAR_AVOIDANCE_SIDE_BOUNDARY_MIN_DIFF_X", 8.0)))
+
+        bottom_left = measurement.get("bottom_left", (measurement.get("x_min", car_x), smooth_cy))
+        bottom_right = measurement.get("bottom_right", (measurement.get("x_max", car_x), smooth_cy))
+        left_bottom_x = float(bottom_left[0])
+        right_bottom_x = float(bottom_right[0])
+
+        road_center_side = None
+        road_center_confidence = 0.0
+        center_left_x, center_right_x, _center_width = self._car_road_width_at_y(
+            left_boundary,
+            right_boundary,
+            road_center_y,
+        )
+        if center_left_x is not None and center_right_x is not None:
+            road_center_x = (float(center_left_x) + float(center_right_x)) * 0.5
+            road_center_offset = car_x - road_center_x
+            road_center_confidence = min(1.0, abs(road_center_offset) / max(road_center_margin * 2.0, 1.0))
+            if road_center_offset <= -road_center_margin:
+                road_center_side = "left"
+            elif road_center_offset >= road_center_margin:
+                road_center_side = "right"
+
+        def _avoid_from_nearest(nearest):
+            return "right" if nearest == "left" else "left"
+
+        def _selected_boundary(avoid_side):
+            selected_x = right_x if avoid_side == "right" else left_x
+            if selected_x is None:
+                return None, None
+            return float(selected_x), float(selected_x) - target_x
 
         if left_x is not None and right_x is not None:
-            left_dist = abs(car_x - float(left_x))
-            right_dist = abs(float(right_x) - car_x)
-            if left_dist <= right_dist:
-                return "right", float(right_x), float(right_x) - target_x, "left"
-            return "left", float(left_x), float(left_x) - target_x, "right"
+            left_clearance = left_bottom_x - float(left_x)
+            right_clearance = float(right_x) - right_bottom_x
+            boundary_nearest = "left" if left_clearance <= right_clearance else "right"
+            boundary_diff = abs(left_clearance - right_clearance)
+            width_scale = max(float(road_width or 0.0), 1.0)
+            boundary_confidence = min(1.0, boundary_diff / width_scale)
+            nearest_side = boundary_nearest
+            side_source = "corner_boundary"
+            confidence = boundary_confidence
+
+            if road_center_side is not None:
+                if road_center_side == boundary_nearest:
+                    side_source = "corner_boundary+road_center"
+                    confidence = max(boundary_confidence, road_center_confidence)
+                elif boundary_diff < boundary_min_diff and road_center_confidence > boundary_confidence:
+                    nearest_side = road_center_side
+                    side_source = "road_center"
+                    confidence = road_center_confidence
+
+            avoid_side = _avoid_from_nearest(nearest_side)
+            boundary_x, boundary_error = _selected_boundary(avoid_side)
+            return avoid_side, boundary_x, boundary_error, nearest_side, side_source, confidence
 
         if left_x is not None:
-            return "left", float(left_x), float(left_x) - target_x, "left"
+            nearest_side = road_center_side or "left"
+            avoid_side = _avoid_from_nearest(nearest_side)
+            if avoid_side == "right":
+                avoid_side = "left"
+            return avoid_side, float(left_x), float(left_x) - target_x, nearest_side, "single_boundary", road_center_confidence
         if right_x is not None:
-            return "right", float(right_x), float(right_x) - target_x, "right"
-        return "left", None, None, None
+            nearest_side = road_center_side or "right"
+            avoid_side = _avoid_from_nearest(nearest_side)
+            if avoid_side == "left":
+                avoid_side = "right"
+            return avoid_side, float(right_x), float(right_x) - target_x, nearest_side, "single_boundary", road_center_confidence
+        if road_center_side is not None:
+            return _avoid_from_nearest(road_center_side), None, None, road_center_side, "road_center", road_center_confidence
+        return "left", None, None, None, "none", 0.0
 
     def _car_measurement_from_item(self, item, w_seg, h_seg, base):
         """从 car 检测框提取用于跟踪和避障的稳定几何量."""
@@ -2305,6 +2375,9 @@ class RoadSegmentor:
         y_sorted = np.argsort(box[:, 1])
         bottom_pts = box[y_sorted[-2:]]
         top_pts = box[y_sorted[:2]]
+        bottom_x_sorted = bottom_pts[np.argsort(bottom_pts[:, 0])]
+        bottom_left_pt = bottom_x_sorted[0]
+        bottom_right_pt = bottom_x_sorted[-1]
         raw_bottom_y = float(np.max(bottom_pts[:, 1]))
         raw_top_y = float(np.min(top_pts[:, 1]))
         bottom_center_x = float(np.mean(bottom_pts[:, 0]))
@@ -2323,13 +2396,15 @@ class RoadSegmentor:
             "y_max": y_max,
             "bottom_pts": bottom_pts,
             "top_pts": top_pts,
+            "bottom_left": (float(bottom_left_pt[0]), float(bottom_left_pt[1])),
+            "bottom_right": (float(bottom_right_pt[0]), float(bottom_right_pt[1])),
             "bottom_center": (bottom_center_x, bottom_center_y),
             "raw_bottom_y": raw_bottom_y,
             "raw_top_y": raw_top_y,
         }
 
-    def _update_locked_car(self, measurements, base):
-        """按底部中心点连续性锁定同一辆车，允许短暂遮挡/漏检."""
+    def _update_locked_car(self, measurements, base, hold_misses=True):
+        """按底部中心点连续性锁定同一辆车，按阶段决定是否允许漏检续命."""
         max_miss = max(0, int(getattr(config, "CAR_AVOIDANCE_MISS_FRAMES", 0)))
         near_max_miss = max(0, int(getattr(config, "CAR_AVOIDANCE_NEAR_MISS_FRAMES", max_miss)))
         near_rows = max(0.0, float(getattr(config, "CAR_AVOIDANCE_NEAR_BOUNDARY_ROWS", 60.0)))
@@ -2398,6 +2473,11 @@ class RoadSegmentor:
                     return None
                 return self.locked_car
 
+            if not bool(hold_misses):
+                self.locked_car = None
+                self.locked_car_miss_frames = 0
+                return None
+
             if near_committed and measurements and bool(self.locked_car.get("confirmed", False)):
                 path_y_min = float(np.min(base[:, 1]))
                 path_y_max = float(np.max(base[:, 1]))
@@ -2435,12 +2515,14 @@ class RoadSegmentor:
         if not measurements:
             return None
 
-        # 新目标优先选靠近车身底部、且离基础路径更近的 car。
+        # 新目标只锁最明显、最近的 car，避免多个远处小框抢占避障状态。
         def _new_target_key(m):
-            cx, cy = m["bottom_center"]
-            path_x = self._path_x_at_y_points(base, cy)
-            lateral = abs(float(cx) - float(path_x)) if path_x is not None else 0.0
-            return (float(cy), -lateral, float(m.get("score", 0.0)))
+            _cx, cy = m["bottom_center"]
+            return (
+                float(m.get("area", 0.0)),
+                float(cy),
+                float(m.get("score", 0.0)),
+            )
 
         best = max(measurements, key=_new_target_key)
         self.locked_car = {
@@ -2456,13 +2538,13 @@ class RoadSegmentor:
             return None
         return self.locked_car
 
-    def _car_avoidance_boundary_inset(self, locked_car, base):
-        """基于锁定目标决定左边界内收量."""
+    def _car_avoidance_boundary_inset(self, locked_car, base, left_boundary=None, right_boundary=None):
+        """基于锁定目标决定是否可以切到避车边界。"""
         if locked_car is None:
-            return 0.0, None, False
+            return 0.0, None, False, "no_lock", None
         measurement = locked_car.get("measurement")
         if measurement is None:
-            return 0.0, None, False
+            return 0.0, None, False, "no_measurement", None
 
         path_y_min = float(np.min(base[:, 1]))
         path_y_max = float(np.max(base[:, 1]))
@@ -2470,12 +2552,19 @@ class RoadSegmentor:
         center_y = float(np.clip(smooth_cy, path_y_min, path_y_max))
         path_bottom_y = float(np.max(base[:, 1]))
         rows_to_car = max(0.0, path_bottom_y - center_y)
-        start_rows = max(0.0, float(getattr(config, "CAR_AVOIDANCE_START_BOUNDARY_ROWS", 115.0)))
-        if rows_to_car > start_rows:
-            return 0.0, (center_y, path_bottom_y), False
+        switch_rows = max(0.0, float(getattr(config, "CAR_AVOIDANCE_SWITCH_MIN_BOTTOM_Y", 160.0)))
+        if rows_to_car > switch_rows:
+            return 0.0, (center_y, path_bottom_y), False, "switch_rows_limit", None
+
+        _left_x, _right_x, road_width = self._car_road_width_at_y(left_boundary, right_boundary, center_y)
+        min_road_width = max(0.0, float(getattr(config, "CAR_AVOIDANCE_SIDE_MIN_ROAD_WIDTH", 0.0)))
+        if road_width is None:
+            return 0.0, (center_y, path_bottom_y), False, "road_missing", None
+        if road_width < min_road_width:
+            return 0.0, (center_y, path_bottom_y), False, "road_too_narrow", road_width
 
         # 进入避障窗口后，把选定侧边界本身当作控制中线。
-        return 0.0, (center_y, path_bottom_y), True
+        return 0.0, (center_y, path_bottom_y), True, "ready", road_width
 
     def _update_car_avoidance_boundary_path(
         self,
@@ -2498,6 +2587,9 @@ class RoadSegmentor:
             "boundary_x": None,
             "boundary_error": None,
             "nearest_boundary_side": None,
+            "road_width": None,
+            "side_source": "",
+            "side_confidence": 0.0,
             "avoid_weight": 0.0,
             "rows_to_bottom": None,
             "left_boundary_error": None,
@@ -2660,40 +2752,28 @@ class RoadSegmentor:
                 measurements.append(measurement)
         debug["detected_cars"] = int(len(measurements))
 
-        if self.locked_car is None and self.car_avoidance_state == "FOLLOW_LANE":
-            start_rows = max(0.0, float(getattr(config, "CAR_AVOIDANCE_START_BOUNDARY_ROWS", 115.0)))
-            path_bottom_y = float(np.max(base[:, 1]))
-            near_measurements = []
-            far_measurements = []
-            for measurement in measurements:
-                _cx, cy = measurement["bottom_center"]
-                rows_to_car = max(0.0, path_bottom_y - float(cy))
-                if rows_to_car <= start_rows:
-                    near_measurements.append(measurement)
-                else:
-                    far_measurements.append((rows_to_car, measurement))
-            if far_measurements and not near_measurements:
-                debug["state"] = self.car_avoidance_state
-                debug["event"] = "distance_limit"
-                nearest_rows = min(rows for rows, _measurement in far_measurements)
-                now = time.monotonic()
-                interval = max(0.2, float(getattr(config, "LOG_INTERVAL_CAR_AVOIDANCE_PROCESS", 0.25)))
-                if (
-                    self.last_car_avoid_log_state != "car_avoidance_distance_limit" or
-                    now - float(self.last_car_avoid_log_at) >= interval
-                ):
-                    self.last_car_avoid_log_state = "car_avoidance_distance_limit"
-                    self.last_car_avoid_log_at = now
-                    print(
-                        f"避车距离未到: rows={nearest_rows:.1f}>{start_rows:.1f}，暂不触发 det={len(measurements)}",
-                        flush=True,
-                    )
-                return 0.0, debug, None
-            measurements = near_measurements
-
-        locked_car = self._update_locked_car(measurements, base)
+        had_locked_before_update = self.locked_car is not None
+        hold_misses = self.car_avoidance_state == "AVOIDING"
+        locked_car = self._update_locked_car(measurements, base, hold_misses=hold_misses)
         if locked_car is None:
-            if self.car_avoidance_state == "AVOIDING" and self.car_last_avoid_path is not None:
+            if had_locked_before_update and self.car_avoidance_state != "AVOIDING":
+                self.car_avoidance_state = "FOLLOW_LANE"
+                self.car_clearing_frames = 0
+                self.car_last_avoid_path = None
+                self.car_last_avoid_path_is_boundary = False
+                self.car_last_boundary_inset_x = 0.0
+                self.car_avoidance_boundary_side = None
+                debug["state"] = self.car_avoidance_state
+                debug["active"] = False
+                debug["clear_frames"] = 0
+                debug["miss_frames"] = 0
+                debug["boundary_path_active"] = False
+                debug["boundary_ready"] = False
+                debug["avoid_weight"] = 0.0
+                debug["boundary_side"] = ""
+                debug["event"] = "pre_switch_lost_done"
+                self._log_car_avoidance_process(debug, "pre_switch_lost_done", force=True)
+            elif self.car_avoidance_state == "AVOIDING" and self.car_last_avoid_path is not None:
                 self.car_avoidance_state = "CLEARING"
                 self.car_clearing_frames = 0
                 debug["state"] = self.car_avoidance_state
@@ -2723,25 +2803,15 @@ class RoadSegmentor:
         debug["locked_hit_frames"] = int(locked_car.get("hit_frames", 0))
         debug["locked_center"] = (float(_smooth_cx), float(smooth_cy))
 
-        resolved_side, boundary_x, boundary_error, nearest_side = self._select_car_avoidance_boundary_side(
+        inset, y_range, boundary_ready, not_ready_event, road_width = self._car_avoidance_boundary_inset(
             locked_car,
+            base,
             left_boundary,
             right_boundary,
         )
-        if prev_state != "AVOIDING" or self.car_avoidance_boundary_side not in ("left", "right"):
-            self.car_avoidance_boundary_side = resolved_side
-        selected_side = self.car_avoidance_boundary_side if self.car_avoidance_boundary_side in ("left", "right") else resolved_side
-        if selected_side != resolved_side:
-            boundary_x = right_boundary_x if selected_side == "right" else left_boundary_x
-            boundary_error = None if boundary_x is None else float(boundary_x) - target_x
-        debug["boundary_side"] = selected_side
-        debug["boundary_x"] = None if boundary_x is None else float(boundary_x)
-        debug["boundary_error"] = None if boundary_error is None else float(boundary_error)
-        debug["nearest_boundary_side"] = nearest_side
-
-        inset, y_range, boundary_ready = self._car_avoidance_boundary_inset(locked_car, base)
         debug["boundary_ready"] = bool(boundary_ready)
         debug["boundary_inset_x"] = float(inset)
+        debug["road_width"] = None if road_width is None else float(road_width)
 
         if not boundary_ready:
             if self.car_avoidance_state == "AVOIDING":
@@ -2753,9 +2823,27 @@ class RoadSegmentor:
                 self.car_avoidance_boundary_side = None
             debug["state"] = self.car_avoidance_state
             debug["clear_frames"] = int(self.car_clearing_frames)
-            debug["event"] = "locked_not_ready"
-            self._log_car_avoidance_process(debug, "locked_not_ready", force=prev_state == "AVOIDING")
+            debug["event"] = not_ready_event or "locked_not_ready"
+            self._log_car_avoidance_process(debug, debug["event"], force=prev_state == "AVOIDING")
             return 0.0, debug, None
+
+        resolved_side, boundary_x, boundary_error, nearest_side, side_source, side_confidence = self._select_car_avoidance_boundary_side(
+            locked_car,
+            left_boundary,
+            right_boundary,
+        )
+        if self.car_avoidance_boundary_side not in ("left", "right"):
+            self.car_avoidance_boundary_side = resolved_side
+        selected_side = self.car_avoidance_boundary_side if self.car_avoidance_boundary_side in ("left", "right") else resolved_side
+        if selected_side != resolved_side:
+            boundary_x = right_boundary_x if selected_side == "right" else left_boundary_x
+            boundary_error = None if boundary_x is None else float(boundary_x) - target_x
+        debug["boundary_side"] = selected_side
+        debug["boundary_x"] = None if boundary_x is None else float(boundary_x)
+        debug["boundary_error"] = None if boundary_error is None else float(boundary_error)
+        debug["nearest_boundary_side"] = nearest_side
+        debug["side_source"] = side_source
+        debug["side_confidence"] = float(side_confidence)
 
         if y_range is not None:
             debug["blocked_y_range"] = (float(y_range[0]), float(y_range[1]))

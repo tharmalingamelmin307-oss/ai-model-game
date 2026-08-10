@@ -222,7 +222,7 @@ SIGN_ROUTE_SKIP_FIRST_PASS = True
 SIGN_ROUTE_FIXED_REQUIRE_SIGN = True
 # 触发语义路牌停车采样的 sign 框面积阈值，单位是 TARGET_RES 坐标系像素面积。
 # 它会和 SIGN_LLM_T0RIGGER_DIST、SIGN_LLM_TRIGGER_EDGE_MARGIN_RATIO 同时满足后才停车。
-SIGN_LLM_TRIGGER_AREA = 12000 #16000
+SIGN_LLM_TRIGGER_AREA = 10000 #16000
 # 触发语义路牌停车采样的 sign 截止距离，单位是 TARGET_RES 像素。
 # 路牌框底边距离画面底部小于等于该值，才认为已经足够近，可以停车采样。
 # 调大：更早停车；调小：更靠近再停车。
@@ -232,13 +232,12 @@ SIGN_LLM_TRIGGER_DIST = 600
 # 单位是 SEG_SIZE 坐标系像素行。
 SIGN_LLM_FORK_POINT_TRIGGER_ROWS = 150
 # 停车后希望采集的有效 OCR 样本数量。
-# 收满后会提交给千帆；如果超时，也可能提前提交已有样本。
+# 收满后会提交给千帆；如果超时，则有几个有效样本就提交几个。
 SIGN_LLM_OCR_SAMPLES = 5
-# 最少有效样本数。当前主流程仍倾向收满 SIGN_LLM_OCR_SAMPLES；
-# 这个值保留给采集失败/策略调整时作为下限参考。
+# 兼容旧配置：当前主流程不再要求最少 3 个；只要有 1 个有效样本就能提交 API。
 SIGN_LLM_MIN_VALID_SAMPLES = 3
 # 停车采集 OCR 的最长等待时间，单位秒。
-# 到时后即使没收满样本，也会尝试 force 提交。
+# 到时后即使没收满样本，也会尝试 force 提交；0 个有效样本仍不会提交。
 SIGN_LLM_COLLECT_TIMEOUT = 3.0
 # 千帆 API 请求超时时间，单位秒。
 # 太小可能导致正常网络波动被判失败；太大会让车辆等待更久。
@@ -486,7 +485,7 @@ MERGE_STATE_MISS_TOLERANCE_FRAMES = 2
 # 退出补线时检查底部多少行的总白区宽度。
 MERGE_STATE_EXIT_BOTTOM_ROWS = 5
 # 汇合补线进入后至少保持多久，单位秒；在这之前即使满足退出条件也不退出。
-MERGE_STATE_MIN_HOLD_SECONDS = 2.0
+MERGE_STATE_MIN_HOLD_SECONDS = 1.0
 # 底部总白区宽度低于该阈值时，认为更像恢复成单路。
 MERGE_STATE_EXIT_WIDTH_THRESH = 340.0
 # 退出条件连续满足多少帧才真正退出补线状态。
@@ -948,6 +947,7 @@ DEFAULT_CONTROL_DATA = {
     "sign_llm_waiting_result": False,
     "sign_llm_completed_hold": False,
     "sign_llm_samples": [],
+    "sign_llm_attempts": 0,
     "sign_llm_started_at": None,
     "sign_llm_frame_id": -1,
     "sign_llm_ocr_inflight": False,
@@ -1471,7 +1471,7 @@ CAR_AVOIDANCE_STANLEY_HEADING_GAIN = 0.34
 CAR_AVOIDANCE_STANLEY_SPEED_ESTIMATE = CAR_AVOIDANCE_TARGET_SPEED
 
 # 3. 绕完两辆车并完成回正后高速巡线75
-POST_CAR_TARGET_SPEED = 75
+POST_CAR_TARGET_SPEED = 55
 POST_CAR_STANLEY_LATERAL_GAIN = 0.35
 POST_CAR_STANLEY_LATERAL_D_GAIN = 0.018
 POST_CAR_STANLEY_HEADING_GAIN = 0.34
@@ -1487,7 +1487,7 @@ POST_CAR_STANLEY_SPEED_ESTIMATE = POST_CAR_TARGET_SPEED
 # ---------------------------------------------------------------------------
 
 # 全程最多触发几次车辆避障；0 表示不限制。
-CAR_AVOIDANCE_MAX_CYCLES = 5
+CAR_AVOIDANCE_MAX_CYCLES = 0
 
 # 绕完指定数量的车辆并完成回正后，切到第三套独立的高速巡线参数。
 # 三套 B 控制参数分别是：普通巡线 STANLEY_*、避车 CAR_AVOIDANCE_*、
@@ -1495,13 +1495,21 @@ CAR_AVOIDANCE_MAX_CYCLES = 5
 # 只有 CLEARING 完成回到 FOLLOW_LANE 后才启用本组。
 POST_CAR_CONTROL_ENABLED = True
 POST_CAR_CONTROL_AFTER_CYCLES = 2
-# car 底部中心距离画面底部超过这个行数时，不触发新的避车。
-# SEG 高度是 160，120 表示车框底部进入中近距离后才允许躲。
-CAR_AVOIDANCE_START_BOUNDARY_ROWS = 150.0
-# 在预览画面上画出避车触发距离线；车框底边低于蓝线才允许触发避车。
+# car 出现在分割平面内就允许参与锁定；这里只控制“什么时候切线接管”。
+# car 底部中心距离分割平面底部不超过这个行数时，才允许切线。
+# 日志里的 rows 就是这个距离；当前 SEG 高度是 160，rows=156 已经在 160 行窗口内。
+CAR_AVOIDANCE_SWITCH_MIN_BOTTOM_Y = 160.0
+# 在预览画面上画出避车切线距离线；车框底边低于蓝线才允许切线避车。
 CAR_AVOIDANCE_DISTANCE_LINE_ENABLED = True
 CAR_AVOIDANCE_DISTANCE_LINE_COLOR = (255, 0, 0)
 CAR_AVOIDANCE_DISTANCE_LINE_THICKNESS = 3
+# 切线前要求车所在 y 处能看到左右边界，且路宽不小于这个值，避免远处窄路误判左右。
+CAR_AVOIDANCE_SIDE_MIN_ROAD_WIDTH = 45.0
+# 选边时用车框底边中心相对道路参考行中心的位置作为辅助可信度，只相信底边框。
+CAR_AVOIDANCE_SIDE_ROAD_CENTER_Y = 150.0
+CAR_AVOIDANCE_SIDE_ROAD_CENTER_MARGIN_X = 12.0
+# 车框左下角到左边界、右下角到右边界的距离差小于该值时，可让道路中心投票接管。
+CAR_AVOIDANCE_SIDE_BOUNDARY_MIN_DIFF_X = 8.0
 # car 底部中心距离画面底部不超过这个行数时，使用近距离漏检帧数。
 CAR_AVOIDANCE_NEAR_BOUNDARY_ROWS = 110.0
 # 避车提交距离：目标第一次进入这个距离以内后，就持续沿选定侧边界直到 car 消失。
