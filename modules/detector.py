@@ -1,11 +1,11 @@
-"""PP-YOLOE RKNN 检测封装.
+"""YOLO RKNN 检测封装.
 
 职责:
 1. 接收 BGR 图像并完成模型输入预处理。
 2. 调用 RKNNLite 执行推理。
-3. 按当前 detv3 official split 模型解析两个输出:
-   - boxes: [N, 4] xyxy
-   - scores: [N, num_classes]
+3. 按当前 YOLOv8 predfl 模型解析两个输出:
+   - raw DFL: [1, 4*reg_max, N]
+   - class logits: [1, num_classes, N]
 4. 将结果整理成统一检测框结构:
    {
        "rect": [x, y, w, h],
@@ -16,33 +16,61 @@
 
 实现约定:
 1. 所有输出框最终都统一映射到 `config.TARGET_RES` 坐标系。
-2. 当前检测后处理对齐 detv3 测试脚本：框尺寸、类别置信度、
+2. 当前检测后处理对齐 PaddleYOLO-RKNN predfl 契约：DFL 解码、类别置信度、
    类别最大面积比例和贴边大框过滤。
 3. 类别级阈值由 `config.CLASS_MIN_SCORES` 控制。
-4. 当前 RKNN 已固化 mean/std，Python 侧只喂 0-255 RGB uint8。
+4. 当前 RKNN 已固化 divide_by_255，Python 侧只喂 0-255 RGB uint8。
 """
 
 import cv2
 import numpy as np
 from rknnlite.api import RKNNLite
 import config
+try:
+    from modules.cpp_det_worker import CppDetWorker
+except ImportError:
+    CppDetWorker = None
+from utils.yolo_rknn_post import (
+    class_aware_nms,
+    decode_dfl_boxes,
+    letterbox_bgr_or_rgb,
+    scale_boxes_from_letterbox,
+    sigmoid,
+)
 
 
 class YOLODetector:
     def __init__(self, core_id):
         """加载模型并绑定到指定 NPU 核."""
-        self.rknn = RKNNLite()
-        if self.rknn.load_rknn(config.YOLO_MODEL) != 0:
-            raise RuntimeError("YOLO 加载失败")
-        if self.rknn.init_runtime(core_mask=core_id) != 0:
-            raise RuntimeError("YOLO 初始化失败")
-
         self.conf_thres = float(config.YOLO_CONF_THRES)
         self.nms_thres = float(config.YOLO_NMS_THRES)
-        
         self.runtime_error_logged = False
 
         self.num_classes = len(config.CLASS_NAMES)
+        self.strides = tuple(getattr(config, "YOLO_HEAD_STRIDES", (8, 16, 32)))
+        self.reg_max = int(getattr(config, "YOLO_REG_MAX", 16))
+        self.class_logit_thresholds = np.asarray(
+            [self._score_to_logit(self._get_class_conf_thres(cls_id=i)) for i in range(self.num_classes)],
+            dtype=np.float32,
+        )
+        self.last_timing = {"preprocess": 0.0, "rknn": 0.0, "decode": 0.0, "total": 0.0}
+        self.last_decode_counts = {"raw": 0, "topk": 0, "nms": 0, "result": 0}
+        self.cpp_det_worker = None
+        self.rknn = None
+
+        if bool(getattr(config, "CPP_DET_ENABLED", False)) and CppDetWorker is not None:
+            try:
+                self.cpp_det_worker = CppDetWorker(core_id)
+                print(f"YOLO C++ worker enabled: core={core_id}", flush=True)
+            except Exception as exc:
+                print(f"YOLO C++ worker unavailable, fallback to Python RKNN: {exc}", flush=True)
+
+        if self.cpp_det_worker is None:
+            self.rknn = RKNNLite()
+            if self.rknn.load_rknn(config.YOLO_MODEL) != 0:
+                raise RuntimeError("YOLO 加载失败")
+            if self.rknn.init_runtime(core_mask=core_id) != 0:
+                raise RuntimeError("YOLO 初始化失败")
 
     def _class_name_from_id(self, cls_id):
         cls_id = int(cls_id)
@@ -58,6 +86,10 @@ class YOLODetector:
         min_scores = getattr(config, "CLASS_MIN_SCORES", {})
         return float(min_scores.get(cls_name, self.conf_thres))
 
+    def _score_to_logit(self, score):
+        score = min(max(float(score), 1e-6), 1.0 - 1e-6)
+        return float(np.log(score / (1.0 - score)))
+
     def _build_score_keep_mask(self, class_ids, scores):
         """为一批候选框生成“按类别阈值保留”的布尔掩码。"""
         if len(class_ids) == 0 or len(scores) == 0:
@@ -68,6 +100,13 @@ class YOLODetector:
             dtype=np.float32,
         )
         return scores >= score_thres
+
+    def _build_logit_keep_mask(self, class_ids, logits):
+        """用 sigmoid 之前的 logit 阈值筛候选，避免全量 sigmoid。"""
+        if len(class_ids) == 0 or len(logits) == 0:
+            return np.array([], dtype=bool)
+
+        return logits >= self.class_logit_thresholds[class_ids]
 
     def _is_valid_detection(self, x, y, w, h, cls_name, score, orig_w, orig_h):
         """按当前 detv3 测试脚本的规则过滤检测结果。"""
@@ -101,15 +140,16 @@ class YOLODetector:
 
     def _preprocess(self, frame):
         """将上游 BGR 图像整理成 RKNN 实际接收的 NHWC 输入."""
-        input_w, input_h = config.YOLO_SIZE
-        if frame.shape[1] != input_w or frame.shape[0] != input_h:
-            img = cv2.resize(frame, (input_w, input_h), interpolation=cv2.INTER_LINEAR)
-        else:
-            img = frame
-            
-        # 当前 detv3 RKNN 内部已固化 mean/std，这里只喂 0-255 RGB。
+        img, transform = letterbox_bgr_or_rgb(
+            frame,
+            config.YOLO_SIZE,
+            pad_value=int(getattr(config, "YOLO_LETTERBOX_PAD_VALUE", 114)),
+            scaleup=bool(getattr(config, "YOLO_LETTERBOX_SCALEUP", False)),
+        )
+
+        # RKNN 内部已固化 divide_by_255，这里只喂 0-255 RGB。
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        return np.expand_dims(img, axis=0)
+        return np.expand_dims(img, axis=0), transform
 
     def _nms_boxes_xyxy(self, boxes, scores):
         if len(boxes) == 0:
@@ -302,22 +342,125 @@ class YOLODetector:
             results = results[:max_dets]
         return results
 
+    def _decode_predfl_outputs(self, outputs, output_w, output_h, transform):
+        """解析 YOLOv8 predfl 输出: raw DFL + class logits."""
+        if outputs is None or len(outputs) != 2:
+            shapes = [] if outputs is None else [np.asarray(out).shape for out in outputs]
+            raise RuntimeError(f"Unexpected predfl output count/shapes: {shapes}")
+
+        raw_dfl = np.asarray(outputs[0])
+        cls_logits = np.asarray(outputs[1])
+        if cls_logits.ndim != 3 or cls_logits.shape[0] != 1:
+            raise RuntimeError(f"Unexpected predfl class shape: {cls_logits.shape}")
+        if cls_logits.shape[1] != self.num_classes:
+            raise RuntimeError(f"Unexpected predfl class count: {cls_logits.shape}")
+
+        logits_all = cls_logits[0]
+        class_ids = np.argmax(logits_all, axis=0).astype(np.int32)
+        max_logits = logits_all[class_ids, np.arange(logits_all.shape[1])].astype(np.float32, copy=False)
+
+        keep = self._build_logit_keep_mask(class_ids, max_logits)
+        if not np.any(keep):
+            self.last_decode_counts = {"raw": 0, "topk": 0, "nms": 0, "result": 0}
+            return []
+
+        candidate_idx = np.flatnonzero(keep)
+        class_ids = class_ids[candidate_idx]
+        scores = sigmoid(np.clip(max_logits[candidate_idx], -88.0, 88.0)).astype(np.float32, copy=False)
+        raw_count = int(candidate_idx.size)
+
+        topk = int(getattr(config, "YOLO_PRE_NMS_TOPK_PER_CLASS", 0))
+        if topk > 0 and candidate_idx.size > 0:
+            selected_parts = []
+            for cls_id in np.unique(class_ids):
+                inds = np.where(class_ids == cls_id)[0]
+                if inds.size > topk:
+                    inds = inds[np.argsort(-scores[inds], kind="stable")[:topk]]
+                selected_parts.append(inds)
+            selected = np.concatenate(selected_parts, axis=0) if selected_parts else np.zeros((0,), dtype=np.int64)
+            candidate_idx = candidate_idx[selected]
+            class_ids = class_ids[selected]
+            scores = scores[selected]
+
+        if candidate_idx.size == 0:
+            self.last_decode_counts = {"raw": raw_count, "topk": 0, "nms": 0, "result": 0}
+            return []
+        topk_count = int(candidate_idx.size)
+
+        boxes = decode_dfl_boxes(
+            raw_dfl,
+            config.YOLO_SIZE,
+            self.strides,
+            reg_max=self.reg_max,
+            candidate_idx=candidate_idx,
+        )
+
+        max_dets = int(getattr(config, "YOLO_MAX_DETS", 50))
+        keep_nms = class_aware_nms(
+            boxes,
+            scores,
+            class_ids,
+            max_det=max_dets,
+            iou_threshold=self.nms_thres,
+        )
+        if keep_nms.size == 0:
+            self.last_decode_counts = {"raw": raw_count, "topk": topk_count, "nms": 0, "result": 0}
+            return []
+
+        boxes = scale_boxes_from_letterbox(
+            boxes[keep_nms],
+            transform,
+            (output_w, output_h),
+        )
+        class_ids = class_ids[keep_nms]
+        scores = scores[keep_nms]
+        results = self._build_results(boxes, class_ids, scores, output_w, output_h)
+        self.last_decode_counts = {
+            "raw": raw_count,
+            "topk": topk_count,
+            "nms": int(keep_nms.size),
+            "result": int(len(results)),
+        }
+        return results
+
     def run(self, frame_data, output_size=None):
         """执行一次完整检测流程."""
+        if self.cpp_det_worker is not None:
+            results = self.cpp_det_worker.run(frame_data, output_size=output_size)
+            self.last_timing = dict(self.cpp_det_worker.last_timing)
+            self.last_decode_counts = dict(self.cpp_det_worker.last_counts)
+            return results
+
         try:
+            t_start = cv2.getTickCount()
+            tick_freq = cv2.getTickFrequency()
             infer_h, infer_w = frame_data.shape[:2]
             if output_size is None:
                 output_w, output_h = infer_w, infer_h
             else:
                 output_w, output_h = output_size
             input_w, input_h = config.YOLO_SIZE
-            blob = self._preprocess(frame_data)
+            blob, transform = self._preprocess(frame_data)
+            t_after_preprocess = cv2.getTickCount()
 
             outputs = self.rknn.inference(
                 inputs=[blob],
                 data_format=['nhwc']
             )
-            return self._decode_split_outputs(outputs, output_w, output_h, input_w, input_h)
+            t_after_rknn = cv2.getTickCount()
+            route = str(getattr(config, "YOLO_OUTPUT_ROUTE", "predfl")).lower()
+            if route == "predfl":
+                results = self._decode_predfl_outputs(outputs, output_w, output_h, transform)
+            else:
+                results = self._decode_split_outputs(outputs, output_w, output_h, input_w, input_h)
+            t_end = cv2.getTickCount()
+            self.last_timing = {
+                "preprocess": (t_after_preprocess - t_start) / tick_freq,
+                "rknn": (t_after_rknn - t_after_preprocess) / tick_freq,
+                "decode": (t_end - t_after_rknn) / tick_freq,
+                "total": (t_end - t_start) / tick_freq,
+            }
+            return results
 
         except Exception as e:
             if not self.runtime_error_logged:

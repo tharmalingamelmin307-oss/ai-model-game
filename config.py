@@ -68,17 +68,17 @@ JPEG_QUALITY = 75
 # ---------------------------------------------------------------------------
 # 分割模型路径。
 # 当前主控链路依赖这个模型输出赛道 mask，所以它直接影响路径规划和转向控制。
-# 这里的模型默认输入尺寸是 SEG_SIZE，对应下面的 416x160。
-SEG_MODEL = str(PROJECT_ROOT / "models/seg/segv6/segv6_416x160_argmax_rk3588_int8.rknn")
+# 这里使用 YOLOv8-Seg seg_predfl RKNN，CPU 端在 modules/segmentor.py 重建 mask。
+SEG_MODEL = str(PROJECT_ROOT / "models/double/seg_yolov8n_segpredfl_int8_160x416.rknn")
 
 # 目标检测模型路径。
-# 当前使用的是 PP-YOLOE 的 RKNN 版本，输出后处理由 modules/detector.py 负责。
+# 当前使用的是 YOLOv8 predfl 的 RKNN 版本，输出后处理由 modules/detector.py 负责。
 # 如果替换模型，除了改这里，通常还要同步检查:
 # - YOLO_SIZE
 # - CLASS_NAMES
 # - detector.py 的输出解析逻辑
 # YOLO_MODEL = str(PROJECT_ROOT / "models/det/dev6/ppyoloe_merged_512x384_split_rk3588_int8.rknn")
-YOLO_MODEL = str(PROJECT_ROOT / "models/det/detv7/ppyoloe_8900_best_512x384_split_rk3588_int8.rknn")
+YOLO_MODEL = str(PROJECT_ROOT / "models/double/det_yolov8n_predfl_int8_640.rknn")
 
 
 # OCR 检测模型路径。
@@ -152,24 +152,24 @@ YOLO_PAUSE_OCR_TIMEOUT = 1.5
 # 否则会出现“框是对的，但类别解释全错”的问题。
 # "coin" 只作为模型类别占位保留，当前主流程不做金币规划。
 CLASS_NAMES = [
-    "car",                  # 0
-    "coin",                 # 1
-    "person",               # 2
-    "door",                 # 3
-    "stone",                # 4
-    "zebra_crossing",       # 5
-    "traffic_light_red",    # 6
-    "traffic_light_green",  # 7
-    "traffic_light_yellow", # 8
-    "sign",                 # 9
-    "limit_sign",           # 10
-    "start",                # 11
+    "door",                 # 0
+    "start",                # 1
+    "car",                  # 2
+    "coin",                 # 3
+    "person",               # 4
+    "stone",                # 5
+    "sign",                 # 6
+    "limit_sign",           # 7
+    "zebra_crossing",       # 8
+    "traffic_light_red",    # 9
+    "traffic_light_green",  # 10
+    "traffic_light_yellow", # 11
     "stop",                 # 12
 ]
 
 # 普通语义路牌类别 id。
 # 这类框会送去 OCR，当前主要识别 LEFT / RIGHT。
-SIGN_CLASS_ID = 9
+SIGN_CLASS_ID = 6
 
 # 普通语义路牌在进入 OCR 前，框的最小面积阈值，单位是 TARGET_RES 坐标系像素面积。
 # 这个值比单独宽高更灵活，能更直接表达“这块牌子整体够不够大”。
@@ -307,24 +307,47 @@ YOLO_EDGE_TOUCH_MAX_AREA_RATIO = 0.30
 TARGET_RES = (960, 720)
 
 # YOLO 模型输入尺寸，格式为 (width, height)。
-# 主线程会把原图缩放到这个尺寸供 detector.py 推理。
+# detector.py 会把 TARGET_RES 图 letterbox 到这个尺寸供模型推理。
 # 调大:
 # - 远处小目标更容易被看见
 # - 检测延迟更高
 # 调小:
 # - 延迟更低
 # - 但远处小目标和细节更容易丢
-YOLO_SIZE = (512, 384)
+YOLO_SIZE = (640, 640)
+YOLO_OUTPUT_ROUTE = "predfl"
+YOLO_HEAD_STRIDES = (8, 16, 32)
+YOLO_REG_MAX = 16
+YOLO_LETTERBOX_PAD_VALUE = 114
+YOLO_LETTERBOX_SCALEUP = False
+CPP_DET_ENABLED = True
+CPP_DET_WORKER_BIN = str(PROJECT_ROOT / "cpp_rknn/det_worker")
 
 # 分割模型输入尺寸，格式为 (width, height)。
 # 分割线程直接用这张小图做主控路径搜索。
 # 这是实时控制链路的关键性能点之一。
 SEG_SIZE = (416, 160)
+SEG_OUTPUT_ROUTE = "seg_predfl"
+SEG_HEAD_STRIDES = (8, 16, 32)
+SEG_REG_MAX = 16
+SEG_CONF_THRES = 0.25
+SEG_NMS_THRES = 0.70
+SEG_PRE_NMS_TOPK = 16
+SEG_MAX_DETS = 1
+SEG_MASK_THRES = 0.5
+SEG_LETTERBOX_PAD_VALUE = 114
+SEG_LETTERBOX_SCALEUP = False
+CPP_SEG_ENABLED = True
+CPP_SEG_WORKER_BIN = str(PROJECT_ROOT / "cpp_rknn/seg_worker")
 
 # 分割模型输入裁剪比例。
 # 0.5 表示先裁掉原图上半部分，只把下半部分 resize 到 SEG_SIZE。
 # 这个值要和当前 segv3 测试脚本里的 crop_y = h // 2 保持一致。
 SEG_INPUT_CROP_TOP_RATIO = 0.5
+# 分割 mask 进入路径搜索前，强制忽略顶部/底部边框行。
+# 这些边缘常由 ROI crop / instance mask bbox 带出，不应参与八邻域边界追踪。
+SEG_MASK_IGNORE_TOP_ROWS = 3
+SEG_MASK_IGNORE_BOTTOM_ROWS = 3
 
 # OCR 识别模型输入高度。
 # PaddleOCR 一类识别模型通常固定高度，再按宽高比自适应宽度。
@@ -343,6 +366,10 @@ MASK_ALPHA = 0.4
 # 是否在预览画面上给整块分割 mask 染色。
 # False 时只画路径/边界/文字，不改变原图大面积颜色，也能减少一点渲染开销。
 SEG_DEBUG_DRAW_MASK = False
+
+# Seg 控制优先时，调试预览每隔多少个 Seg 后处理帧渲染一次。
+# 1 表示每帧渲染；3 表示每 3 帧更新一次网页预览，但每帧仍更新控制量。
+SEG_RENDER_INTERVAL = 3
 
 # 裁剪分割模型预览合成阈值。
 # 网页预览仍以完整原图为底，只把 Seg 渲染图里相对原图明显变化的像素叠上去。
@@ -1007,9 +1034,11 @@ DEFAULT_CONTROL_DATA = {
     "car_avoidance_left_boundary_error": None,
     "car_avoidance_left_boundary_x": None,
     "car_avoidance_boundary_inset_x": 0.0,
+    "car_avoidance_control_error_offset_x": 0.0,
     "car_avoidance_detected_cars": 0,
     "car_avoidance_locked_confirmed": False,
     "car_avoidance_locked_hit_frames": 0,
+    "car_avoidance_boundary_side_ready": False,
     "car_avoidance_boundary_path_active": False,
     "car_avoidance_avoid_weight": 0.0,
     "car_avoidance_event": "",
@@ -1071,16 +1100,16 @@ FPS_STATS_UPDATE_INTERVAL = 1.0
 
 # Seg 阶段耗时诊断日志。
 # 开启后每隔一段时间打印 inference / search / fit / render / total，用来定位掉帧瓶颈。
-SEG_PROFILE_LOG_ENABLED = False
+SEG_PROFILE_LOG_ENABLED = True
 # Seg profile 日志节流间隔，单位秒。
-SEG_PROFILE_LOG_INTERVAL = 2.0
+SEG_PROFILE_LOG_INTERVAL = 1.0
 
 # 主流程运行时耗时诊断日志。
 # 开启后会额外打印采集预处理、Seg 推理线程等待、发布、MJPEG 编码等耗时。
 # 用来判断页面 FPS 是卡在输入来帧、模型推理、后处理发布还是网页推流。
-MAIN_PROFILE_LOG_ENABLED = False
+MAIN_PROFILE_LOG_ENABLED = True
 # 主流程 profile 日志节流间隔，单位秒。
-MAIN_PROFILE_LOG_INTERVAL = 2.0
+MAIN_PROFILE_LOG_INTERVAL = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -1306,7 +1335,7 @@ OCR_DEBUG_SAVE_MAX_IMAGES = 30
 # ---------------------------------------------------------------------------
 # YOLO 预处理与解析参数
 # ---------------------------------------------------------------------------
-# 当前 detv3 RKNN 已固化 mean/std，Python 侧只喂 0-255 RGB uint8。
+# 当前 predfl RKNN 已固化 divide_by_255，Python 侧只喂 0-255 RGB uint8。
 
 # 检测框的最小宽高阈值，单位是输出坐标系像素。
 # 过小的框通常没有足够语义价值，也容易成为噪声。
@@ -1316,8 +1345,8 @@ YOLO_BOX_MIN_SIZE = 3
 YOLO_MAX_DETS = 50
 
 # 进入 NMS 前，每个类别最多保留多少个候选框。
-# detv3 低阈值会产生大量候选；如果全部做 Python NMS，会明显抢占 Seg 线程 CPU。
-YOLO_PRE_NMS_TOPK_PER_CLASS = 80
+# predfl 低阈值会产生大量候选；如果全部做 Python NMS，会明显抢占 Seg 线程 CPU。
+YOLO_PRE_NMS_TOPK_PER_CLASS = 20
 
 
 
@@ -1358,7 +1387,7 @@ SEG_CENTERLINE_ONLY_MODE = True
 # 中心线模式下，先取最大连通白区，再按行直接取该区域左右边界中点。
 SEG_CENTERLINE_LARGEST_COMPONENT_ONLY = True
 # 中心线模式逐行采样步长。1 表示真正每一行都取中点；调大可进一步少点提速。
-SEG_CENTERLINE_ROW_STEP = 1
+SEG_CENTERLINE_ROW_STEP = 2
 
 # 同一层里，相邻白色像素之间如果断开超过这个阈值，就认为属于不同分支。
 SEG_PATH_GAP_THRESH = 20
@@ -1432,7 +1461,7 @@ SEG_PATH_CENTER_PENALTY_GAIN = 3.5
 SEG_PATH_TOP_TIER_SCORE_GAP = 150.0
 
 # 最终拟合路径重新采样成多少个密集点，用来计算 steer_signal 和画线。
-SEG_PATH_DENSE_SAMPLES = 30
+SEG_PATH_DENSE_SAMPLES = 18
 
 # 终端打印当前赛道宽度的节流间隔，单位秒。
 TRACK_WIDTH_LOG_INTERVAL = 1.5
@@ -1499,6 +1528,10 @@ POST_CAR_CONTROL_AFTER_CYCLES = 2
 # car 底部中心距离分割平面底部不超过这个行数时，才允许切线。
 # 日志里的 rows 就是这个距离；当前 SEG 高度是 160，rows=156 已经在 160 行窗口内。
 CAR_AVOIDANCE_SWITCH_MIN_BOTTOM_Y = 160.0
+# 选左/右绕车的更早判断门槛；到这里就先把方向定下来，但仍然不切线。
+CAR_AVOIDANCE_SIDE_DECISION_MIN_BOTTOM_Y = 180.0
+# 避车控制中心偏差外加量。设 10 表示最终循线误差：巡左边界 -10，巡右边界 +10。
+CAR_AVOIDANCE_CONTROL_ERROR_OFFSET_X = 10.0
 # 在预览画面上画出避车切线距离线；车框底边低于蓝线才允许切线避车。
 CAR_AVOIDANCE_DISTANCE_LINE_ENABLED = True
 CAR_AVOIDANCE_DISTANCE_LINE_COLOR = (255, 0, 0)
@@ -1515,9 +1548,9 @@ CAR_AVOIDANCE_NEAR_BOUNDARY_ROWS = 110.0
 # 避车提交距离：目标第一次进入这个距离以内后，就持续沿选定侧边界直到 car 消失。
 CAR_AVOIDANCE_COMMIT_ROWS = 80.0
 # car 跟踪锁定。锁定主要看车框底部中心点的连续性，面积只做异常框过滤。
-# 连续命中后进入避障；短暂漏检会继续沿用锁定目标，超过允许帧数后进入 CLEARING。
-# 新 car 目标需要连续命中多少帧才锁定。
-CAR_AVOIDANCE_LOCK_HIT_FRAMES = 3
+# 新 car 目标出现 1 帧就先锁定最大/最近目标，进入 160 行窗口后立即判断左右；
+# 后续帧仍通过底部中心连续性匹配，避免切到别的 car。
+CAR_AVOIDANCE_LOCK_HIT_FRAMES = 1
 # 锁定目标和新检测框匹配的搜索半径。
 CAR_AVOIDANCE_SEARCH_RADIUS = 60.0
 # 目标漏检期间，搜索半径随漏检帧数增加的增益。
@@ -1565,6 +1598,11 @@ SEG_DEBUG_PATH_THICKNESS = 2
 SEG_DEBUG_DRAW_CANDIDATE_PATHS = False
 # 是否绘制当前选中路径的左右边界。
 SEG_DEBUG_DRAW_BOUNDARIES = True
+# 边界调试线过滤：八邻域 trace/补线有时会把上下边框混进边界，
+# 预览绘制时跳过明显的长横段，避免误认为赛道边界。
+SEG_DEBUG_BOUNDARY_SKIP_HORIZONTAL_EDGE_SEGMENTS = False
+SEG_DEBUG_BOUNDARY_HORIZONTAL_MAX_DY = 3
+SEG_DEBUG_BOUNDARY_HORIZONTAL_MIN_DX = 20
 # 是否绘制汇合补线引导线。
 SEG_DEBUG_DRAW_MERGE_GUIDE = False
 # 左候选路径颜色。

@@ -42,6 +42,7 @@ from modules.detector import YOLODetector
 from modules.baidu_ocr_api import BaiduOCRRecognizer
 from modules.ocr_system import OCRRecognizer as LocalOCRRecognizer
 from modules.qianfan_client import request_road_choice
+from utils.yolo_rknn_post import letterbox_bgr_or_rgb
 try:
     from utils.rknn_quiet import install_rknn_warning_filter
 except ImportError:
@@ -171,7 +172,13 @@ def make_seg_input(frame_rgb):
         crop_y = int(round(h * crop_ratio))
         frame_rgb = frame_rgb[crop_y:, :, :]
 
-    return cv2.resize(frame_rgb, config.SEG_SIZE, interpolation=cv2.INTER_LINEAR)
+    seg_img, _ = letterbox_bgr_or_rgb(
+        frame_rgb,
+        config.SEG_SIZE,
+        pad_value=int(getattr(config, "SEG_LETTERBOX_PAD_VALUE", 114)),
+        scaleup=bool(getattr(config, "SEG_LETTERBOX_SCALEUP", False)),
+    )
+    return seg_img
 
 
 def expand_seg_render_to_target(rendered_img, base_frame=None):
@@ -1358,6 +1365,8 @@ def yolo_worker(core_id=None, worker_id=0):
             t_det_start = time.perf_counter()
             objs = det.run(det_frame, output_size=config.TARGET_RES)
             t_det_end = time.perf_counter()
+            det_timing = getattr(det, "last_timing", {})
+            det_counts = getattr(det, "last_decode_counts", {})
 
             # 新一帧检测结果先清掉旧的 OCR 文本，避免沿用上一帧残留内容。
             for obj in objs:
@@ -1540,6 +1549,12 @@ def yolo_worker(core_id=None, worker_id=0):
                     "wait_input": t_after_get - t_loop_start,
                     "drain_input": t_after_drain - t_after_get,
                     "det_run": t_det_end - t_det_start,
+                    "det_pre": float(det_timing.get("preprocess", 0.0)),
+                    "det_rknn": float(det_timing.get("rknn", 0.0)),
+                    "det_decode": float(det_timing.get("decode", 0.0)),
+                    "det_raw_count": float(det_counts.get("raw", 0)),
+                    "det_topk_count": float(det_counts.get("topk", 0)),
+                    "det_nms_count": float(det_counts.get("nms", 0)),
                     "update": t_update_end - t_det_end,
                     "post": t_loop_end - t_update_end,
                     "loop": t_loop_end - t_loop_start,
@@ -1922,9 +1937,11 @@ def seg_worker(core_id, worker_id=0):
             global_control_data["car_avoidance_left_boundary_x"] = car_stats.get("car_left_boundary_x")
             global_control_data["car_avoidance_control_path_error"] = car_stats.get("car_control_path_error")
             global_control_data["car_avoidance_boundary_inset_x"] = float(car_stats.get("car_boundary_inset_x", 0.0))
+            global_control_data["car_avoidance_control_error_offset_x"] = float(car_stats.get("car_control_error_offset_x", 0.0))
             global_control_data["car_avoidance_detected_cars"] = int(car_stats.get("car_detected_cars", 0))
             global_control_data["car_avoidance_locked_confirmed"] = bool(car_stats.get("car_locked_confirmed", False))
             global_control_data["car_avoidance_locked_hit_frames"] = int(car_stats.get("car_locked_hit_frames", 0))
+            global_control_data["car_avoidance_boundary_side_ready"] = bool(car_stats.get("car_boundary_side_ready", False))
             global_control_data["car_avoidance_boundary_path_active"] = bool(car_stats.get("car_boundary_path_active", False))
             global_control_data["car_avoidance_avoid_weight"] = float(car_stats.get("car_avoid_weight", 0.0))
             global_control_data["car_avoidance_event"] = str(car_stats.get("car_event", ""))
@@ -2059,8 +2076,9 @@ def seg_worker(core_id, worker_id=0):
                 yolo_boxes=current_yolo_boxes,
             )
 
-        with frame_lock:
-            global_preview_frame = rendered_img
+        if rendered_img is not None:
+            with frame_lock:
+                global_preview_frame = rendered_img
 
     if not bool(getattr(config, "SEG_PIPELINE_ENABLED", True)):
         fps_start_holder = [fps_start_time]
@@ -2123,6 +2141,7 @@ def seg_worker(core_id, worker_id=0):
     fps_start_holder = [fps_start_time]
 
     def postprocess_loop():
+        render_counter = 0
         while True:
             t_get_start = time.perf_counter()
             item = mask_queue.get()
@@ -2168,6 +2187,9 @@ def seg_worker(core_id, worker_id=0):
                     debug_drive_active = not drive_stop_active
 
             try:
+                render_counter += 1
+                render_interval = max(1, int(getattr(config, "SEG_RENDER_INTERVAL", 1)))
+                render_enabled = (render_counter % render_interval) == 0
                 t_post_start = time.perf_counter()
                 steer_signal, rendered_img = seg.postprocess_mask(
                     blob_rgb_320,
@@ -2183,6 +2205,7 @@ def seg_worker(core_id, worker_id=0):
                     external_boundary_side=external_boundary_side,
                     sign_route_pending=sign_route_pending,
                     debug_drive_active=debug_drive_active,
+                    render_enabled=render_enabled,
                 )
                 t_post_end = time.perf_counter()
                 publish_seg_result(
@@ -2250,6 +2273,7 @@ def seg_worker(core_id, worker_id=0):
             t_infer_start = time.perf_counter()
             mask, infer_s = seg.infer_mask(blob_rgb_320)
             t_infer_end = time.perf_counter()
+            infer_timing = getattr(seg, "last_infer_timing", {})
         except Exception as e:
             throttled_log(
                 f"seg_infer_error_{core_id}",
@@ -2289,6 +2313,10 @@ def seg_worker(core_id, worker_id=0):
                 "wait_input": t_after_get - t_get_start,
                 "lock": t_lock_end - t_lock_start,
                 "infer": t_infer_end - t_infer_start,
+                "rknn": float(infer_timing.get("rknn", 0.0)),
+                "decode": float(infer_timing.get("decode", 0.0)),
+                "seg_candidates_count": float(infer_timing.get("candidates", 0)),
+                "seg_kept_count": float(infer_timing.get("kept", 0)),
                 "put_mask": t_put_end - t_put_start,
                 "loop": t_put_end - t_get_start,
                 "drop_post_fps": float(dropped_post),
@@ -2338,9 +2366,11 @@ def serial_control_thread():
             car_avoidance_left_boundary_x = global_control_data.get("car_avoidance_left_boundary_x")
             car_avoidance_control_path_error = global_control_data.get("car_avoidance_control_path_error")
             car_avoidance_boundary_inset_x = float(global_control_data.get("car_avoidance_boundary_inset_x", 0.0))
+            car_avoidance_control_error_offset_x = float(global_control_data.get("car_avoidance_control_error_offset_x", 0.0))
             car_avoidance_detected_cars = int(global_control_data.get("car_avoidance_detected_cars", 0))
             car_avoidance_locked_confirmed = bool(global_control_data.get("car_avoidance_locked_confirmed", False))
             car_avoidance_locked_hit_frames = int(global_control_data.get("car_avoidance_locked_hit_frames", 0))
+            car_avoidance_boundary_side_ready = bool(global_control_data.get("car_avoidance_boundary_side_ready", False))
             car_avoidance_boundary_path_active = bool(global_control_data.get("car_avoidance_boundary_path_active", False))
             car_avoidance_avoid_weight = float(global_control_data.get("car_avoidance_avoid_weight", 0.0))
             car_avoidance_event = str(global_control_data.get("car_avoidance_event", ""))
@@ -2500,9 +2530,11 @@ def serial_control_thread():
             car_avoidance_left_boundary_x = None
             car_avoidance_control_path_error = None
             car_avoidance_boundary_inset_x = 0.0
+            car_avoidance_control_error_offset_x = 0.0
             car_avoidance_detected_cars = 0
             car_avoidance_locked_confirmed = False
             car_avoidance_locked_hit_frames = 0
+            car_avoidance_boundary_side_ready = False
             car_avoidance_boundary_path_active = False
             car_avoidance_avoid_weight = 0.0
             car_avoidance_event = ""
@@ -2559,11 +2591,13 @@ def serial_control_thread():
         car_pause_text = "1" if car_avoidance_state_paused else "0"
         car_locked_text = "1" if car_avoidance_locked_confirmed else "0"
         car_path_text = "1" if car_avoidance_boundary_path_active else "0"
+        car_side_ready_text = "1" if car_avoidance_boundary_side_ready else "0"
         car_side_text = str(car_avoidance_boundary_side or "").upper() or "无"
         car_boundary_x_text = "无" if car_avoidance_boundary_x is None else f"{float(car_avoidance_boundary_x):.1f}"
         car_boundary_error_text = "无" if car_avoidance_boundary_error is None else f"{float(car_avoidance_boundary_error):.1f}"
         car_control_error_text = "无" if car_avoidance_control_path_error is None else f"{float(car_avoidance_control_path_error):.1f}"
         car_boundary_inset_text = f"{float(car_avoidance_boundary_inset_x):.1f}"
+        car_control_error_offset_text = f"{float(car_avoidance_control_error_offset_x):.1f}"
         car_kp_text = "无" if car_avoidance_control_kp is None else f"{float(car_avoidance_control_kp):.2f}"
         car_kd_text = "无" if car_avoidance_control_kd is None else f"{float(car_avoidance_control_kd):.2f}"
         car_psi_text = "无" if car_avoidance_control_psi is None else f"{float(car_avoidance_control_psi):.2f}"
@@ -2575,7 +2609,7 @@ def serial_control_thread():
                 f">>> 避车#{car_avoidance_cycle_id}(B): event={car_avoidance_event or '-'} state={car_avoidance_state} rows={car_rows_text} "
                 f"det={int(car_avoidance_detected_cars)} locked={car_locked_text} hits={int(car_avoidance_locked_hit_frames)} "
                 f"miss={car_miss_text} clear={car_clear_text} pause={car_pause_text} path={car_path_text} "
-                f"inset={car_boundary_inset_text} weight={float(car_avoidance_avoid_weight):.2f} "
+                f"inset={car_boundary_inset_text} side_ready={car_side_ready_text} ctrl_off={car_control_error_offset_text} weight={float(car_avoidance_avoid_weight):.2f} "
                 f"side={car_side_text} boundary_x={car_boundary_x_text} boundary_e={car_boundary_error_text} "
                 f"ctrl_e={car_control_error_text} "
                 f"B=({car_kp_text},{car_kd_text},{car_psi_text}) v={car_v_text}",
@@ -2591,7 +2625,9 @@ def serial_control_thread():
                     car_clear_text,
                     car_pause_text,
                     car_path_text,
+                    car_side_ready_text,
                     car_boundary_inset_text,
+                    car_control_error_offset_text,
                     int(float(car_avoidance_avoid_weight) * 100),
                     car_side_text,
                     car_boundary_x_text,
@@ -2769,7 +2805,7 @@ def ai_producer_thread():
                     seg_queue.put((seg_blob, vis_img_large))
                 t_seg_put_end = time.perf_counter()
 
-                # 检测分支直接生成 YOLO 输入尺寸的小图，避免大图先放大再缩小。
+                # 检测分支交给 detector 内部按模型契约做 letterbox。
                 # 同时保留一份 TARGET_RES 大图，供:
                 # - 检测框绘制
                 # - OCR 整图 det + rec
@@ -2779,7 +2815,7 @@ def ai_producer_thread():
                 yolo_interval = max(1, int(getattr(config, "YOLO_PRODUCER_FRAME_INTERVAL", 1)))
                 submit_yolo = (yolo_frame_counter % yolo_interval) == 0
                 if submit_yolo:
-                    det_img = cv2.resize(frame_bgr, config.YOLO_SIZE, interpolation=cv2.INTER_LINEAR)
+                    det_img = vis_img_large
                 t_yolo_end = time.perf_counter()
 
                 dropped_yolo = 0

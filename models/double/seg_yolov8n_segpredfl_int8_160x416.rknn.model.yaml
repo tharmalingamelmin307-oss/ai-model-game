@@ -1,0 +1,47 @@
+schema_version: 1
+model_file: seg_yolov8n_segpredfl_int8_160x416.rknn
+model_sha256: b8fb9dd8321c7f332a10337d282962d09928f314a16c06744421b485d1b99a80
+contract_onnx_sha256: 2c01f01c7c8297b58c091b1410496de415d9ac842293fef09512cc6369d21cbc
+input_shape:
+- 160
+- 416
+color: rgb
+resize_mode: letterbox
+pad_value: 114
+scaleup: false
+tensor_encoding:
+  logical_dtype: uint8
+  logical_layout: hwc
+  backend_binding: query_model_attributes
+normalization: divide_by_255
+output_route: seg_predfl
+output_shapes:
+- - 1
+  - 1365
+  - 64
+- - 1
+  - 1
+  - 1365
+- - 1
+  - 32
+  - 1365
+- - 1
+  - 32
+  - 40
+  - 104
+- - 1
+  - 1
+  - 1365
+task: segment
+head_strides:
+- 8
+- 16
+- 32
+anchor_count: 1365
+reg_max: 16
+class_names:
+- object
+mask_dim: 32
+proto_shape:
+- 40
+- 104

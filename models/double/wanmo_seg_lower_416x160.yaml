@@ -1,0 +1,6 @@
+path: /home/hr/mememe/天大模型/PaddleYOLO-RKNN/data/wanmo_seg_lower_416x160
+train: images/train
+val: images/val
+
+names:
+  0: object

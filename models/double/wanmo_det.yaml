@@ -1,0 +1,18 @@
+path: /home/hr/mememe/天大模型/PaddleYOLO-RKNN/data/wanmo_det
+train: images/train
+val: images/val
+
+names:
+  0: door
+  1: start
+  2: car
+  3: coin
+  4: person
+  5: stone
+  6: sign
+  7: limit_sign
+  8: zebra_crossing
+  9: traffic_light_red
+  10: traffic_light_green
+  11: traffic_light_yellow
+  12: stop

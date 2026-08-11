@@ -249,6 +249,8 @@ class DebugLogger:
                 value = float(value)
                 if name.endswith("_fps"):
                     parts.append(f"{name}={value:.1f}")
+                elif name.endswith("_count"):
+                    parts.append(f"{name}={value:.0f}")
                 else:
                     parts.append(f"{name}={value * 1000.0:.1f}ms")
             print(f"{label} " + " ".join(parts), flush=True)

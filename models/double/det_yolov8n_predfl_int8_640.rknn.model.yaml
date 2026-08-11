@@ -1,0 +1,45 @@
+schema_version: 1
+model_file: det_yolov8n_predfl_int8_640.rknn
+model_sha256: 286d6c1210f8a18274ea7f7322cd7307f7813aad3a7ab2a2994b480e032b05ff
+contract_onnx_sha256: b6dc4bc76c0a4ec74f393e094d4c2bda8622894a63844958f5848a50612f472d
+input_shape:
+- 640
+- 640
+color: rgb
+resize_mode: letterbox
+pad_value: 114
+scaleup: false
+tensor_encoding:
+  logical_dtype: uint8
+  logical_layout: hwc
+  backend_binding: query_model_attributes
+normalization: divide_by_255
+output_route: predfl
+output_shapes:
+- - 1
+  - 64
+  - 8400
+- - 1
+  - 13
+  - 8400
+task: detect
+head_strides:
+- 8
+- 16
+- 32
+anchor_count: 8400
+reg_max: 16
+class_names:
+- door
+- start
+- car
+- coin
+- person
+- stone
+- sign
+- limit_sign
+- zebra_crossing
+- traffic_light_red
+- traffic_light_green
+- traffic_light_yellow
+- stop

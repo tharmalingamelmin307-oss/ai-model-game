@@ -23,6 +23,17 @@ import config
 from modules.debug_tools import SegDebugOverlay, SegProfileLogger, draw_seg_status_text
 from modules.path_controller import PathController
 try:
+    from modules.cpp_seg_worker import CppSegWorker
+except ImportError:
+    CppSegWorker = None
+from utils.yolo_rknn_post import (
+    assemble_seg_masks,
+    class_aware_nms,
+    decode_dfl_boxes,
+    score_sum_candidates,
+    sigmoid,
+)
+try:
     from utils.rknn_quiet import suppress_rknn_init_output
 except ImportError:
     from contextlib import nullcontext as suppress_rknn_init_output
@@ -30,11 +41,21 @@ except ImportError:
 class RoadSegmentor:
     def __init__(self, core_id):
         """初始化分割模型与分割空间坐标映射."""
-        with suppress_rknn_init_output():
-            self.rknn = RKNNLite()
+        self.cpp_seg_worker = None
+        self.rknn = None
+        if bool(getattr(config, "CPP_SEG_ENABLED", False)) and CppSegWorker is not None:
+            try:
+                self.cpp_seg_worker = CppSegWorker(core_id)
+                print(f"Seg C++ worker enabled: core={core_id}", flush=True)
+            except Exception as exc:
+                print(f"Seg C++ worker unavailable, fallback to Python RKNN: {exc}", flush=True)
 
-            if self.rknn.load_rknn(config.SEG_MODEL) != 0 or self.rknn.init_runtime(core_mask=core_id) != 0:
-                raise RuntimeError("Seg 模型加载或初始化失败")
+        if self.cpp_seg_worker is None:
+            with suppress_rknn_init_output():
+                self.rknn = RKNNLite()
+
+                if self.rknn.load_rknn(config.SEG_MODEL) != 0 or self.rknn.init_runtime(core_mask=core_id) != 0:
+                    raise RuntimeError("Seg 模型加载或初始化失败")
             
         w_seg, h_seg = config.SEG_SIZE
         target_w, target_h = config.TARGET_RES
@@ -104,6 +125,112 @@ class RoadSegmentor:
         self.debug_overlay = SegDebugOverlay(tuple(config.SEG_SIZE))
         self.seg_profile_logger = SegProfileLogger()
         self.last_control_c_debug_log_at = 0.0
+        self.seg_output_route = str(getattr(config, "SEG_OUTPUT_ROUTE", "seg_predfl")).lower()
+        self.seg_strides = tuple(getattr(config, "SEG_HEAD_STRIDES", (8, 16, 32)))
+        self.seg_reg_max = int(getattr(config, "SEG_REG_MAX", 16))
+        self.last_infer_timing = {"rknn": 0.0, "decode": 0.0, "total": 0.0}
+
+    def _empty_seg_mask(self):
+        w_seg, h_seg = config.SEG_SIZE
+        return np.zeros((h_seg, w_seg), dtype=np.uint8)
+
+    def _apply_mask_ignore_border(self, mask):
+        """把上下边框行强制置黑，防止边界 trace 爬到 ROI 边缘。"""
+        if mask is None or mask.size == 0:
+            return mask
+        ignore_top_rows = max(0, int(getattr(config, "SEG_MASK_IGNORE_TOP_ROWS", 0)))
+        ignore_bottom_rows = max(0, int(getattr(config, "SEG_MASK_IGNORE_BOTTOM_ROWS", 0)))
+        if ignore_top_rows <= 0 and ignore_bottom_rows <= 0:
+            return mask
+        out = mask
+        if ignore_top_rows > 0:
+            out[:min(ignore_top_rows, out.shape[0]), :] = 0
+        if ignore_bottom_rows > 0:
+            start_y = max(0, out.shape[0] - ignore_bottom_rows)
+            out[start_y:, :] = 0
+        return out
+
+    def _decode_seg_predfl_mask(self, outputs):
+        """Decode YOLOv8-Seg seg_predfl outputs into one binary road mask."""
+        if outputs is None or len(outputs) != 5:
+            shapes = [] if outputs is None else [np.asarray(out).shape for out in outputs]
+            raise RuntimeError(f"Unexpected seg_predfl output count/shapes: {shapes}")
+
+        raw_dfl = np.asarray(outputs[0])
+        cls_logits = np.asarray(outputs[1], dtype=np.float32)
+        mask_coeff = np.asarray(outputs[2], dtype=np.float32)
+        proto = np.asarray(outputs[3], dtype=np.float32)
+        score_sum = np.asarray(outputs[4], dtype=np.float32)
+
+        if cls_logits.ndim != 3 or cls_logits.shape[0] != 1:
+            raise RuntimeError(f"Unexpected seg class shape: {cls_logits.shape}")
+        if mask_coeff.ndim != 3 or mask_coeff.shape[0] != 1:
+            raise RuntimeError(f"Unexpected seg coeff shape: {mask_coeff.shape}")
+        if proto.ndim != 4 or proto.shape[0] != 1:
+            raise RuntimeError(f"Unexpected seg proto shape: {proto.shape}")
+
+        anchors_n = cls_logits.shape[2]
+        if mask_coeff.shape[2] != anchors_n:
+            raise RuntimeError(f"Seg coeff anchors mismatch: cls={cls_logits.shape}, coeff={mask_coeff.shape}")
+
+        conf_thres = float(getattr(config, "SEG_CONF_THRES", 0.25))
+        candidate_idx = score_sum_candidates(score_sum, conf_thres)
+        if candidate_idx.size == 0:
+            return self._empty_seg_mask()
+
+        logits = np.clip(cls_logits[0][:, candidate_idx].astype(np.float32), -88.0, 88.0)
+        scores_all = sigmoid(logits)
+        class_ids = np.argmax(scores_all, axis=0).astype(np.int32)
+        scores = scores_all[class_ids, np.arange(scores_all.shape[1])].astype(np.float32)
+
+        keep = scores >= conf_thres
+        if not np.any(keep):
+            return self._empty_seg_mask()
+
+        candidate_idx = candidate_idx[keep]
+        class_ids = class_ids[keep]
+        scores = scores[keep]
+
+        topk = int(getattr(config, "SEG_PRE_NMS_TOPK", 16))
+        if topk > 0 and candidate_idx.size > topk:
+            selected = np.argsort(-scores, kind="stable")[:topk]
+            candidate_idx = candidate_idx[selected]
+            class_ids = class_ids[selected]
+            scores = scores[selected]
+
+        boxes = decode_dfl_boxes(
+            raw_dfl,
+            config.SEG_SIZE,
+            self.seg_strides,
+            reg_max=self.seg_reg_max,
+            candidate_idx=candidate_idx,
+        )
+        coeffs = mask_coeff[0][:, candidate_idx].T.astype(np.float32)
+
+        max_dets = int(getattr(config, "SEG_MAX_DETS", 8))
+        keep_nms = class_aware_nms(
+            boxes,
+            scores,
+            class_ids,
+            max_det=max_dets,
+            iou_threshold=float(getattr(config, "SEG_NMS_THRES", 0.70)),
+        )
+        if keep_nms.size == 0:
+            return self._empty_seg_mask()
+
+        seg_result = {
+            "boxes": boxes[keep_nms],
+            "coeffs": coeffs[keep_nms],
+            "proto": proto[0],
+        }
+        masks = assemble_seg_masks(
+            seg_result,
+            config.SEG_SIZE,
+            mask_threshold=float(getattr(config, "SEG_MASK_THRES", 0.5)),
+        )
+        if masks.shape[0] == 0:
+            return self._empty_seg_mask()
+        return (np.any(masks > 0, axis=0)).astype(np.uint8)
 
     def _log_control_c_debug(self, steer_signal, servo_pwm, car_active=False):
         """低频打印 C 控制内部量，便于试车后反推小弯/大弯参数."""
@@ -161,6 +288,7 @@ class RoadSegmentor:
         cycle_id = int(debug.get("cycle_id", self.car_avoidance_cycle_id))
         detected = int(debug.get("detected_cars", 0))
         boundary_strength = float(debug.get("boundary_strength_x", 0.0))
+        side_ready = bool(debug.get("boundary_side_ready", False))
         signature = (
             state,
             event,
@@ -170,6 +298,7 @@ class RoadSegmentor:
             int(debug.get("clear_frames", 0)),
             bool(debug.get("boundary_path_active", False)),
             str(debug.get("boundary_side", "") or ""),
+            int(side_ready),
             round(boundary_strength, 1),
         )
 
@@ -195,6 +324,8 @@ class RoadSegmentor:
         boundary_error_text = "无" if boundary_error is None else f"{float(boundary_error):.1f}"
         control_error = debug.get("control_path_error")
         control_error_text = "无" if control_error is None else f"{float(control_error):.1f}"
+        control_error_offset = float(debug.get("control_error_offset_x", 0.0))
+        side_ready_text = "1" if side_ready else "0"
         stage_label = "避车过程"
         stage_note = ""
         line_suffix = ""
@@ -215,7 +346,9 @@ class RoadSegmentor:
             f"state={state} det={detected} locked={int(bool(debug.get('locked_confirmed', False)))} "
             f"hits={int(debug.get('locked_hit_frames', 0))} miss={int(debug.get('miss_frames', 0))} "
             f"clear={int(debug.get('clear_frames', 0))} rows={rows_text} center={center_text} "
-            f"inset={float(debug.get('boundary_inset_x', 0.0)):.1f} weight={float(debug.get('avoid_weight', 0.0)):.2f} "
+            f"inset={float(debug.get('boundary_inset_x', 0.0)):.1f} side_ready={side_ready_text} "
+            f"ctrl_off={control_error_offset:.1f} "
+            f"weight={float(debug.get('avoid_weight', 0.0)):.2f} "
             f"path={int(bool(debug.get('boundary_path_active', False)))} ready={int(bool(debug.get('boundary_ready', False)))} "
             f"active={int(active)} "
             f"side={boundary_side} nearest={nearest_side} boundary_x={boundary_x_text} "
@@ -1250,10 +1383,14 @@ class RoadSegmentor:
         no_edge_bottom = int(np.clip(int(getattr(config, "MERGE_STATE_EXIT_NO_EDGE_Y_BOTTOM", 150)), 0, h - 1))
         if no_edge_bottom < no_edge_top:
             no_edge_top, no_edge_bottom = no_edge_bottom, no_edge_top
+        max_touch_rows = max(0, int(getattr(config, "MERGE_STATE_EXIT_NO_EDGE_MAX_TOUCH_ROWS", 0)))
+        touch_rows = 0
         for y in range(no_edge_top, no_edge_bottom + 1):
             row = search_mask[y]
             if row[0] > 0 or row[-1] > 0:
-                return False
+                touch_rows += 1
+                if touch_rows > max_touch_rows:
+                    return False
         return True
 
     def _update_merge_state(self, merge_detect_info, search_mask):
@@ -2227,7 +2364,7 @@ class RoadSegmentor:
         """避车时把右边线本身当作控制中线。"""
         return self._build_car_boundary_path(base_path, right_boundary, 0.0, w_seg)
 
-    def _car_control_path_error_for_debug(self, path_points, w_seg):
+    def _car_control_path_error_for_debug(self, path_points, w_seg, center_bias_x=0.0):
         """返回避车参考线在 Stanley 前视行上的实际控制误差."""
         path_x = self._path_x_at_y_points(
             path_points,
@@ -2235,7 +2372,7 @@ class RoadSegmentor:
         )
         if path_x is None:
             return None
-        return float(path_x) - float(w_seg) * 0.5
+        return float(path_x) - (float(w_seg) * 0.5 + float(center_bias_x))
 
     def _boundary_x_at_y(self, boundary_points, y):
         """按 y 在左右边界点上插值得到边界 x."""
@@ -2581,6 +2718,8 @@ class RoadSegmentor:
             "blocked_y_range": None,
             "boundary_inset_x": 0.0,
             "boundary_strength_x": 0.0,
+            "control_error_offset_x": 0.0,
+            "boundary_side_ready": False,
             "boundary_path_active": False,
             "boundary_ready": False,
             "boundary_side": self.car_avoidance_boundary_side,
@@ -2657,6 +2796,14 @@ class RoadSegmentor:
                 return self._build_car_right_boundary_path(base, right_boundary, inset_value, w_seg)
             return base, False
 
+        def _car_control_error_offset_for_side(boundary_side):
+            offset = max(0.0, float(getattr(config, "CAR_AVOIDANCE_CONTROL_ERROR_OFFSET_X", 0.0)))
+            if boundary_side == "left":
+                return -offset
+            if boundary_side == "right":
+                return offset
+            return 0.0
+
         if not bool(state_updates_enabled):
             debug["cycle_id"] = int(self.car_avoidance_cycle_id)
             debug["state"] = self.car_avoidance_state
@@ -2715,7 +2862,9 @@ class RoadSegmentor:
                 debug["clear_frames"] = 0
                 debug["miss_frames"] = int(self.locked_car_miss_frames)
                 debug["boundary_inset_x"] = 0.0
+                debug["control_error_offset_x"] = 0.0
                 debug["boundary_strength_x"] = 0.0
+                debug["boundary_side_ready"] = False
                 debug["boundary_path_active"] = False
                 debug["boundary_ready"] = False
                 debug["avoid_weight"] = 0.0
@@ -2730,14 +2879,25 @@ class RoadSegmentor:
             debug["clear_frames"] = int(self.car_clearing_frames)
             debug["miss_frames"] = int(self.locked_car_miss_frames)
             debug["boundary_inset_x"] = float(self.car_last_boundary_inset_x)
-            debug["boundary_strength_x"] = float(self.car_last_boundary_inset_x) * float(avoid_weight)
+            debug["control_error_offset_x"] = (
+                float(_car_control_error_offset_for_side(self.car_avoidance_boundary_side)) *
+                float(avoid_weight)
+            )
+            debug["boundary_strength_x"] = (
+                abs(float(self.car_last_boundary_inset_x)) +
+                abs(float(_car_control_error_offset_for_side(self.car_avoidance_boundary_side)))
+            ) * float(avoid_weight)
             debug["boundary_side"] = self.car_avoidance_boundary_side or ""
             debug["boundary_path_active"] = bool(current_path_ok)
             debug["boundary_ready"] = bool(current_path_ok)
             debug["avoid_weight"] = float(avoid_weight)
             debug["active"] = True
             debug["event"] = "clearing"
-            debug["control_path_error"] = self._car_control_path_error_for_debug(clearing_path, w_seg)
+            debug["control_path_error"] = self._car_control_path_error_for_debug(
+                clearing_path,
+                w_seg,
+                center_bias_x=-float(debug["control_error_offset_x"]),
+            )
             self._log_car_avoidance_process(debug, "clearing")
             return (
                 float(debug["boundary_strength_x"]),
@@ -2768,6 +2928,7 @@ class RoadSegmentor:
                 debug["clear_frames"] = 0
                 debug["miss_frames"] = 0
                 debug["boundary_path_active"] = False
+                debug["boundary_side_ready"] = False
                 debug["boundary_ready"] = False
                 debug["avoid_weight"] = 0.0
                 debug["boundary_side"] = ""
@@ -2803,6 +2964,40 @@ class RoadSegmentor:
         debug["locked_hit_frames"] = int(locked_car.get("hit_frames", 0))
         debug["locked_center"] = (float(_smooth_cx), float(smooth_cy))
 
+        side_decision_rows = max(0.0, float(getattr(
+            config,
+            "CAR_AVOIDANCE_SIDE_DECISION_MIN_BOTTOM_Y",
+            float(getattr(config, "CAR_AVOIDANCE_SWITCH_MIN_BOTTOM_Y", 160.0)),
+        )))
+        side_cache_ready = self.car_avoidance_boundary_side in ("left", "right")
+        side_decision_ready = rows_to_car <= side_decision_rows
+        debug["boundary_side_ready"] = bool(side_decision_ready or side_cache_ready)
+        resolved_side = None
+        boundary_x = None
+        boundary_error = None
+        nearest_side = None
+        side_source = ""
+        side_confidence = 0.0
+        if debug["boundary_side_ready"]:
+            resolved_side, boundary_x, boundary_error, nearest_side, side_source, side_confidence = self._select_car_avoidance_boundary_side(
+                locked_car,
+                left_boundary,
+                right_boundary,
+            )
+            if self.car_avoidance_boundary_side not in ("left", "right"):
+                self.car_avoidance_boundary_side = resolved_side
+            selected_side = self.car_avoidance_boundary_side if self.car_avoidance_boundary_side in ("left", "right") else resolved_side
+            if selected_side != resolved_side:
+                boundary_x = right_boundary_x if selected_side == "right" else left_boundary_x
+                boundary_error = None if boundary_x is None else float(boundary_x) - target_x
+            debug["boundary_side"] = selected_side
+            debug["control_error_offset_x"] = float(_car_control_error_offset_for_side(selected_side))
+            debug["boundary_x"] = None if boundary_x is None else float(boundary_x)
+            debug["boundary_error"] = None if boundary_error is None else float(boundary_error)
+            debug["nearest_boundary_side"] = nearest_side
+            debug["side_source"] = side_source
+            debug["side_confidence"] = float(side_confidence)
+
         inset, y_range, boundary_ready, not_ready_event, road_width = self._car_avoidance_boundary_inset(
             locked_car,
             base,
@@ -2821,32 +3016,35 @@ class RoadSegmentor:
                 self.car_last_avoid_path_is_boundary = False
                 self.car_last_boundary_inset_x = 0.0
                 self.car_avoidance_boundary_side = None
+                debug["boundary_side_ready"] = False
             debug["state"] = self.car_avoidance_state
             debug["clear_frames"] = int(self.car_clearing_frames)
             debug["event"] = not_ready_event or "locked_not_ready"
             self._log_car_avoidance_process(debug, debug["event"], force=prev_state == "AVOIDING")
             return 0.0, debug, None
 
-        resolved_side, boundary_x, boundary_error, nearest_side, side_source, side_confidence = self._select_car_avoidance_boundary_side(
-            locked_car,
-            left_boundary,
-            right_boundary,
-        )
-        if self.car_avoidance_boundary_side not in ("left", "right"):
-            self.car_avoidance_boundary_side = resolved_side
-        selected_side = self.car_avoidance_boundary_side if self.car_avoidance_boundary_side in ("left", "right") else resolved_side
-        if selected_side != resolved_side:
-            boundary_x = right_boundary_x if selected_side == "right" else left_boundary_x
-            boundary_error = None if boundary_x is None else float(boundary_x) - target_x
-        debug["boundary_side"] = selected_side
-        debug["boundary_x"] = None if boundary_x is None else float(boundary_x)
-        debug["boundary_error"] = None if boundary_error is None else float(boundary_error)
-        debug["nearest_boundary_side"] = nearest_side
-        debug["side_source"] = side_source
-        debug["side_confidence"] = float(side_confidence)
-
         if y_range is not None:
             debug["blocked_y_range"] = (float(y_range[0]), float(y_range[1]))
+        if resolved_side is None:
+            resolved_side, boundary_x, boundary_error, nearest_side, side_source, side_confidence = self._select_car_avoidance_boundary_side(
+                locked_car,
+                left_boundary,
+                right_boundary,
+            )
+            if self.car_avoidance_boundary_side not in ("left", "right"):
+                self.car_avoidance_boundary_side = resolved_side
+            selected_side = self.car_avoidance_boundary_side if self.car_avoidance_boundary_side in ("left", "right") else resolved_side
+            if selected_side != resolved_side:
+                boundary_x = right_boundary_x if selected_side == "right" else left_boundary_x
+                boundary_error = None if boundary_x is None else float(boundary_x) - target_x
+            debug["boundary_side"] = selected_side
+            debug["control_error_offset_x"] = float(_car_control_error_offset_for_side(selected_side))
+            debug["boundary_x"] = None if boundary_x is None else float(boundary_x)
+            debug["boundary_error"] = None if boundary_error is None else float(boundary_error)
+            debug["nearest_boundary_side"] = nearest_side
+            debug["side_source"] = side_source
+            debug["side_confidence"] = float(side_confidence)
+        selected_side = self.car_avoidance_boundary_side if self.car_avoidance_boundary_side in ("left", "right") else resolved_side
         avoid_path, path_ok = _build_avoid_path_for_side(selected_side, inset)
         if prev_state != "AVOIDING":
             self.car_avoidance_cycle_id += 1
@@ -2858,12 +3056,20 @@ class RoadSegmentor:
         debug["state"] = self.car_avoidance_state
         debug["clear_frames"] = 0
         debug["boundary_inset_x"] = float(inset)
-        debug["boundary_strength_x"] = float(inset)
+        debug["control_error_offset_x"] = float(_car_control_error_offset_for_side(selected_side))
+        debug["boundary_strength_x"] = abs(float(inset)) + abs(float(debug["control_error_offset_x"]))
         debug["avoid_weight"] = 1.0
         debug["boundary_ready"] = bool(boundary_ready)
         debug["boundary_side"] = selected_side
         debug["boundary_path_active"] = bool(path_ok)
-        debug["control_path_error"] = self._car_control_path_error_for_debug(avoid_path, w_seg) if path_ok else None
+        debug["control_path_error"] = (
+            self._car_control_path_error_for_debug(
+                avoid_path,
+                w_seg,
+                center_bias_x=-float(debug["control_error_offset_x"]),
+            )
+            if path_ok else None
+        )
         debug["active"] = True
         debug["event"] = "enter_avoiding" if prev_state != "AVOIDING" else "avoiding"
         debug["cycle_id"] = int(self.car_avoidance_cycle_id)
@@ -2873,17 +3079,38 @@ class RoadSegmentor:
 
     def infer_mask(self, blob_rgb_320):
         """只执行分割模型推理，返回二值 mask 和推理耗时."""
+        if self.cpp_seg_worker is not None:
+            mask, total_s = self.cpp_seg_worker.run(blob_rgb_320)
+            timing = self.cpp_seg_worker.last_timing
+            self.last_infer_timing = {
+                "rknn": float(timing.get("rknn", 0.0)),
+                "decode": float(timing.get("decode", 0.0)),
+                "total": float(timing.get("total", total_s)),
+                "candidates": int(timing.get("candidates", 0)),
+                "kept": int(timing.get("kept", 0)),
+            }
+            return mask, total_s
+
         t_infer_start = time.perf_counter()
         outputs = self.rknn.inference(inputs=[np.expand_dims(blob_rgb_320, axis=0)])
-        out = outputs[0]
-        t_infer_end = time.perf_counter()
+        t_rknn_end = time.perf_counter()
 
-        if len(out.shape) == 4 and out.shape[1] > 1:
-            mask = (out[0][1] > out[0][0]).astype(np.uint8)
+        if self.seg_output_route == "seg_predfl":
+            mask = self._decode_seg_predfl_mask(outputs)
         else:
-            mask = out.squeeze().astype(np.uint8)
+            out = outputs[0]
+            if len(out.shape) == 4 and out.shape[1] > 1:
+                mask = (out[0][1] > out[0][0]).astype(np.uint8)
+            else:
+                mask = out.squeeze().astype(np.uint8)
+        t_decode_end = time.perf_counter()
 
-        return (mask > 0).astype(np.uint8), t_infer_end - t_infer_start
+        self.last_infer_timing = {
+            "rknn": t_rknn_end - t_infer_start,
+            "decode": t_decode_end - t_rknn_end,
+            "total": t_decode_end - t_infer_start,
+        }
+        return (mask > 0).astype(np.uint8), t_decode_end - t_infer_start
 
     def postprocess_mask(
         self,
@@ -2900,6 +3127,7 @@ class RoadSegmentor:
         external_boundary_side="left",
         sign_route_pending=False,
         debug_drive_active=True,
+        render_enabled=True,
     ):
         """对已推理出的 mask 做路径规划、控制器调用和调试渲染.
 
@@ -2923,6 +3151,7 @@ class RoadSegmentor:
         blob = blob_rgb_320
         ai_view = cv2.cvtColor(blob, cv2.COLOR_RGB2BGR)
         mask = (mask > 0).astype(np.uint8)
+        mask = self._apply_mask_ignore_border(mask)
 
         # 投影 YOLO 框到分割面
         t_preprocess_start = time.perf_counter()
@@ -2936,6 +3165,7 @@ class RoadSegmentor:
         steer_signal = 0.0
         pts_final_orig = None
         search_mask = self._prepare_search_mask(mask)
+        search_mask = self._apply_mask_ignore_border(search_mask)
         search_edge_mask = self._extract_edge_mask(search_mask)
         merge_detect_info = None
         if not self.merge_state_active:
@@ -2966,6 +3196,7 @@ class RoadSegmentor:
                 search_mask,
                 merge_guide_info.get("guide_polyline"),
             )
+            search_mask = self._apply_mask_ignore_border(search_mask)
             search_edge_mask = self._extract_edge_mask(search_mask)
             y_fork_info = {"active": False, "fork_point": None, "split_rows": 0}
         else:
@@ -3327,11 +3558,22 @@ class RoadSegmentor:
                 if control_mode == "stanley_band" else
                 None
             )
+            car_control_error_offset_x = 0.0
+            if (
+                car_boundary_path_active and
+                avoid_path_source == "car" and
+                car_path_debug is not None
+            ):
+                car_control_error_offset_x = float(car_path_debug.get("control_error_offset_x", 0.0))
+            control_center_bias_x = (
+                float(getattr(config, "CONTROL_CENTER_BIAS_X", 0.0)) -
+                float(car_control_error_offset_x)
+            )
             steer_signal = self.path_controller.compute_steer_signal(
                 control_path_points,
                 w_seg,
                 h_seg,
-                center_bias_x=float(getattr(config, "CONTROL_CENTER_BIAS_X", 0.0)),
+                center_bias_x=control_center_bias_x,
                 lateral_points=lateral_control_points,
                 param_overrides=control_param_overrides,
             )
@@ -3426,6 +3668,8 @@ class RoadSegmentor:
             "car_left_boundary_x": float(car_path_debug.get("left_boundary_x", 0.0)) if car_path_debug is not None and car_path_debug.get("left_boundary_x") is not None else None,
             "car_control_path_error": float(car_path_debug.get("control_path_error", 0.0)) if car_path_debug is not None and car_path_debug.get("control_path_error") is not None else None,
             "car_boundary_inset_x": float(car_path_debug.get("boundary_inset_x", 0.0)) if car_path_debug is not None else 0.0,
+            "car_control_error_offset_x": float(car_control_error_offset_x) if 'car_control_error_offset_x' in locals() else 0.0,
+            "car_boundary_side_ready": bool(car_path_debug.get("boundary_side_ready", False)) if car_path_debug is not None else False,
             "car_detected_cars": int(car_path_debug.get("detected_cars", 0)) if car_path_debug is not None else 0,
             "car_locked_confirmed": bool(car_path_debug.get("locked_confirmed", False)) if car_path_debug is not None else False,
             "car_locked_hit_frames": int(car_path_debug.get("locked_hit_frames", 0)) if car_path_debug is not None else 0,
@@ -3462,7 +3706,9 @@ class RoadSegmentor:
         # 5. 调试渲染
         # -------------------------------------------------------------------
         t_render_start = time.perf_counter()
-        if preview_frame is not None:
+        if not bool(render_enabled):
+            ai_view = None
+        elif preview_frame is not None:
             target_w, target_h = config.TARGET_RES
             if preview_frame.shape[1] != target_w or preview_frame.shape[0] != target_h:
                 ai_view = cv2.resize(preview_frame, config.TARGET_RES, interpolation=cv2.INTER_LINEAR)
@@ -3513,13 +3759,14 @@ class RoadSegmentor:
             servo_pwm,
             car_active=bool(car_active) if 'car_active' in locals() else False,
         )
-        draw_seg_status_text(
-            ai_view,
-            fps_stats=fps_stats,
-            steer_signal=steer_signal,
-            servo_pwm=servo_pwm,
-            branch_stats=self.last_branch_stats,
-        )
+        if ai_view is not None:
+            draw_seg_status_text(
+                ai_view,
+                fps_stats=fps_stats,
+                steer_signal=steer_signal,
+                servo_pwm=servo_pwm,
+                branch_stats=self.last_branch_stats,
+            )
         t_render_end = time.perf_counter()
         preprocess_s = t_preprocess_end - t_preprocess_start
         search_s = t_search_end - t_search_start
