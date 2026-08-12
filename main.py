@@ -1098,6 +1098,17 @@ def maybe_submit_sign_llm_job(state, frame_id, force=False):
         str(state.get("sign_route_state", "IDLE")) != "SIGN_STOP_COLLECT"
     ):
         return False
+    # OCR 任务是异步执行的。串口线程的采样计时可能先到，但此时
+    # OCR 仍在请求百度接口；不能把这次任务提前判成失败，否则稍后
+    # 返回的文字无法再进入样本，路线状态也会被错误地标记为已完成。
+    if force and bool(state.get("sign_llm_ocr_inflight", False)):
+        throttled_log(
+            "sign_llm_wait_ocr",
+            "语义路牌OCR仍在执行，暂不结束采样等待结果",
+            state=(int(state.get("sign_llm_frame_id", -1)),),
+            min_interval=0.5,
+        )
+        return False
     samples = list(state.get("sign_llm_samples", []))
     attempts = int(state.get("sign_llm_attempts", len(samples)))
     valid_samples = [sample for sample in samples if str(sample.get("text", "")).strip()]
@@ -1115,14 +1126,19 @@ def maybe_submit_sign_llm_job(state, frame_id, force=False):
             )
             throttled_log(
                 "sign_llm_collect_failed",
-                f"语义路牌OCR采样结束但没有有效样本，释放状态机: "
+                f"语义路牌OCR采样失败，保留待判定状态，下一块路牌重试: "
                 f"valid={len(valid_samples)} attempts={attempts} force={int(force)}",
                 state=(len(valid_samples), attempts, int(force)),
                 min_interval=0.0,
             )
             clear_sign_llm_state(state, keep_completed=False)
             state["sign_llm_error"] = reason
-            state["sign_route_pass_index"] = 3
+            # 第一次路牌判定失败不能直接标记为“第三圈已完成”。
+            # 否则下一次看到路牌会命中 llm_used/pass_index>=3 的忽略分支，
+            # 永远不会执行第二圈识别成功后的第三圈取反。
+            state["sign_route_pass_index"] = 1
+            state["sign_route_llm_used"] = False
+            state["sign_route_first_choice"] = 0
             reset_sign_route_state(state, next_state="WAIT_SIGN_GONE")
             return False
         else:
