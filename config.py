@@ -501,7 +501,7 @@ MERGE_GUIDE_LINE_Y_MAX = 160
 MERGE_GUIDE_LINE_MIN_GAP = 13.0
 # 汇合补线使用的固定宽度比例。
 # 1.0 保持原始宽度；偏宽时可调到 0.9/0.85/0.8。
-MERGE_BOUNDARY_WIDTH_RATIO = 0.9
+MERGE_BOUNDARY_WIDTH_RATIO = 0.80
 # 汇合 guide line 画入搜索 mask 时使用的线宽。
 MERGE_GUIDE_LINE_THICKNESS = 2
 # 汇合状态机：连续命中若干帧才进入补线；进入后等底部赛道宽度稳定恢复再退出。
@@ -1544,7 +1544,7 @@ CAR_AVOIDANCE_SWITCH_MIN_BOTTOM_Y = 160.0
 # 选左/右绕车的更早判断门槛；到这里就先把方向定下来，但仍然不切线。
 CAR_AVOIDANCE_SIDE_DECISION_MIN_BOTTOM_Y = 180.0
 # 避车控制中心偏差外加量。设 10 表示最终循线误差：巡左边界 -10，巡右边界 +10。
-CAR_AVOIDANCE_CONTROL_ERROR_OFFSET_X = 10.0
+CAR_AVOIDANCE_CONTROL_ERROR_OFFSET_X = 30.0
 # 在预览画面上画出避车切线距离线；车框底边低于蓝线才允许切线避车。
 CAR_AVOIDANCE_DISTANCE_LINE_ENABLED = True
 CAR_AVOIDANCE_DISTANCE_LINE_COLOR = (255, 0, 0)

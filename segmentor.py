@@ -1373,17 +1373,8 @@ class RoadSegmentor:
         h, _ = search_mask.shape[:2]
         rows_need = max(1, int(getattr(config, "MERGE_STATE_EXIT_BOTTOM_ROWS", 5)))
         width_thresh = float(getattr(config, "MERGE_STATE_EXIT_WIDTH_THRESH", 340.0))
-        # SEG_MASK_IGNORE_BOTTOM_ROWS 会把图像最底部几行强制置黑。
-        # 退出检查不能再把这些黑边当成“没有赛道”，否则这里会永远失败。
-        ignored_bottom_rows = max(
-            0,
-            int(getattr(config, "SEG_MASK_IGNORE_BOTTOM_ROWS", 0)),
-        )
-        valid_bottom = max(0, h - min(ignored_bottom_rows, h))
-        start_y = max(0, valid_bottom - rows_need)
-        if valid_bottom <= start_y:
-            return False
-        for y in range(start_y, valid_bottom):
+        start_y = max(0, h - rows_need)
+        for y in range(start_y, h):
             xs = np.where(search_mask[y] > 0)[0]
             if len(xs) == 0:
                 return False
