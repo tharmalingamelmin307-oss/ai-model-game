@@ -21,6 +21,7 @@ import numpy as np
 import cv2
 import threading
 import serial
+from concurrent.futures import ThreadPoolExecutor
 from queue import Queue, Empty
 from multiprocessing import Process, Queue as MPQueue, shared_memory, resource_tracker
 from flask import Flask, Response, render_template_string, request
@@ -713,6 +714,93 @@ def rect_area(rect):
     return float(max(0, rect[2]) * max(0, rect[3]))
 
 
+def rect_center_distance(a, b):
+    """返回两个 [x,y,w,h] 框中心点距离."""
+    if a is None or b is None or len(a) != 4 or len(b) != 4:
+        return float("inf")
+    ax, ay = rect_center(a)
+    bx, by = rect_center(b)
+    return float(np.hypot(float(ax) - float(bx), float(ay) - float(by)))
+
+
+def rect_is_stable(prev_rect, current_rect):
+    """判断路牌框单帧变化是否足够小，可以认为车身已经稳定下来."""
+    if prev_rect is None or current_rect is None:
+        return False
+    if len(prev_rect) != 4 or len(current_rect) != 4:
+        return False
+
+    pos_tol = float(getattr(config, "SIGN_LLM_STABLE_POSITION_TOLERANCE", 12.0))
+    size_tol_ratio = float(getattr(config, "SIGN_LLM_STABLE_SIZE_TOLERANCE_RATIO", 0.15))
+    if rect_center_distance(prev_rect, current_rect) > pos_tol:
+        return False
+
+    prev_w = max(1.0, float(prev_rect[2]))
+    prev_h = max(1.0, float(prev_rect[3]))
+    cur_w = max(1.0, float(current_rect[2]))
+    cur_h = max(1.0, float(current_rect[3]))
+    return (
+        abs(cur_w - prev_w) / prev_w <= size_tol_ratio and
+        abs(cur_h - prev_h) / prev_h <= size_tol_ratio
+    )
+
+
+def best_matching_sign_rect(sign_rects, locked_rect):
+    """从当前帧 sign 框里找最接近锁定路牌的那个框."""
+    if not sign_rects:
+        return None
+    if locked_rect is None:
+        return list(sign_rects[0])
+    return list(min(sign_rects, key=lambda rect: rect_center_distance(rect, locked_rect)))
+
+
+def update_sign_llm_rect_stability(state, current_rect):
+    """停车后用连续稳定的路牌框判断车已基本停稳，才允许 OCR."""
+    if not (
+        sign_route_uses_llm() and
+        bool(state.get("sign_llm_stop_active", False)) and
+        bool(state.get("sign_llm_collecting", False)) and
+        str(state.get("sign_route_state", "IDLE")) == "SIGN_STOP_COLLECT"
+    ):
+        return False
+
+    need_frames = max(1, int(getattr(config, "SIGN_LLM_STABLE_FRAMES", 3)))
+    prev_rect = state.get("sign_llm_stable_rect")
+    if current_rect is None:
+        state["sign_llm_stable_frames"] = 0
+        state["sign_llm_stable_rect"] = None
+        state["sign_llm_ocr_ready"] = False
+        return False
+
+    stable_frames = int(state.get("sign_llm_stable_frames", 0))
+    if rect_is_stable(prev_rect, current_rect):
+        stable_frames += 1
+    else:
+        stable_frames = 1
+    state["sign_llm_stable_rect"] = list(current_rect)
+    state["sign_llm_stable_frames"] = stable_frames
+
+    ready = stable_frames >= need_frames
+    was_ready = bool(state.get("sign_llm_ocr_ready", False))
+    state["sign_llm_ocr_ready"] = ready
+    if ready and not was_ready:
+        state["sign_llm_started_at"] = time.monotonic()
+        throttled_log(
+            "sign_llm_stable_ready",
+            f"语义路牌框已稳定，开始OCR采样: stable={stable_frames}/{need_frames} rect={list(current_rect)}",
+            state=(stable_frames, tuple(int(float(v)) for v in current_rect)),
+            min_interval=0.0,
+        )
+    elif not ready:
+        throttled_log(
+            "sign_llm_wait_stable",
+            f"语义路牌停车等待框稳定: stable={stable_frames}/{need_frames} rect={list(current_rect)}",
+            state=(stable_frames, tuple(int(float(v)) for v in current_rect)),
+            min_interval=0.5,
+        )
+    return ready
+
+
 def clear_sign_llm_state(state, keep_completed=False):
     """清理语义路牌 LLM 状态；可选择保留本次路牌已处理标记."""
     state["sign_llm_stop_active"] = False
@@ -724,6 +812,9 @@ def clear_sign_llm_state(state, keep_completed=False):
     state["sign_llm_frame_id"] = -1
     state["sign_llm_ocr_inflight"] = False
     state["sign_llm_ocr_inflight_started_at"] = None
+    state["sign_llm_stable_rect"] = None
+    state["sign_llm_stable_frames"] = 0
+    state["sign_llm_ocr_ready"] = False
     state["sign_llm_error"] = ""
     if not keep_completed:
         state["sign_llm_completed_hold"] = False
@@ -743,6 +834,9 @@ def reset_sign_route_state(state, next_state="IDLE"):
     state["sign_route_api_submitted"] = False
     state["sign_llm_ocr_inflight"] = False
     state["sign_llm_ocr_inflight_started_at"] = None
+    state["sign_llm_stable_rect"] = None
+    state["sign_llm_stable_frames"] = 0
+    state["sign_llm_ocr_ready"] = False
     state["sign_llm_completed_hold"] = False
 
 
@@ -1111,16 +1205,26 @@ def maybe_submit_sign_llm_job(state, frame_id, force=False):
         return False
     samples = list(state.get("sign_llm_samples", []))
     attempts = int(state.get("sign_llm_attempts", len(samples)))
+    if force and not bool(state.get("sign_llm_ocr_ready", False)) and attempts <= 0:
+        throttled_log(
+            "sign_llm_wait_stable_timeout",
+            "语义路牌仍在等待停车稳定，暂不结束采样",
+            state=(int(state.get("sign_llm_frame_id", -1)),),
+            min_interval=0.5,
+        )
+        return False
     valid_samples = [sample for sample in samples if str(sample.get("text", "")).strip()]
     sample_need = max(1, int(getattr(config, "SIGN_LLM_OCR_SAMPLES", 10)))
-    min_valid = 1
+    min_valid = max(1, int(getattr(config, "SIGN_LLM_MIN_VALID_SAMPLES", min(3, sample_need))))
+    min_valid = min(min_valid, sample_need)
     enough_full = len(valid_samples) >= sample_need
-    enough_min = (attempts >= sample_need or force) and len(valid_samples) >= min_valid
-    ready = enough_full or enough_min
+    enough_min = attempts >= sample_need and len(valid_samples) >= min_valid
+    enough_timeout = force and len(valid_samples) >= 1
+    ready = enough_full or enough_min or enough_timeout
     if not ready:
         if attempts >= sample_need or force:
             reason = (
-                f"collect_timeout_not_enough_valid_samples:{len(valid_samples)}/{min_valid}"
+                f"collect_timeout_not_enough_valid_samples:{len(valid_samples)}/1"
                 if force else
                 f"not_enough_valid_samples:{len(valid_samples)}/{min_valid}"
             )
@@ -1208,9 +1312,9 @@ def mark_sign_ocr_done():
         global_control_data["sign_llm_ocr_inflight_started_at"] = None
 
 
-def create_ocr_recognizer():
-    """Create the configured OCR backend while keeping the worker interface stable."""
-    backend = str(getattr(config, "OCR_BACKEND", "local")).strip().lower()
+def create_ocr_recognizer(backend=None):
+    """Create an OCR backend while keeping the worker interface stable."""
+    backend = str(backend or getattr(config, "OCR_BACKEND", "local")).strip().lower()
     if backend in ("baidu", "baidu_api", "api", "cloud"):
         return BaiduOCRRecognizer(
             timeout=float(getattr(config, "BAIDU_OCR_TIMEOUT", 10.0)),
@@ -1220,6 +1324,74 @@ def create_ocr_recognizer():
     if backend in ("local", "rknn", "rknn_local"):
         return LocalOCRRecognizer(core_id=config.REC_CORE)
     raise RuntimeError(f"unsupported OCR_BACKEND: {backend}")
+
+
+def sign_ocr_backends():
+    """返回当前语义路牌采样要运行的 OCR 后端列表."""
+    if not bool(getattr(config, "OCR_DUAL_BACKEND_ENABLED", False)):
+        return [str(getattr(config, "OCR_BACKEND", "local")).strip().lower()]
+
+    backends = [
+        str(getattr(config, "OCR_LOCAL_BACKEND", "local")).strip().lower(),
+        str(getattr(config, "OCR_API_BACKEND", "baidu_api")).strip().lower(),
+    ]
+    unique = []
+    for backend in backends:
+        if backend and backend not in unique:
+            unique.append(backend)
+    return unique or [str(getattr(config, "OCR_BACKEND", "local")).strip().lower()]
+
+
+def backend_label(backend):
+    backend = str(backend or "").strip().lower()
+    if backend in ("baidu", "baidu_api", "api", "cloud"):
+        return "api"
+    if backend in ("local", "rknn", "rknn_local"):
+        return "local"
+    return backend or "unknown"
+
+
+def run_ocr_backend_once(backend, frame_data):
+    recognizer = None
+    label = backend_label(backend)
+    try:
+        recognizer = create_ocr_recognizer(backend)
+        results = recognizer.run_full_frame(frame_data)
+        return {
+            "backend": label,
+            "results": results or [],
+            "error": "",
+            "det_box_count": int(getattr(recognizer, "last_det_box_count", 0)),
+            "rec_empty_count": int(getattr(recognizer, "last_rec_empty_count", 0)),
+            "rec_exception_count": int(getattr(recognizer, "last_rec_exception_count", 0)),
+            "rec_valid_count": int(getattr(recognizer, "last_rec_valid_count", 0)),
+        }
+    except Exception as exc:
+        return {
+            "backend": label,
+            "results": [],
+            "error": str(exc),
+            "det_box_count": 0,
+            "rec_empty_count": 0,
+            "rec_exception_count": 0,
+            "rec_valid_count": 0,
+        }
+    finally:
+        if recognizer is not None:
+            try:
+                recognizer.close()
+            except Exception as exc:
+                log_once(f"ocr_release_error_{label}", f"OCR释放失败({label}): {exc}")
+
+
+def run_sign_ocr_backends(frame_data):
+    backends = sign_ocr_backends()
+    if len(backends) <= 1:
+        return [run_ocr_backend_once(backends[0], frame_data)]
+
+    with ThreadPoolExecutor(max_workers=len(backends)) as executor:
+        futures = [executor.submit(run_ocr_backend_once, backend, frame_data) for backend in backends]
+        return [future.result() for future in futures]
 
 
 def sign_llm_worker():
@@ -1434,6 +1606,7 @@ def yolo_worker(core_id=None, worker_id=0):
             # 只把通过门槛的 sign 送去 OCR，减少不必要的整图文字检测开销。
             sign_jobs = []
             pending_sign_jobs = []
+            visible_sign_rects = []
             route_trigger_rect = None
             route_skip_debug = None
             route_sign_gate_enabled = sign_route_uses_llm()
@@ -1444,6 +1617,8 @@ def yolo_worker(core_id=None, worker_id=0):
                 if cls_id != config.SIGN_CLASS_ID:
                     continue
                 rect = obj.get("rect", [0, 0, 0, 0])
+                if len(rect) == 4 and float(rect[2]) >= 2.0 and float(rect[3]) >= 2.0:
+                    visible_sign_rects.append(list(rect))
                 if route_sign_gate_enabled and route_trigger_rect is None:
                     if fork_point_trigger:
                         should_trigger = sign_rect_edge_safe(rect)
@@ -1540,6 +1715,9 @@ def yolo_worker(core_id=None, worker_id=0):
                             global_control_data["sign_llm_attempts"] = 0
                             global_control_data["sign_llm_ocr_inflight"] = False
                             global_control_data["sign_llm_ocr_inflight_started_at"] = None
+                            global_control_data["sign_llm_stable_rect"] = None
+                            global_control_data["sign_llm_stable_frames"] = 0
+                            global_control_data["sign_llm_ocr_ready"] = False
                             global_control_data["sign_llm_started_at"] = time.monotonic()
                             global_control_data["sign_llm_result"] = ""
                             global_control_data["sign_llm_error"] = ""
@@ -1556,10 +1734,17 @@ def yolo_worker(core_id=None, worker_id=0):
                     locked_rect = None
 
             if sign_llm_collecting_now:
-                if locked_rect is not None:
-                    sign_jobs.append((-1, config.SIGN_CLASS_ID, list(locked_rect)))
-                else:
-                    sign_jobs.extend(pending_sign_jobs)
+                current_sign_rect = best_matching_sign_rect(visible_sign_rects, locked_rect)
+                with data_lock:
+                    ocr_ready = update_sign_llm_rect_stability(global_control_data, current_sign_rect)
+                    locked_rect = global_control_data.get("sign_route_locked_rect")
+                if ocr_ready:
+                    if current_sign_rect is not None:
+                        sign_jobs.append((-1, config.SIGN_CLASS_ID, list(current_sign_rect)))
+                    elif locked_rect is not None:
+                        sign_jobs.append((-1, config.SIGN_CLASS_ID, list(locked_rect)))
+                    else:
+                        sign_jobs.extend(pending_sign_jobs)
 
             if sign_jobs:
                 if sign_llm_collecting_now:
@@ -1574,8 +1759,8 @@ def yolo_worker(core_id=None, worker_id=0):
                 job_names = tuple(class_name_from_id(cls_id) for _, cls_id, _ in sign_jobs)
                 throttled_log(
                     "ocr_enter",
-                    f"路牌达到识别条件: 数量={len(sign_jobs)} 类型={list(job_names)}",
-                    state=job_names,
+                    f"路牌停车稳定后开始OCR: 数量={len(sign_jobs)} 类型={list(job_names)} backends={sign_ocr_backends()}",
+                    state=(job_names, tuple(sign_ocr_backends())),
                     min_interval=config.LOG_INTERVAL_OCR_ENTER
                 )
                 # OCR 只保留较新的任务，过旧的任务直接丢掉。
@@ -1629,22 +1814,10 @@ def ocr_worker():
     - 同一帧里的多个 OCR 结果，会按“中心点最近”去匹配各个路牌框
     - 匹配结果回写时还会再核对 frame_id，避免旧帧 OCR 迟到污染新状态
     """
-    ocr = None
-
-    def close_ocr():
-        nonlocal ocr
-        if ocr is not None:
-            try:
-                ocr.close()
-            except Exception as e:
-                log_once("ocr_release_error", f"OCR释放失败: {e}")
-            ocr = None
-
     while True:
         try:
             job = ocr_queue.get()
             if job is None:
-                close_ocr()
                 break
 
             frame_data, sign_jobs, frame_id = job
@@ -1659,24 +1832,28 @@ def ocr_worker():
             ]
             if not sign_jobs:
                 mark_sign_ocr_done()
-                close_ocr()
                 continue
 
-            if ocr is None:
-                try:
-                    ocr = create_ocr_recognizer()
-                    log_once(
-                        "ocr_backend",
-                        f"OCR后端启动: {getattr(config, 'OCR_BACKEND', 'local')}",
-                    )
-                except Exception as e:
-                    log_once("ocr_init_error", f"OCR启动失败: {e}")
-                    mark_sign_ocr_done()
-                    continue
-
             updates = []
-            # 这里跑的是整图 OCR，再把结果按中心点回匹配给 sign_jobs。
-            ocr_results = ocr.run_full_frame(frame_data)
+            # 这里跑的是整图 OCR。语义路牌默认同时跑本地模型和 API，
+            # 再把两边结果合并后按中心点回匹配给 sign_jobs。
+            backend_outputs = run_sign_ocr_backends(frame_data)
+            ocr_results = []
+            for backend_output in backend_outputs:
+                backend_name = str(backend_output.get("backend", "unknown"))
+                error = str(backend_output.get("error", ""))
+                if error:
+                    throttled_log(
+                        f"ocr_backend_error_{backend_name}",
+                        f"OCR后端失败({backend_name}): {error}",
+                        state=(backend_name, error),
+                        min_interval=config.LOG_INTERVAL_OCR_RAW,
+                    )
+                for result in backend_output.get("results", []) or []:
+                    item = dict(result)
+                    item["backend"] = backend_name
+                    ocr_results.append(item)
+
             if not ocr_results:
                 with data_lock:
                     submitted = record_sign_llm_sample(
@@ -1696,22 +1873,12 @@ def ocr_worker():
                 throttled_log(
                     "ocr_no_results",
                     "OCR无有效文本: "
-                    f"det_boxes={getattr(ocr, 'last_det_box_count', 0)} "
-                    f"rec_empty={getattr(ocr, 'last_rec_empty_count', 0)} "
-                    f"rec_ex={getattr(ocr, 'last_rec_exception_count', 0)} "
-                    f"rec_valid={getattr(ocr, 'last_rec_valid_count', 0)} "
+                    f"backends={[(b.get('backend'), len(b.get('results', []) or []), b.get('error', '')) for b in backend_outputs]} "
                     f"jobs={len(sign_jobs)}",
-                    state=(
-                        getattr(ocr, "last_det_box_count", 0),
-                        getattr(ocr, "last_rec_empty_count", 0),
-                        getattr(ocr, "last_rec_exception_count", 0),
-                        getattr(ocr, "last_rec_valid_count", 0),
-                        len(sign_jobs),
-                    ),
+                    state=tuple((b.get("backend"), len(b.get("results", []) or []), str(b.get("error", ""))[:40]) for b in backend_outputs),
                     min_interval=config.LOG_INTERVAL_OCR_RAW
                 )
                 mark_sign_ocr_done()
-                close_ocr()
                 continue
 
             min_ocr_score = float(config.OCR_MIN_SCORE)
@@ -1844,7 +2011,6 @@ def ocr_worker():
                     min_interval=config.LOG_INTERVAL_OCR_RAW
                 )
                 mark_sign_ocr_done()
-                close_ocr()
                 continue
 
             # 回写时再做一次 class_id 检查，避免队列延迟导致“框已经换帧”的情况。
@@ -1913,11 +2079,9 @@ def ocr_worker():
                                     min_interval=config.LOG_INTERVAL_TURN_INTENT
                                 )
             mark_sign_ocr_done()
-            close_ocr()
 
         except Exception as e:
             mark_sign_ocr_done()
-            close_ocr()
             log_once("ocr_worker_error", f"OCR线程异常: {e}")
 
 # ==============================================================================

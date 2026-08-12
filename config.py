@@ -98,6 +98,11 @@ DICT_PATH = str(PROJECT_ROOT / "models/ocr/keys.txt")
 # - "baidu_api": 把内存中的整张 TARGET_RES 图发给百度云 OCR，释放板端 NPU 的 OCR 压力
 # - "local": 使用下面的 OCR RKNN det + rec 模型
 OCR_BACKEND = "baidu_api"
+# 语义路牌停车后，是否同时运行本地 OCR 和 API OCR。
+# True 时两条 OCR 并发执行；任一条失败仍保留另一条结果。
+OCR_DUAL_BACKEND_ENABLED = True
+OCR_LOCAL_BACKEND = "local"
+OCR_API_BACKEND = "baidu_api"
 
 # 百度 OCR API 请求参数。
 # 密钥从项目根目录 .env 读取:
@@ -225,16 +230,22 @@ SIGN_LLM_TRIGGER_AREA = 10000 #16000
 # 触发语义路牌停车采样的 sign 截止距离，单位是 TARGET_RES 像素。
 # 路牌框底边距离画面底部小于等于该值，才认为已经足够近，可以停车采样。
 # 调大：更早停车；调小：更靠近再停车。
-SIGN_LLM_TRIGGER_DIST = 540
+SIGN_LLM_TRIGGER_DIST = 500
 # 硬性停车采样条件：Y 岔路特征点距离分割平面底部小于等于该行数时，
 # 若当前帧有不贴边的 sign 框，立刻停车开始路牌 OCR/千帆，不再受 sign 面积/高度限制。
 # 单位是 SEG_SIZE 坐标系像素行。
 SIGN_LLM_FORK_POINT_TRIGGER_ROWS = 120
 # 停车后希望采集的有效 OCR 样本数量。
 # 收满后会提交给千帆；如果超时，则有几个有效样本就提交几个。
-SIGN_LLM_OCR_SAMPLES = 5
-# 兼容旧配置：当前主流程不再要求最少 3 个；只要有 1 个有效样本就能提交 API。
+SIGN_LLM_OCR_SAMPLES = 3
+# 正常提交给千帆的最少有效样本数；超时兜底时仍允许 1 个有效样本提交。
 SIGN_LLM_MIN_VALID_SAMPLES = 3
+# 路牌触发停车后，检测框连续稳定多少帧才开始 OCR。
+SIGN_LLM_STABLE_FRAMES = 3
+# 路牌框中心位置允许的单帧最大变化，单位是 TARGET_RES 像素。
+SIGN_LLM_STABLE_POSITION_TOLERANCE = 12.0
+# 路牌框宽高允许的单帧相对变化比例。
+SIGN_LLM_STABLE_SIZE_TOLERANCE_RATIO = 0.15
 # 停车采集 OCR 的最长等待时间，单位秒。
 # 到时后即使没收满样本，也会尝试 force 提交；0 个有效样本仍不会提交。
 SIGN_LLM_COLLECT_TIMEOUT = 3.0
@@ -637,8 +648,8 @@ BAUD_RATE = 115200
 # 当前并不是直接发电机 PWM，而是发一个速度档位：
 # - CONTROL_MIN_SPEED: 常规最低巡航速度
 # - CONTROL_MAX_SPEED: 直道或轻弯时允许的最高速度
-CONTROL_MIN_SPEED = 65
-CONTROL_MAX_SPEED = 65
+CONTROL_MIN_SPEED = 55
+CONTROL_MAX_SPEED = 55
 
 # 用单一转向控制量做动态降速时的增益。
 # 设为 0 表示关闭“打角越大就降速”的策略。
@@ -983,6 +994,9 @@ DEFAULT_CONTROL_DATA = {
     "sign_llm_frame_id": -1,
     "sign_llm_ocr_inflight": False,
     "sign_llm_ocr_inflight_started_at": None,
+    "sign_llm_stable_rect": None,
+    "sign_llm_stable_frames": 0,
+    "sign_llm_ocr_ready": False,
     "sign_llm_result": "",
     "sign_llm_error": "",
     "sign_route_state": "IDLE",
@@ -1508,7 +1522,7 @@ CAR_AVOIDANCE_STANLEY_HEADING_GAIN = 0.34
 CAR_AVOIDANCE_STANLEY_SPEED_ESTIMATE = CAR_AVOIDANCE_TARGET_SPEED
 
 # 3. 绕完两辆车并完成回正后高速巡线75
-POST_CAR_TARGET_SPEED = 65
+POST_CAR_TARGET_SPEED = 55
 POST_CAR_STANLEY_LATERAL_GAIN = 0.35
 POST_CAR_STANLEY_LATERAL_D_GAIN = 0.018
 POST_CAR_STANLEY_HEADING_GAIN = 0.34
