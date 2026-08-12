@@ -22,14 +22,18 @@
 #undef main
 
 #include <cerrno>
+#include <cmath>
+#include <fcntl.h>
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <unistd.h>
 
 namespace {
 
 constexpr std::uint32_t kReqMagic = 0x4E494753U;   // "SGIN"
 constexpr std::uint32_t kRespMagic = 0x554F4753U;  // "SGOU"
+int g_protocol_fd = STDOUT_FILENO;
 
 struct RequestHeader {
   std::uint32_t magic;
@@ -64,8 +68,39 @@ bool read_exact(std::istream &in, void *data, std::size_t bytes) {
 }
 
 bool write_exact(std::ostream &out, const void *data, std::size_t bytes) {
-  out.write(static_cast<const char *>(data), static_cast<std::streamsize>(bytes));
-  return static_cast<bool>(out);
+  (void)out;
+  const char *ptr = static_cast<const char *>(data);
+  std::size_t done = 0;
+  while (done < bytes) {
+    const ssize_t written = ::write(g_protocol_fd, ptr + done, bytes - done);
+    if (written > 0) {
+      done += static_cast<std::size_t>(written);
+      continue;
+    }
+    if (written < 0 && errno == EINTR) {
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
+
+bool isolate_runtime_stdout() {
+  const int protocol_fd = ::dup(STDOUT_FILENO);
+  if (protocol_fd < 0) {
+    return false;
+  }
+  const int devnull_fd = ::open("/dev/null", O_WRONLY);
+  if (devnull_fd < 0 || ::dup2(devnull_fd, STDOUT_FILENO) < 0) {
+    if (devnull_fd >= 0) {
+      ::close(devnull_fd);
+    }
+    ::close(protocol_fd);
+    return false;
+  }
+  ::close(devnull_fd);
+  g_protocol_fd = protocol_fd;
+  return true;
 }
 
 std::vector<std::uint8_t> read_file(const std::string &path) {
@@ -84,6 +119,207 @@ std::vector<std::uint8_t> read_file(const std::string &path) {
     throw std::runtime_error("failed to read model: " + path);
   }
   return data;
+}
+
+bool query_attrs(rknn_context ctx, rknn_input_output_num *io,
+                 rknn_tensor_attr *input_attr, rknn_tensor_attr *output_attr) {
+  if (ctx == 0 || io == nullptr || input_attr == nullptr || output_attr == nullptr) {
+    return false;
+  }
+  std::memset(io, 0, sizeof(*io));
+  if (rknn_query(ctx, RKNN_QUERY_IN_OUT_NUM, io, sizeof(*io)) != 0 ||
+      io->n_input != 1 || io->n_output != 1) {
+    return false;
+  }
+  std::memset(input_attr, 0, sizeof(*input_attr));
+  input_attr->index = 0;
+  if (rknn_query(ctx, RKNN_QUERY_INPUT_ATTR, input_attr, sizeof(*input_attr)) != 0) {
+    return false;
+  }
+  std::memset(output_attr, 0, sizeof(*output_attr));
+  output_attr->index = 0;
+  return rknn_query(ctx, RKNN_QUERY_OUTPUT_ATTR, output_attr, sizeof(*output_attr)) == 0;
+}
+
+bool prepare_argmax_input(const std::vector<std::uint8_t> &rgb, const rknn_tensor_attr &attr,
+                          std::vector<std::int8_t> *int8_data, std::vector<std::uint8_t> *u8_data,
+                          std::vector<float> *float_data, rknn_input *input) {
+  if (input == nullptr || attr.n_dims != 4 || attr.dims[0] != 1 ||
+      attr.dims[1] == 0 || attr.dims[2] == 0 || attr.dims[3] == 0) {
+    return false;
+  }
+  const int height = 160;
+  const int width = 416;
+  const int channels = 3;
+  if (rgb.size() != static_cast<std::size_t>(width * height * channels)) {
+    return false;
+  }
+
+  // segv6 的旧部署代码明确使用:
+  //   RGB uint8 -> 按 input scale/zp 量化 -> INT8 NHWC
+  // 即便逻辑输入属性查询为 NCHW，也保持这个运行时协议。
+  auto quantize = [&](std::uint8_t value) -> std::int8_t {
+    const float normalized = static_cast<float>(value) / 255.0f;
+    const float scale = attr.scale > 0.0f ? attr.scale : (1.0f / 128.0f);
+    const int quantized = static_cast<int>(std::lrint(normalized / scale + attr.zp));
+    return static_cast<std::int8_t>(std::clamp(quantized, -128, 127));
+  };
+  auto quantize_u8 = [&](std::uint8_t value) -> std::uint8_t {
+    const float normalized = static_cast<float>(value) / 255.0f;
+    const float scale = attr.scale > 0.0f ? attr.scale : (1.0f / 255.0f);
+    const int quantized = static_cast<int>(std::lrint(normalized / scale + attr.zp));
+    return static_cast<std::uint8_t>(std::clamp(quantized, 0, 255));
+  };
+  auto normalized = [&](std::uint8_t value) -> float {
+    return static_cast<float>(value) / 255.0f;
+  };
+
+  (void)u8_data;
+  (void)float_data;
+  int8_data->resize(rgb.size());
+  for (std::size_t i = 0; i < rgb.size(); ++i) {
+    (*int8_data)[i] = quantize(rgb[i]);
+  }
+  std::memset(input, 0, sizeof(*input));
+  input->index = 0;
+  input->type = RKNN_TENSOR_INT8;
+  input->fmt = RKNN_TENSOR_NHWC;
+  input->size = int8_data->size();
+  input->buf = int8_data->data();
+  return true;
+}
+
+std::size_t tensor_element_bytes(const rknn_tensor_type type) {
+  switch (type) {
+    case RKNN_TENSOR_FLOAT32:
+    case RKNN_TENSOR_INT32:
+    case RKNN_TENSOR_UINT32:
+      return 4;
+    case RKNN_TENSOR_FLOAT16:
+    case RKNN_TENSOR_INT16:
+    case RKNN_TENSOR_UINT16:
+      return 2;
+    case RKNN_TENSOR_INT64:
+      return 8;
+    case RKNN_TENSOR_INT8:
+    case RKNN_TENSOR_UINT8:
+    case RKNN_TENSOR_BOOL:
+      return 1;
+    default:
+      return 0;
+  }
+}
+
+bool decode_argmax_native(const void *data, const rknn_tensor_attr &native_attr,
+                          const rknn_tensor_attr &logical_attr, cv::Mat *mask) {
+  if (mask == nullptr || data == nullptr || logical_attr.n_elems != 160U * 416U) {
+    return false;
+  }
+  const std::size_t element_bytes = tensor_element_bytes(native_attr.type);
+  if (element_bytes == 0 || native_attr.size_with_stride == 0) {
+    return false;
+  }
+
+  const auto *raw = static_cast<const std::uint8_t *>(data);
+  *mask = cv::Mat::zeros(160, 416, CV_8U);
+
+  auto class_value = [&](const std::uint8_t *ptr) -> int {
+    switch (native_attr.type) {
+      case RKNN_TENSOR_FLOAT32:
+        return static_cast<int>(std::lrint(*reinterpret_cast<const float *>(ptr)));
+      case RKNN_TENSOR_INT32:
+        return *reinterpret_cast<const std::int32_t *>(ptr);
+      case RKNN_TENSOR_UINT32:
+        return static_cast<int>(*reinterpret_cast<const std::uint32_t *>(ptr));
+      case RKNN_TENSOR_INT16:
+        return *reinterpret_cast<const std::int16_t *>(ptr);
+      case RKNN_TENSOR_UINT16:
+        return static_cast<int>(*reinterpret_cast<const std::uint16_t *>(ptr));
+      case RKNN_TENSOR_INT8:
+        return *reinterpret_cast<const std::int8_t *>(ptr);
+      case RKNN_TENSOR_UINT8:
+      case RKNN_TENSOR_BOOL:
+        return *ptr;
+      default:
+        return 0;
+    }
+  };
+
+  const auto read_nchw = [&](const int y, const int x) -> int {
+    if (native_attr.n_dims < 3) {
+      return 0;
+    }
+    const std::size_t width = native_attr.dims[native_attr.n_dims - 1];
+    const std::size_t height = native_attr.dims[native_attr.n_dims - 2];
+    const std::size_t row_stride = native_attr.w_stride > 0 ? native_attr.w_stride : width;
+    if (width < 416U || height < 160U || x < 0 || y < 0 ||
+        static_cast<std::size_t>(x) >= width || static_cast<std::size_t>(y) >= height) {
+      return 0;
+    }
+    const std::size_t offset =
+        (static_cast<std::size_t>(y) * row_stride + static_cast<std::size_t>(x)) *
+        element_bytes;
+    if (offset + element_bytes > native_attr.size_with_stride) {
+      return 0;
+    }
+    return class_value(raw + offset);
+  };
+
+  const auto read_nhwc = [&](const int y, const int x) -> int {
+    if (native_attr.n_dims < 4) {
+      return read_nchw(y, x);
+    }
+    const std::size_t width = native_attr.dims[native_attr.n_dims - 2];
+    const std::size_t height = native_attr.dims[native_attr.n_dims - 3];
+    const std::size_t channels = native_attr.dims[native_attr.n_dims - 1];
+    const std::size_t row_stride = native_attr.w_stride > 0 ? native_attr.w_stride : width;
+    if (channels == 0 || width < 416U || height < 160U ||
+        static_cast<std::size_t>(x) >= width || static_cast<std::size_t>(y) >= height) {
+      return 0;
+    }
+    const std::size_t offset =
+        (static_cast<std::size_t>(y) * row_stride * channels +
+         static_cast<std::size_t>(x) * channels) *
+        element_bytes;
+    if (offset + element_bytes > native_attr.size_with_stride) {
+      return 0;
+    }
+    return class_value(raw + offset);
+  };
+
+  const auto read_nc1hwc2 = [&](const int y, const int x) -> int {
+    if (native_attr.n_dims != 5 || native_attr.dims[0] != 1 ||
+        native_attr.dims[1] == 0 || native_attr.dims[2] < 160U ||
+        native_attr.dims[3] < 416U || native_attr.dims[4] == 0) {
+      return 0;
+    }
+    const std::size_t width = native_attr.dims[3];
+    const std::size_t row_stride = native_attr.w_stride > 0 ? native_attr.w_stride : width;
+    const std::size_t block = native_attr.dims[4];
+    const std::size_t offset =
+        (((static_cast<std::size_t>(y) * row_stride + static_cast<std::size_t>(x)) * block)) *
+        element_bytes;
+    if (offset + element_bytes > native_attr.size_with_stride) {
+      return 0;
+    }
+    return class_value(raw + offset);
+  };
+
+  for (int y = 0; y < 160; ++y) {
+    auto *row = mask->ptr<std::uint8_t>(y);
+    for (int x = 0; x < 416; ++x) {
+      int value = 0;
+      if (native_attr.fmt == RKNN_TENSOR_NC1HWC2) {
+        value = read_nc1hwc2(y, x);
+      } else if (native_attr.fmt == RKNN_TENSOR_NHWC) {
+        value = read_nhwc(y, x);
+      } else {
+        value = read_nchw(y, x);
+      }
+      row[x] = value > 0 ? 255U : 0U;
+    }
+  }
+  return true;
 }
 
 cv::Rect make_output_roi(const candidate_t &candidate) {
@@ -358,13 +594,163 @@ double run_staged_seg_postproc_to_mask(
 
 void worker_usage(const char *prog) {
   std::cerr << "usage: " << prog
-            << " --model M.rknn [--core 0|1|2|all] [--conf 0.25] [--iou 0.45]\n";
+            << " --model M.rknn [--route seg_predfl|argmax] "
+               "[--core 0|1|2|all] [--conf 0.25] [--iou 0.45]\n";
+}
+
+int run_argmax_worker(const std::vector<std::uint8_t> &model, const char *core_str) {
+  int core_mask = 0;
+  if (!parse_core(core_str, &core_mask)) {
+    std::cerr << "invalid core: " << core_str << "\n";
+    return 2;
+  }
+
+  void *model_copy = std::malloc(model.size());
+  if (model_copy == nullptr) {
+    std::cerr << "argmax model allocation failed\n";
+    return 1;
+  }
+  std::memcpy(model_copy, model.data(), model.size());
+
+  rknn_context ctx = 0;
+  int ret = rknn_init(&ctx, model_copy, model.size(), 0, nullptr);
+  std::free(model_copy);
+  if (ret != 0) {
+    std::cerr << "argmax rknn_init failed: " << ret << "\n";
+    return 1;
+  }
+  ret = rknn_set_core_mask(ctx, static_cast<rknn_core_mask>(core_mask));
+  if (ret != 0) {
+    std::cerr << "argmax rknn_set_core_mask failed: " << ret << "\n";
+    rknn_destroy(ctx);
+    return 1;
+  }
+
+  rknn_input_output_num io{};
+  rknn_tensor_attr input_attr{};
+  rknn_tensor_attr output_attr{};
+  if (!query_attrs(ctx, &io, &input_attr, &output_attr)) {
+    std::cerr << "argmax query input/output attributes failed\n";
+    rknn_destroy(ctx);
+    return 1;
+  }
+  const bool input_layout_ok =
+      input_attr.n_dims == 4 && input_attr.dims[0] == 1 &&
+      ((input_attr.dims[1] == 3 && input_attr.dims[2] == 160 && input_attr.dims[3] == 416) ||
+       (input_attr.dims[1] == 160 && input_attr.dims[2] == 416 && input_attr.dims[3] == 3));
+  if (!input_layout_ok || output_attr.n_elems != 160U * 416U) {
+    std::cerr << "argmax model shape mismatch: input_dims=" << input_attr.dims[0] << "x"
+              << input_attr.dims[1] << "x" << input_attr.dims[2] << "x" << input_attr.dims[3]
+              << " output_elems=" << output_attr.n_elems << "\n";
+    rknn_destroy(ctx);
+    return 1;
+  }
+
+  const std::size_t rgb_bytes = 416U * 160U * 3U;
+  std::vector<std::uint8_t> rgb(rgb_bytes);
+  std::vector<std::int8_t> int8_input;
+  std::vector<std::uint8_t> u8_input;
+  std::vector<float> float_input;
+  cv::Mat mask;
+  rknn_tensor_attr native_output_attr{};
+  native_output_attr.index = 0;
+  if (rknn_query(ctx, RKNN_QUERY_NATIVE_OUTPUT_ATTR, &native_output_attr,
+                 sizeof(native_output_attr)) != 0 ||
+      native_output_attr.size_with_stride == 0) {
+    std::cerr << "argmax query native output attributes failed\n";
+    rknn_destroy(ctx);
+    return 1;
+  }
+  rknn_tensor_mem *output_mem =
+      rknn_create_mem(ctx, native_output_attr.size_with_stride);
+  if (output_mem == nullptr || output_mem->virt_addr == nullptr ||
+      rknn_set_io_mem(ctx, output_mem, &native_output_attr) != 0) {
+    std::cerr << "argmax bind native output memory failed\n";
+    if (output_mem != nullptr) {
+      rknn_destroy_mem(ctx, output_mem);
+    }
+    rknn_destroy(ctx);
+    return 1;
+  }
+  std::cerr << "seg_worker ready route=argmax input=416x160 output=160x416 type="
+            << output_attr.type << " input_type=" << input_attr.type
+            << " input_fmt=" << input_attr.fmt << " input_scale=" << input_attr.scale
+            << " input_zp=" << input_attr.zp << " native_fmt=" << native_output_attr.fmt
+            << " native_bytes=" << native_output_attr.size_with_stride << "\n";
+
+  while (true) {
+    RequestHeader req{};
+    if (!read_exact(std::cin, &req, sizeof(req))) {
+      break;
+    }
+    ResponseHeader resp{};
+    resp.magic = kRespMagic;
+    resp.frame_id = req.frame_id;
+    resp.status = 0;
+    resp.mask_bytes = static_cast<std::uint32_t>(rgb_bytes / 3U);
+    if (req.magic != kReqMagic || req.bytes != rgb_bytes) {
+      resp.status = -2;
+      resp.mask_bytes = 0;
+      write_exact(std::cout, &resp, sizeof(resp));
+      std::cout.flush();
+      break;
+    }
+    if (!read_exact(std::cin, rgb.data(), rgb.size())) {
+      break;
+    }
+
+    rknn_input input{};
+    if (!prepare_argmax_input(rgb, input_attr, &int8_input, &u8_input, &float_input, &input)) {
+      resp.status = -3;
+    } else {
+      const double start = now_ms();
+      ret = rknn_inputs_set(ctx, 1, &input);
+      if (ret == 0) {
+        ret = rknn_run(ctx, nullptr);
+      }
+      const double run_end = now_ms();
+      if (ret != 0) {
+        resp.status = ret;
+      } else {
+        const double post_start = now_ms();
+        ret = rknn_mem_sync(ctx, output_mem, RKNN_MEMORY_SYNC_FROM_DEVICE);
+        if (ret != 0) {
+          resp.status = ret;
+        } else if (!decode_argmax_native(output_mem->virt_addr, native_output_attr,
+                                         output_attr, &mask)) {
+          resp.status = -4;
+        }
+        resp.run_ms = static_cast<float>(run_end - start);
+        resp.post_ms = static_cast<float>(now_ms() - post_start);
+        resp.candidates = 0;
+        resp.kept = resp.status == 0 ? 1 : 0;
+      }
+    }
+    if (resp.status != 0 || mask.empty()) {
+      resp.mask_bytes = 0;
+      write_exact(std::cout, &resp, sizeof(resp));
+    } else {
+      resp.mask_bytes = static_cast<std::uint32_t>(mask.total());
+      write_exact(std::cout, &resp, sizeof(resp));
+      write_exact(std::cout, mask.data, resp.mask_bytes);
+    }
+    std::cout.flush();
+  }
+
+  rknn_destroy_mem(ctx, output_mem);
+  if (g_protocol_fd != STDOUT_FILENO) {
+    ::close(g_protocol_fd);
+    g_protocol_fd = STDOUT_FILENO;
+  }
+  rknn_destroy(ctx);
+  return 0;
 }
 
 }  // namespace
 
 int main(int argc, char **argv) {
   std::string model_path;
+  const char *route_str = "seg_predfl";
   const char *core_str = "0";
   float conf_thr = 0.25f;
   float iou_thr = 0.45f;
@@ -374,6 +760,8 @@ int main(int argc, char **argv) {
     const std::string arg = argv[i];
     if (arg == "--model" && i + 1 < argc) {
       model_path = argv[++i];
+    } else if (arg == "--route" && i + 1 < argc) {
+      route_str = argv[++i];
     } else if (arg == "--core" && i + 1 < argc) {
       core_str = argv[++i];
     } else if (arg == "--conf" && i + 1 < argc) {
@@ -393,6 +781,14 @@ int main(int argc, char **argv) {
   }
 
   try {
+    if (!isolate_runtime_stdout()) {
+      std::cerr << "failed to isolate RKNN runtime stdout\n";
+      return 1;
+    }
+    const auto model = read_file(model_path);
+    if (std::strcmp(route_str, "argmax") == 0 || std::strcmp(route_str, "class_map") == 0) {
+      return run_argmax_worker(model, core_str);
+    }
     int core_mask = 0;
     if (!parse_core(core_str, &core_mask)) {
       std::cerr << "invalid core: " << core_str << "\n";
@@ -404,7 +800,6 @@ int main(int argc, char **argv) {
     g_mask_output_width = 416;
     g_mask_output_height = 160;
 
-    const auto model = read_file(model_path);
     rknn_context ctx = 0;
     rknn_input_output_num io{};
     rknn_tensor_attr in_attrs[MAX_IO]{};
@@ -484,6 +879,10 @@ int main(int argc, char **argv) {
     full_io.Release();
     if (ctx != 0) {
       rknn_destroy(ctx);
+    }
+    if (g_protocol_fd != STDOUT_FILENO) {
+      ::close(g_protocol_fd);
+      g_protocol_fd = STDOUT_FILENO;
     }
     free(dummy);
     free_postproc_buffers();

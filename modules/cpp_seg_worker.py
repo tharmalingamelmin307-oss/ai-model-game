@@ -30,6 +30,8 @@ class CppSegWorker:
             str(bin_path),
             "--model",
             str(config.SEG_MODEL),
+            "--route",
+            str(getattr(config, "SEG_OUTPUT_ROUTE", "seg_predfl")),
             "--core",
             str(core_id),
             "--conf",

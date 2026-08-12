@@ -4,14 +4,18 @@
 #include "bench_rknn_perf.cpp"
 #undef main
 
+#include <cerrno>
 #include <fstream>
 #include <iostream>
+#include <fcntl.h>
 #include <string>
+#include <unistd.h>
 
 namespace {
 
 constexpr std::uint32_t kReqMagic = 0x4E494459U;   // "YDIN"
 constexpr std::uint32_t kRespMagic = 0x554F4459U;  // "YDOU"
+int g_protocol_fd = STDOUT_FILENO;
 
 struct RequestHeader {
   std::uint32_t magic;
@@ -55,8 +59,39 @@ bool read_exact(std::istream &in, void *data, std::size_t bytes) {
 }
 
 bool write_exact(std::ostream &out, const void *data, std::size_t bytes) {
-  out.write(static_cast<const char *>(data), static_cast<std::streamsize>(bytes));
-  return static_cast<bool>(out);
+  (void)out;
+  const char *ptr = static_cast<const char *>(data);
+  std::size_t done = 0;
+  while (done < bytes) {
+    const ssize_t written = ::write(g_protocol_fd, ptr + done, bytes - done);
+    if (written > 0) {
+      done += static_cast<std::size_t>(written);
+      continue;
+    }
+    if (written < 0 && errno == EINTR) {
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
+
+bool isolate_runtime_stdout() {
+  const int protocol_fd = ::dup(STDOUT_FILENO);
+  if (protocol_fd < 0) {
+    return false;
+  }
+  const int devnull_fd = ::open("/dev/null", O_WRONLY);
+  if (devnull_fd < 0 || ::dup2(devnull_fd, STDOUT_FILENO) < 0) {
+    if (devnull_fd >= 0) {
+      ::close(devnull_fd);
+    }
+    ::close(protocol_fd);
+    return false;
+  }
+  ::close(devnull_fd);
+  g_protocol_fd = protocol_fd;
+  return true;
 }
 
 std::vector<std::uint8_t> read_file(const std::string &path) {
@@ -115,6 +150,10 @@ int main(int argc, char **argv) {
   }
 
   try {
+    if (!isolate_runtime_stdout()) {
+      std::cerr << "failed to isolate RKNN runtime stdout\n";
+      return 1;
+    }
     int core_mask = 0;
     if (!parse_core(core_str, &core_mask)) {
       std::cerr << "invalid core: " << core_str << "\n";
@@ -212,6 +251,10 @@ int main(int argc, char **argv) {
 
     if (ctx != 0) {
       rknn_destroy(ctx);
+    }
+    if (g_protocol_fd != STDOUT_FILENO) {
+      ::close(g_protocol_fd);
+      g_protocol_fd = STDOUT_FILENO;
     }
     free(dummy);
     free_postproc_buffers();

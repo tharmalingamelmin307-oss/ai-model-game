@@ -67,9 +67,8 @@ JPEG_QUALITY = 75
 # 模型路径
 # ---------------------------------------------------------------------------
 # 分割模型路径。
-# 当前主控链路依赖这个模型输出赛道 mask，所以它直接影响路径规划和转向控制。
-# 这里使用 YOLOv8-Seg seg_predfl RKNN，CPU 端在 modules/segmentor.py 重建 mask。
-SEG_MODEL = str(PROJECT_ROOT / "models/double/seg_yolov8n_segpredfl_int8_160x416.rknn")
+# 当前使用 segv6 单输出 argmax 模型；它直接输出 160x416 的类别图。
+SEG_MODEL = str(PROJECT_ROOT / "models/seg/segv6/segv6_416x160_argmax_rk3588_int8.rknn")
 
 # 目标检测模型路径。
 # 当前使用的是 YOLOv8 predfl 的 RKNN 版本，输出后处理由 modules/detector.py 负责。
@@ -327,7 +326,7 @@ CPP_DET_WORKER_BIN = str(PROJECT_ROOT / "cpp_rknn/det_worker")
 # 分割线程直接用这张小图做主控路径搜索。
 # 这是实时控制链路的关键性能点之一。
 SEG_SIZE = (416, 160)
-SEG_OUTPUT_ROUTE = "seg_predfl"
+SEG_OUTPUT_ROUTE = "argmax"
 SEG_HEAD_STRIDES = (8, 16, 32)
 SEG_REG_MAX = 16
 SEG_CONF_THRES = 0.25
@@ -337,7 +336,10 @@ SEG_MAX_DETS = 1
 SEG_MASK_THRES = 0.5
 SEG_LETTERBOX_PAD_VALUE = 114
 SEG_LETTERBOX_SCALEUP = False
-CPP_SEG_ENABLED = True
+# segv6 是单输出 INT32 argmax。当前板端 RKNN runtime 对这个输出的
+# C++ 原生读取兼容性不好，先使用已验证的 Python RKNNLite 推理；
+# YOLO 仍保持 C++ worker。
+CPP_SEG_ENABLED = False
 CPP_SEG_WORKER_BIN = str(PROJECT_ROOT / "cpp_rknn/seg_worker")
 
 # 分割模型输入裁剪比例。
@@ -521,6 +523,8 @@ MERGE_STATE_EXIT_CONFIRM_FRAMES = 2
 MERGE_STATE_EXIT_NO_EDGE_Y_TOP = 10
 # 退出补线时检查“不再贴边”的 y 范围下界。
 MERGE_STATE_EXIT_NO_EDGE_Y_BOTTOM = 140
+# 上面 NO_EDGE 检查范围内，允许多少行仍然贴左右边界。0 表示一行都不允许。
+MERGE_STATE_EXIT_NO_EDGE_MAX_TOUCH_ROWS = 0
 
 # 贴边侧八邻域方向特征：作为汇合检测的额外 OR 条件。
 # 从右侧底部种子所在的八连通边缘块中，按从上往下的连续八邻域生长方向记录方向码。
@@ -799,8 +803,8 @@ STANLEY_MIN_FIT_POINTS = 3
 
 # B 调参打印。试车时终端低频输出:
 # pwm/ctrl/e/de/psi/psi_ff/各项 term/当前 Stanley 参数。
-STANLEY_DEBUG_LOG_ENABLED = True
-STANLEY_DEBUG_LOG_INTERVAL = 0.05
+STANLEY_DEBUG_LOG_ENABLED = False
+STANLEY_DEBUG_LOG_INTERVAL = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -924,8 +928,8 @@ CONTROL_C_MIN_FIT_POINTS = 3
 
 # C 调参打印。试车时打开，终端会周期性输出:
 # pwm/steer/e/de/psi/psi_ff/curve_level/当前插值后的参数。
-CONTROL_C_DEBUG_LOG_ENABLED = True
-CONTROL_C_DEBUG_LOG_INTERVAL = 0.5
+CONTROL_C_DEBUG_LOG_ENABLED = False
+CONTROL_C_DEBUG_LOG_INTERVAL = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -1014,6 +1018,15 @@ DEFAULT_CONTROL_DATA = {
     "person_stop_cutoff_y": None,
     "person_stop_event": "",
     "person_move_direction": 0,
+    "person_current_direction": 0,
+    "person_release_direction": 0,
+    "person_move_dx": 0.0,
+    "person_abs_move_dx": 0.0,
+    "person_min_move_dx": 0.0,
+    "person_line_reached": False,
+    "person_movement_confirmed": False,
+    "person_near_bottom": False,
+    "person_enough_area": False,
     "person_missing_started_at": None,
     "person_stop_started_at": None,
     "person_stop_max_released": False,
@@ -1100,16 +1113,16 @@ FPS_STATS_UPDATE_INTERVAL = 1.0
 
 # Seg 阶段耗时诊断日志。
 # 开启后每隔一段时间打印 inference / search / fit / render / total，用来定位掉帧瓶颈。
-SEG_PROFILE_LOG_ENABLED = True
+SEG_PROFILE_LOG_ENABLED = False
 # Seg profile 日志节流间隔，单位秒。
-SEG_PROFILE_LOG_INTERVAL = 1.0
+SEG_PROFILE_LOG_INTERVAL = 5.0
 
 # 主流程运行时耗时诊断日志。
 # 开启后会额外打印采集预处理、Seg 推理线程等待、发布、MJPEG 编码等耗时。
 # 用来判断页面 FPS 是卡在输入来帧、模型推理、后处理发布还是网页推流。
-MAIN_PROFILE_LOG_ENABLED = True
+MAIN_PROFILE_LOG_ENABLED = False
 # 主流程 profile 日志节流间隔，单位秒。
-MAIN_PROFILE_LOG_INTERVAL = 1.0
+MAIN_PROFILE_LOG_INTERVAL = 5.0
 
 
 # ---------------------------------------------------------------------------
@@ -1124,26 +1137,26 @@ MAIN_PROFILE_LOG_INTERVAL = 1.0
 
 # 默认日志节流间隔。
 # 当调用 throttled_log() 时没有显式传入 min_interval，就会回退到这里。
-LOG_INTERVAL_DEFAULT = 2.0
+LOG_INTERVAL_DEFAULT = 5.0
 
 # 路牌达到 OCR 识别条件、任务真正入队时的日志节流。
-LOG_INTERVAL_OCR_ENTER = 2.0
+LOG_INTERVAL_OCR_ENTER = 5.0
 
 # OCR 原始结果调试日志节流。
 # 现场排查“到底读到了什么 / 为什么没有读到文字”时可以调小到 0。
-LOG_INTERVAL_OCR_RAW = 0.5
+LOG_INTERVAL_OCR_RAW = 5.0
 
 # LEFT / RIGHT 语义路牌生效时的日志节流。
-LOG_INTERVAL_TURN_INTENT = 2.0
+LOG_INTERVAL_TURN_INTENT = 5.0
 
 # 行人停车条件满足、强制停车链路触发时的日志节流。
-LOG_INTERVAL_PERSON_STOP_DETAIL = 1.0
+LOG_INTERVAL_PERSON_STOP_DETAIL = 3.0
 
 # 检测到行人但未必已经触发停车时的状态日志节流。
-LOG_INTERVAL_PERSON_DETECT_DETAIL = 2.0
+LOG_INTERVAL_PERSON_DETECT_DETAIL = 5.0
 
 # 串口发送异常日志节流。
-LOG_INTERVAL_SERIAL_ERROR = 2.0
+LOG_INTERVAL_SERIAL_ERROR = 5.0
 
 # ---------------------------------------------------------------------------
 # 场景类别与主流程判定参数
@@ -1588,7 +1601,7 @@ CAR_AVOIDANCE_CLEARING_MAX_FRAMES = 20
 LOG_INTERVAL_CAR_AVOIDANCE_DETAIL = 1.0
 # 避车状态机过程日志，现场排查“避完车后丢线”时保持开启。
 CAR_AVOIDANCE_PROCESS_LOG_ENABLED = True
-LOG_INTERVAL_CAR_AVOIDANCE_PROCESS = 0.25
+LOG_INTERVAL_CAR_AVOIDANCE_PROCESS = 0.5
 # 主分割调试图绘制风格。
 # 最终路径线颜色。
 SEG_DEBUG_PATH_COLOR = (255, 0, 255)

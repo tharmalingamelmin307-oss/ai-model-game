@@ -122,6 +122,8 @@ class RoadSegmentor:
         self.last_control_path_source = "normal"
         self.last_car_avoid_log_at = 0.0
         self.last_car_avoid_log_state = None
+        self.last_car_projection_log_at = 0.0
+        self.last_car_projection_log_state = None
         self.debug_overlay = SegDebugOverlay(tuple(config.SEG_SIZE))
         self.seg_profile_logger = SegProfileLogger()
         self.last_control_c_debug_log_at = 0.0
@@ -2274,6 +2276,48 @@ class RoadSegmentor:
 
         return planning_items
 
+    def _log_car_projection_gate(self, current_yolo_boxes, planning_items):
+        """低频提示 YOLO 车框是否进入了 Seg 避车 ROI。"""
+        if not bool(getattr(config, "CAR_AVOIDANCE_PROCESS_LOG_ENABLED", True)):
+            return
+
+        yolo_cars = [
+            obj for obj in (current_yolo_boxes or [])
+            if str(obj.get("class_name", "")) == "car"
+        ]
+        if not yolo_cars:
+            self.last_car_projection_log_state = None
+            return
+
+        planning_cars = [
+            item for item in (planning_items or [])
+            if str(item.get("class_name", "")) == "car"
+        ]
+        if planning_cars:
+            return
+
+        nearest = max(
+            yolo_cars,
+            key=lambda obj: float(obj.get("rect", [0, 0, 0, 0])[1]) + float(obj.get("rect", [0, 0, 0, 0])[3])
+            if len(obj.get("rect", [])) == 4 else -1.0,
+        )
+        rect = nearest.get("rect", [0, 0, 0, 0])
+        bottom_y = float(rect[1]) + float(rect[3]) if len(rect) == 4 else -1.0
+        roi_top = float(self.seg_crop_top_target_y)
+        state = (len(yolo_cars), int(round(bottom_y)), int(round(roi_top)))
+        now = time.monotonic()
+        interval = max(0.2, float(getattr(config, "LOG_INTERVAL_CAR_AVOIDANCE_PROCESS", 0.5)))
+        if state == self.last_car_projection_log_state and now - float(self.last_car_projection_log_at) < interval:
+            return
+
+        self.last_car_projection_log_state = state
+        self.last_car_projection_log_at = now
+        print(
+            f"避车观察: yolo_car={len(yolo_cars)} planning_car=0 "
+            f"nearest_bottom_y={bottom_y:.1f} seg_roi_top_y={roi_top:.1f}",
+            flush=True,
+        )
+
     def _path_x_at_y_points(self, path_points, y):
         """在一组路径点上按 y 插值得到 x."""
         pts = np.array(path_points, dtype=np.float32).reshape((-1, 2))
@@ -2355,6 +2399,36 @@ class RoadSegmentor:
     def _build_car_boundary_path(self, base_path, boundary, inset_x, w_seg):
         """按选定边界生成避车参考线."""
         return self._build_boundary_inset_path(base_path, boundary, inset_x, w_seg)
+
+    def _build_car_boundary_path_from_visible(self, base_path, visible_boundary, visible_side, target_side, w_seg):
+        """用可见边界和固定赛道宽度，补出目标侧边界作为避车参考线."""
+        base = np.array(base_path, dtype=np.float32).reshape((-1, 2))
+        if len(base) < 2 or visible_boundary is None:
+            return base, False
+
+        visible_xs = self._interp_path_xs(visible_boundary, base[:, 1])
+        if visible_xs is None or len(visible_xs) != len(base):
+            return base, False
+
+        widths = np.array(
+            [self._fixed_track_width_at_y(float(y), 0.0) for y in base[:, 1]],
+            dtype=np.float32,
+        )
+        if not np.any(widths > 0.0):
+            return base, False
+
+        if visible_side == target_side:
+            target_xs = visible_xs
+        elif visible_side == "left" and target_side == "right":
+            target_xs = visible_xs + widths
+        elif visible_side == "right" and target_side == "left":
+            target_xs = visible_xs - widths
+        else:
+            return base, False
+
+        planned = base.copy()
+        planned[:, 0] = np.clip(target_xs, 0.0, float(w_seg - 1))
+        return planned.astype(np.float32), True
 
     def _build_car_left_boundary_path(self, base_path, left_boundary, inset_x, w_seg):
         """避车时把左边线本身当作控制中线。"""
@@ -2693,10 +2767,22 @@ class RoadSegmentor:
         if rows_to_car > switch_rows:
             return 0.0, (center_y, path_bottom_y), False, "switch_rows_limit", None
 
-        _left_x, _right_x, road_width = self._car_road_width_at_y(left_boundary, right_boundary, center_y)
+        _left_x, _right_x, road_width = self._car_road_width_at_y(
+            left_boundary,
+            right_boundary,
+            center_y,
+        )
         min_road_width = max(0.0, float(getattr(config, "CAR_AVOIDANCE_SIDE_MIN_ROAD_WIDTH", 0.0)))
         if road_width is None:
-            return 0.0, (center_y, path_bottom_y), False, "road_missing", None
+            # 新版 Seg 在部分帧只会保留一侧可信边界。此时仍可用固定
+            # 赛道宽度确认“这是一条可避车的路”，让已有边界承担避车线。
+            # 两侧都缺失时不能凭空判断道路位置，继续等待真实路径。
+            if (_left_x is None) == (_right_x is None):
+                return 0.0, (center_y, path_bottom_y), False, "road_missing", None
+            estimated_width = self._fixed_track_width_at_y(center_y, 0.0)
+            if estimated_width <= 0.0:
+                return 0.0, (center_y, path_bottom_y), False, "road_missing", None
+            road_width = float(estimated_width)
         if road_width < min_road_width:
             return 0.0, (center_y, path_bottom_y), False, "road_too_narrow", road_width
 
@@ -2789,11 +2875,23 @@ class RoadSegmentor:
                 if right_boundary is not None:
                     return self._build_car_right_boundary_path(base, right_boundary, inset_value, w_seg)
                 if left_boundary is not None:
-                    return self._build_car_left_boundary_path(base, left_boundary, inset_value, w_seg)
+                    return self._build_car_boundary_path_from_visible(
+                        base,
+                        left_boundary,
+                        "left",
+                        "right",
+                        w_seg,
+                    )
             if left_boundary is not None:
                 return self._build_car_left_boundary_path(base, left_boundary, inset_value, w_seg)
             if right_boundary is not None:
-                return self._build_car_right_boundary_path(base, right_boundary, inset_value, w_seg)
+                return self._build_car_boundary_path_from_visible(
+                    base,
+                    right_boundary,
+                    "right",
+                    "left",
+                    w_seg,
+                )
             return base, False
 
         def _car_control_error_offset_for_side(boundary_side):
@@ -3099,7 +3197,9 @@ class RoadSegmentor:
             mask = self._decode_seg_predfl_mask(outputs)
         else:
             out = outputs[0]
-            if len(out.shape) == 4 and out.shape[1] > 1:
+            if self.seg_output_route in ("argmax", "class_map"):
+                mask = (np.asarray(out).squeeze() > 0).astype(np.uint8)
+            elif len(out.shape) == 4 and out.shape[1] > 1:
                 mask = (out[0][1] > out[0][0]).astype(np.uint8)
             else:
                 mask = out.squeeze().astype(np.uint8)
@@ -3156,6 +3256,7 @@ class RoadSegmentor:
         # 投影 YOLO 框到分割面
         t_preprocess_start = time.perf_counter()
         planning_items = self._project_planning_objects(current_yolo_boxes, w_seg, h_seg)
+        self._log_car_projection_gate(current_yolo_boxes, planning_items)
         t_preprocess_end = time.perf_counter()
 
         # -------------------------------------------------------------------

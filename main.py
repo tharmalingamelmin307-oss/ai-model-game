@@ -172,6 +172,11 @@ def make_seg_input(frame_rgb):
         crop_y = int(round(h * crop_ratio))
         frame_rgb = frame_rgb[crop_y:, :, :]
 
+    # argmax 赛道模型的旧训练/部署链路是直接拉伸到 416x160，
+    # 不能套 YOLO letterbox，否则会改变赛道在模型坐标中的几何比例。
+    if str(getattr(config, "SEG_OUTPUT_ROUTE", "")).lower() in ("argmax", "class_map"):
+        return cv2.resize(frame_rgb, config.SEG_SIZE, interpolation=cv2.INTER_LINEAR)
+
     seg_img, _ = letterbox_bgr_or_rgb(
         frame_rgb,
         config.SEG_SIZE,
@@ -358,6 +363,19 @@ def update_person_stop_state(state, person_info, left_boundary_x, right_boundary
         state["person_miss_frames"] = miss_frames
         state["person_clear_frames"] = clear_frames
         state["person_move_direction"] = move_direction if active else 0
+        state["person_current_direction"] = 0
+        state["person_release_direction"] = move_direction if active else 0
+        state["person_move_dx"] = 0.0
+        state["person_abs_move_dx"] = 0.0
+        state["person_min_move_dx"] = float(getattr(
+            config,
+            "PERSON_CLEAR_MIN_MOVE_DX",
+            getattr(config, "PERSON_CLEAR_MIN_RIGHT_DX", 3.0),
+        ))
+        state["person_line_reached"] = False
+        state["person_movement_confirmed"] = False
+        state["person_near_bottom"] = False
+        state["person_enough_area"] = False
         state["person_missing_started_at"] = missing_started_at if active else None
         state["person_stop_started_at"] = stop_started_at if active else None
         state["person_stop_max_released"] = max_released
@@ -386,6 +404,7 @@ def update_person_stop_state(state, person_info, left_boundary_x, right_boundary
         getattr(config, "PERSON_CLEAR_MIN_RIGHT_DX", 3.0),
     ))
     dx = 0.0 if last_center is None else bottom_center_x - float(last_center)
+    abs_dx = abs(float(dx))
     current_direction = 0
     if dx >= min_move_dx:
         current_direction = 1
@@ -488,6 +507,15 @@ def update_person_stop_state(state, person_info, left_boundary_x, right_boundary
     state["person_clear_frames"] = clear_frames
     state["person_miss_frames"] = miss_frames
     state["person_move_direction"] = move_direction
+    state["person_current_direction"] = current_direction
+    state["person_release_direction"] = release_direction
+    state["person_move_dx"] = float(dx)
+    state["person_abs_move_dx"] = float(abs_dx)
+    state["person_min_move_dx"] = float(min_move_dx)
+    state["person_line_reached"] = bool(line_reached)
+    state["person_movement_confirmed"] = bool(movement_confirmed)
+    state["person_near_bottom"] = bool(near_bottom)
+    state["person_enough_area"] = bool(enough_area)
     state["person_missing_started_at"] = missing_started_at
     state["person_stop_started_at"] = stop_started_at
     state["person_stop_max_released"] = max_released
@@ -1562,6 +1590,8 @@ def yolo_worker(core_id=None, worker_id=0):
             )
 
         except Exception as e:
+            if "worker closed stdout" in str(e) or "Broken pipe" in str(e):
+                return
             log_once(f"yolo_worker_error_{worker_id}", f"YOLO线程异常(worker={worker_id}, core={core_id}): {e}")
 
 
@@ -2398,6 +2428,16 @@ def serial_control_thread():
             person_lock_bottom_y = global_control_data.get("person_lock_bottom_y")
             person_clear_frames = int(global_control_data.get("person_clear_frames", 0))
             person_stop_event = str(global_control_data.get("person_stop_event", ""))
+            person_move_dx = float(global_control_data.get("person_move_dx", 0.0))
+            person_abs_move_dx = float(global_control_data.get("person_abs_move_dx", 0.0))
+            person_min_move_dx = float(global_control_data.get("person_min_move_dx", 0.0))
+            person_move_direction = int(global_control_data.get("person_move_direction", 0))
+            person_current_direction = int(global_control_data.get("person_current_direction", 0))
+            person_release_direction = int(global_control_data.get("person_release_direction", 0))
+            person_line_reached = bool(global_control_data.get("person_line_reached", False))
+            person_movement_confirmed = bool(global_control_data.get("person_movement_confirmed", False))
+            person_near_bottom = bool(global_control_data.get("person_near_bottom", False))
+            person_enough_area = bool(global_control_data.get("person_enough_area", False))
         debug_keyboard_state = get_debug_drive_keyboard_state()
         debug_keyboard_stop_active = bool(debug_keyboard_state.get("manual_stop_active", False))
 
@@ -2557,6 +2597,16 @@ def serial_control_thread():
             person_stop_cutoff_y = None
             person_clear_frames = 0
             person_stop_event = ""
+            person_move_dx = 0.0
+            person_abs_move_dx = 0.0
+            person_min_move_dx = 0.0
+            person_move_direction = 0
+            person_current_direction = 0
+            person_release_direction = 0
+            person_line_reached = False
+            person_movement_confirmed = False
+            person_near_bottom = False
+            person_enough_area = False
             debug_keyboard_state = get_debug_drive_keyboard_state()
             debug_keyboard_stop_active = bool(debug_keyboard_state.get("manual_stop_active", False))
             if sign_llm_stop_active or person_stop_active:
@@ -2585,6 +2635,16 @@ def serial_control_thread():
         center_x_text = "无" if person_bottom_center_x is None else f"{float(person_bottom_center_x):.1f}"
         right_x_text = "无" if person_bottom_right_x is None else f"{float(person_bottom_right_x):.1f}"
         stop_text = "是" if person_stop_active else "否"
+        person_dx_text = f"{float(person_move_dx):+.1f}"
+        person_abs_dx_text = f"{float(person_abs_move_dx):.1f}"
+        person_min_dx_text = f"{float(person_min_move_dx):.1f}"
+        person_dir_text = "右" if int(person_current_direction) > 0 else ("左" if int(person_current_direction) < 0 else "无")
+        person_release_dir_text = "右" if int(person_release_direction) > 0 else ("左" if int(person_release_direction) < 0 else "无")
+        person_locked_dir_text = "右" if int(person_move_direction) > 0 else ("左" if int(person_move_direction) < 0 else "无")
+        person_line_text = "1" if bool(person_line_reached) else "0"
+        person_move_ok_text = "1" if bool(person_movement_confirmed) else "0"
+        person_near_text = "1" if bool(person_near_bottom) else "0"
+        person_area_ok_text = "1" if bool(person_enough_area) else "0"
         car_rows_text = "无" if car_avoidance_rows_to_bottom is None else f"{float(car_avoidance_rows_to_bottom):.1f}"
         car_miss_text = f"{int(car_avoidance_miss_frames)}"
         car_clear_text = f"{int(car_avoidance_clear_frames)}"
@@ -2603,7 +2663,12 @@ def serial_control_thread():
         car_psi_text = "无" if car_avoidance_control_psi is None else f"{float(car_avoidance_control_psi):.2f}"
         car_v_text = "无" if car_avoidance_control_speed_estimate is None else f"{float(car_avoidance_control_speed_estimate):.0f}"
 
-        if car_avoidance_active and (car_avoidance_state != "FOLLOW_LANE" or abs(float(car_avoidance_boundary_inset_x)) > 0.0):
+        car_avoidance_visible_or_event = (
+            car_avoidance_active or
+            int(car_avoidance_detected_cars) > 0 or
+            bool(car_avoidance_event)
+        )
+        if car_avoidance_visible_or_event:
             throttled_log(
                 "car_avoid_detail",
                 f">>> 避车#{car_avoidance_cycle_id}(B): event={car_avoidance_event or '-'} state={car_avoidance_state} rows={car_rows_text} "
@@ -2660,16 +2725,18 @@ def serial_control_thread():
         if person_stop_event == "stop":
             throttled_log(
                 "person_stop_event",
-                f">>> 行人: 停 area={person_area_text} dist={person_dist_text}",
-                state=("stop", person_area_text, person_dist_text),
+                f">>> 行人: 停 area={person_area_text} dist={person_dist_text} "
+                f"dx={person_dx_text}/帧 min={person_min_dx_text}",
+                state=("stop", person_area_text, person_dist_text, person_dx_text, person_min_dx_text),
                 min_interval=0.0,
             )
         elif person_stop_event == "release_line":
             line_side_text = "右侧" if person_clear_line_side == "right" else "左侧"
             throttled_log(
                 "person_stop_event",
-                f">>> 行人: 过线放行({line_side_text}) cutoff_y={cutoff_line_text}",
-                state=("release_line", person_clear_line_side, clear_line_text),
+                f">>> 行人: 过线放行({line_side_text}) cutoff_y={cutoff_line_text} "
+                f"dx={person_dx_text}/帧 clear={person_clear_frames}",
+                state=("release_line", person_clear_line_side, clear_line_text, person_dx_text, person_clear_frames),
                 min_interval=0.0,
             )
         elif person_stop_event == "release_missing":
@@ -2692,7 +2759,11 @@ def serial_control_thread():
                 "person_stop_detail",
                 (
                     f">>> 行人: 停车待放行 area={person_area_text} "
-                    f"dist={person_dist_text} left={left_boundary_text} right={right_boundary_text} "
+                    f"dist={person_dist_text} near={person_near_text} area_ok={person_area_ok_text} "
+                    f"dx={person_dx_text}/帧 abs={person_abs_dx_text} min={person_min_dx_text} "
+                    f"dir={person_dir_text} lock_dir={person_locked_dir_text} release_dir={person_release_dir_text} "
+                    f"move_ok={person_move_ok_text} line_ok={person_line_text} "
+                    f"left={left_boundary_text} right={right_boundary_text} "
                     f"line={clear_line_text} side={person_clear_line_side or '无'} "
                     f"center={road_center_text} clear={person_clear_frames} "
                     f"lock_y={lock_bottom_text} cutoff_y={cutoff_line_text}"
@@ -2707,6 +2778,12 @@ def serial_control_thread():
                     person_clear_line_side,
                     person_clear_frames,
                     lock_bottom_text,
+                    person_dx_text,
+                    person_abs_dx_text,
+                    person_dir_text,
+                    person_release_dir_text,
+                    person_line_text,
+                    person_move_ok_text,
                 ),
                 min_interval=float(getattr(config, "LOG_INTERVAL_PERSON_STOP_DETAIL", 1.0)),
             )
