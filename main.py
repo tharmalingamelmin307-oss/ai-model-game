@@ -164,6 +164,14 @@ def print_runtime_config_summary():
     )
 
 
+def car_avoidance_updates_enabled(control_state):
+    """行人/路牌停车时冻结避车状态；手动未发车仍允许预判左右。"""
+    return not (
+        bool(control_state.get("person_stop_active", False)) or
+        bool(control_state.get("sign_llm_stop_active", False))
+    )
+
+
 def make_seg_input(frame_rgb):
     """按当前分割模型约定生成 RGB 输入图."""
     crop_ratio = float(getattr(config, "SEG_INPUT_CROP_TOP_RATIO", 0.0))
@@ -589,17 +597,19 @@ def should_trigger_sign_route(cls_id, rect):
     x, y, w, h = rect
     if w < 2 or h < 2:
         return False, "invalid_rect"
-    area = rect_area(rect)
-    trigger_area = float(getattr(config, "SIGN_LLM_TRIGGER_AREA", 6000))
-    if area < trigger_area:
-        return False, f"area_too_small({int(area)}<{int(trigger_area)})"
-    frame_w, frame_h = config.TARGET_RES
-    dist_to_bottom = max(0.0, float(frame_h) - float(y + h))
-    trigger_dist = float(getattr(config, "SIGN_LLM_TRIGGER_DIST", 0.0))
-    if trigger_dist > 0.0 and dist_to_bottom > trigger_dist:
-        return False, f"too_far_from_bottom({int(dist_to_bottom)}>{int(trigger_dist)})"
     if not sign_rect_edge_safe(rect):
         return False, "too_close_to_edge"
+
+    sign_distance_m = estimate_sign_distance_m(rect)
+    trigger_distance_m = float(getattr(config, "SIGN_LLM_TRIGGER_DISTANCE_M", 0.55))
+    if sign_distance_m is None:
+        return False, "distance_unavailable"
+    if sign_distance_m > trigger_distance_m:
+        return False, f"distance_too_far({sign_distance_m:.2f}>{trigger_distance_m:.2f})"
+
+    # 旧条件暂不参与触发:
+    # area = rect_area(rect)
+    # dist_to_bottom = max(0.0, float(config.TARGET_RES[1]) - float(y + h))
     return True, "ok"
 
 
@@ -625,6 +635,59 @@ def sign_rect_edge_safe(rect):
     ):
         return False
     return True
+
+
+def estimate_sign_distance_m(rect):
+    """用固定真实高度和检测框高度估算 sign 到相机的距离，单位米."""
+    if not bool(getattr(config, "SIGN_MONOCULAR_DISTANCE_ENABLED", False)):
+        return None
+    if rect is None or len(rect) != 4:
+        return None
+    try:
+        _x, _y, _w, h = [float(v) for v in rect]
+    except (TypeError, ValueError):
+        return None
+    min_h = max(1.0, float(getattr(config, "SIGN_DISTANCE_MIN_BOX_HEIGHT_PX", 8.0)))
+    if h < min_h:
+        return None
+    try:
+        source_h = float(getattr(config, "IPM_SOURCE_SIZE", (640, 480))[1])
+        target_h = float(config.TARGET_RES[1])
+        fy_source = float(config.IPM_CAMERA_K[1][1])
+        fy_target = fy_source * (target_h / max(source_h, 1.0))
+        real_h = float(getattr(config, "SIGN_REAL_HEIGHT_M", 0.0))
+        if real_h <= 0.0:
+            return None
+        return float(fy_target * real_h / h)
+    except Exception:
+        return None
+
+
+def estimate_ground_object_distance_m(rect):
+    """用检测框底边中点的地面反投估算贴地目标距离，单位米。"""
+    if rect is None or len(rect) != 4:
+        return None
+    try:
+        x, y, w, h = [float(v) for v in rect]
+    except (TypeError, ValueError):
+        return None
+    if w <= 0.0 or h <= 0.0:
+        return None
+    try:
+        target_w, target_h = map(float, config.TARGET_RES)
+        source_w, source_h = map(float, getattr(config, "IPM_SOURCE_SIZE", (640, 480)))
+        fy = float(config.IPM_CAMERA_K[1][1])
+        cy = float(config.IPM_CAMERA_K[1][2])
+        camera_height = float(getattr(config, "IPM_CAMERA_HEIGHT", 0.14))
+        forward_offset = float(getattr(config, "IPM_CAMERA_FORWARD_OFFSET", 0.0))
+        _ = (x + w * 0.5) * (source_w / max(target_w, 1.0))
+        v = (y + h) * (source_h / max(target_h, 1.0))
+        denom = v - cy
+        if denom <= 1e-4:
+            return None
+        return float(fy * camera_height / denom - forward_offset)
+    except Exception:
+        return None
 
 
 def sign_route_fork_point_trigger_active(state):
@@ -1589,6 +1652,16 @@ def yolo_worker(core_id=None, worker_id=0):
                 try:
                     obj.pop("text", None)
                     obj.pop("ocr_score", None)
+                    obj.pop("sign_distance_m", None)
+                    obj.pop("ground_distance_m", None)
+                    if obj.get("class_id") == config.SIGN_CLASS_ID:
+                        sign_distance_m = estimate_sign_distance_m(obj.get("rect", [0, 0, 0, 0]))
+                        if sign_distance_m is not None:
+                            obj["sign_distance_m"] = float(sign_distance_m)
+                    if str(obj.get("class_name", "")) == "car":
+                        car_distance_m = estimate_ground_object_distance_m(obj.get("rect", [0, 0, 0, 0]))
+                        if car_distance_m is not None:
+                            obj["ground_distance_m"] = float(car_distance_m)
                 except Exception:
                     pass
 
@@ -1610,8 +1683,6 @@ def yolo_worker(core_id=None, worker_id=0):
             route_trigger_rect = None
             route_skip_debug = None
             route_sign_gate_enabled = sign_route_uses_llm()
-            with data_lock:
-                fork_point_trigger, fork_rows_to_bottom = sign_route_fork_point_trigger_active(global_control_data)
             for idx, obj in enumerate(objs):
                 cls_id = obj.get("class_id")
                 if cls_id != config.SIGN_CLASS_ID:
@@ -1620,15 +1691,7 @@ def yolo_worker(core_id=None, worker_id=0):
                 if len(rect) == 4 and float(rect[2]) >= 2.0 and float(rect[3]) >= 2.0:
                     visible_sign_rects.append(list(rect))
                 if route_sign_gate_enabled and route_trigger_rect is None:
-                    if fork_point_trigger:
-                        should_trigger = sign_rect_edge_safe(rect)
-                        trigger_skip_reason = (
-                            "fork_point_near_bottom"
-                            if should_trigger else
-                            "fork_point_near_bottom_but_too_close_to_edge"
-                        )
-                    else:
-                        should_trigger, trigger_skip_reason = should_trigger_sign_route(cls_id, rect)
+                    should_trigger, trigger_skip_reason = should_trigger_sign_route(cls_id, rect)
                     if should_trigger:
                         route_trigger_rect = list(rect)
                     elif route_skip_debug is None:
@@ -1638,6 +1701,7 @@ def yolo_worker(core_id=None, worker_id=0):
                             "reason": trigger_skip_reason,
                             "area": rect_area(rect),
                             "dist": max(0.0, float(frame_h) - float(y + h)),
+                            "sign_distance_m": estimate_sign_distance_m(rect),
                             "rect": list(rect),
                         }
                 should_enqueue, skip_reason = should_enqueue_ocr_job(cls_id, rect)
@@ -1651,6 +1715,7 @@ def yolo_worker(core_id=None, worker_id=0):
                     f"原因={route_skip_debug['reason']} "
                     f"area={route_skip_debug['area']:.0f} "
                     f"dist={route_skip_debug['dist']:.0f} "
+                    f"sign_z={route_skip_debug.get('sign_distance_m')} "
                     f"rect={route_skip_debug['rect']}",
                     state=(
                         route_skip_debug["reason"],
@@ -2137,10 +2202,12 @@ def seg_worker(core_id, worker_id=0):
             global_control_data["car_avoidance_active"] = bool(car_stats.get("car_active", False))
             global_control_data["car_avoidance_state"] = str(car_stats.get("car_state", "FOLLOW_LANE"))
             global_control_data["car_avoidance_rows_to_bottom"] = car_stats.get("car_rows_to_bottom")
+            global_control_data["car_avoidance_ground_distance_m"] = car_stats.get("car_ground_distance_m")
             global_control_data["car_avoidance_miss_frames"] = int(car_stats.get("car_miss_frames", 0))
             global_control_data["car_avoidance_clear_frames"] = int(car_stats.get("car_clear_frames", 0))
             global_control_data["car_avoidance_state_paused"] = bool(car_stats.get("car_state_paused", False))
             global_control_data["car_avoidance_boundary_side"] = str(car_stats.get("car_boundary_side", ""))
+            global_control_data["car_avoidance_nearest_boundary_side"] = str(car_stats.get("car_nearest_boundary_side", ""))
             global_control_data["car_avoidance_boundary_x"] = car_stats.get("car_boundary_x")
             global_control_data["car_avoidance_boundary_error"] = car_stats.get("car_boundary_error")
             global_control_data["car_avoidance_left_boundary_error"] = car_stats.get("car_left_boundary_error")
@@ -2317,6 +2384,7 @@ def seg_worker(core_id, worker_id=0):
                     bool(global_control_data.get("sign_llm_stop_active", False))
                 )
                 debug_drive_active = not drive_stop_active
+                car_avoidance_state_updates_enabled = car_avoidance_updates_enabled(global_control_data)
 
             try:
                 steer_signal, rendered_img = seg.run(
@@ -2329,6 +2397,8 @@ def seg_worker(core_id, worker_id=0):
                     external_boundary_side=external_boundary_side,
                     sign_route_pending=sign_route_pending,
                     debug_drive_active=debug_drive_active,
+                    car_avoidance_state_updates_enabled=car_avoidance_state_updates_enabled,
+                    preview_frame=preview_frame,
                 )
                 publish_seg_result(
                     steer_signal,
@@ -2373,6 +2443,7 @@ def seg_worker(core_id, worker_id=0):
                 external_boundary_side,
                 sign_route_pending,
                 debug_drive_active,
+                car_avoidance_state_updates_enabled,
             ) = item
 
             if bool(getattr(config, "SEG_POSTPROCESS_REFRESH_YOLO", True)):
@@ -2395,6 +2466,7 @@ def seg_worker(core_id, worker_id=0):
                         bool(global_control_data.get("sign_llm_stop_active", False))
                     )
                     debug_drive_active = not drive_stop_active
+                    car_avoidance_state_updates_enabled = car_avoidance_updates_enabled(global_control_data)
 
             try:
                 render_counter += 1
@@ -2415,6 +2487,7 @@ def seg_worker(core_id, worker_id=0):
                     external_boundary_side=external_boundary_side,
                     sign_route_pending=sign_route_pending,
                     debug_drive_active=debug_drive_active,
+                    car_avoidance_state_updates_enabled=car_avoidance_state_updates_enabled,
                     render_enabled=render_enabled,
                 )
                 t_post_end = time.perf_counter()
@@ -2477,6 +2550,7 @@ def seg_worker(core_id, worker_id=0):
                 bool(global_control_data.get("sign_llm_stop_active", False))
             )
             debug_drive_active = not drive_stop_active
+            car_avoidance_state_updates_enabled = car_avoidance_updates_enabled(global_control_data)
         t_lock_end = time.perf_counter()
 
         try:
@@ -2514,6 +2588,7 @@ def seg_worker(core_id, worker_id=0):
             external_boundary_side,
             sign_route_pending,
             debug_drive_active,
+            car_avoidance_state_updates_enabled,
         ))
         t_put_end = time.perf_counter()
         profile_log(
@@ -2566,10 +2641,12 @@ def serial_control_thread():
             car_avoidance_active = bool(global_control_data.get("car_avoidance_active", False))
             car_avoidance_state = str(global_control_data.get("car_avoidance_state", "FOLLOW_LANE"))
             car_avoidance_rows_to_bottom = global_control_data.get("car_avoidance_rows_to_bottom")
+            car_avoidance_ground_distance_m = global_control_data.get("car_avoidance_ground_distance_m")
             car_avoidance_miss_frames = int(global_control_data.get("car_avoidance_miss_frames", 0))
             car_avoidance_clear_frames = int(global_control_data.get("car_avoidance_clear_frames", 0))
             car_avoidance_state_paused = bool(global_control_data.get("car_avoidance_state_paused", False))
             car_avoidance_boundary_side = str(global_control_data.get("car_avoidance_boundary_side", ""))
+            car_avoidance_nearest_boundary_side = str(global_control_data.get("car_avoidance_nearest_boundary_side", ""))
             car_avoidance_boundary_x = global_control_data.get("car_avoidance_boundary_x")
             car_avoidance_boundary_error = global_control_data.get("car_avoidance_boundary_error")
             car_avoidance_left_boundary_error = global_control_data.get("car_avoidance_left_boundary_error")
@@ -2591,6 +2668,7 @@ def serial_control_thread():
             car_avoidance_control_kd = global_control_data.get("car_avoidance_control_kd")
             car_avoidance_control_psi = global_control_data.get("car_avoidance_control_psi")
             car_avoidance_control_speed_estimate = global_control_data.get("car_avoidance_control_speed_estimate")
+            latest_yolo_boxes_for_car_log = [obj.copy() for obj in global_yolo_boxes]
             sign_llm_stop_active = bool(global_control_data.get("sign_llm_stop_active", False))
             sign_llm_collecting = bool(global_control_data.get("sign_llm_collecting", False))
             sign_llm_frame_id = int(global_control_data.get("sign_llm_frame_id", -1))
@@ -2744,6 +2822,7 @@ def serial_control_thread():
             car_avoidance_clear_frames = 0
             car_avoidance_state_paused = False
             car_avoidance_boundary_side = ""
+            car_avoidance_nearest_boundary_side = ""
             car_avoidance_boundary_x = None
             car_avoidance_boundary_error = None
             car_avoidance_left_boundary_error = None
@@ -2801,8 +2880,6 @@ def serial_control_thread():
             global_control_data["debug_keyboard_enabled"] = bool(debug_keyboard_state.get("enabled", False))
             global_control_data["debug_keyboard_stop_active"] = bool(debug_keyboard_stop_active)
             global_control_data["debug_keyboard_message"] = str(debug_keyboard_state.get("message", ""))
-            if person_stop_event:
-                global_control_data["person_stop_event"] = ""
 
         person_area_text = "无" if 'person_area' not in locals() or person_area is None else f"{float(person_area):.0f}"
         person_dist_text = "无" if person_dist_to_bottom is None else f"{float(person_dist_to_bottom):.1f}"
@@ -2825,7 +2902,36 @@ def serial_control_thread():
         person_move_ok_text = "1" if bool(person_movement_confirmed) else "0"
         person_near_text = "1" if bool(person_near_bottom) else "0"
         person_area_ok_text = "1" if bool(person_enough_area) else "0"
+        if car_avoidance_ground_distance_m is None:
+            car_candidates = [
+                obj for obj in latest_yolo_boxes_for_car_log
+                if str(obj.get("class_name", "")) == "car"
+            ]
+            if car_candidates:
+                nearest_car = min(
+                    car_candidates,
+                    key=lambda obj: float(obj.get("ground_distance_m", 1e9))
+                    if obj.get("ground_distance_m") is not None else 1e9,
+                )
+                car_avoidance_ground_distance_m = nearest_car.get("ground_distance_m")
         car_rows_text = "无" if car_avoidance_rows_to_bottom is None else f"{float(car_avoidance_rows_to_bottom):.1f}"
+        car_z_text = "无" if car_avoidance_ground_distance_m is None else f"{float(car_avoidance_ground_distance_m):.2f}m"
+        car_cut_trigger_z = float(getattr(config, "CAR_AVOIDANCE_SWITCH_DISTANCE_M", 0.0))
+        car_side_trigger_z = float(getattr(config, "CAR_AVOIDANCE_SIDE_DECISION_DISTANCE_M", car_cut_trigger_z))
+        car_cut_trigger_z_text = "关闭" if car_cut_trigger_z <= 0.0 else f"{car_cut_trigger_z:.2f}m"
+        car_side_trigger_z_text = "关闭" if car_side_trigger_z <= 0.0 else f"{car_side_trigger_z:.2f}m"
+        car_cut_ready_z = (
+            car_cut_trigger_z > 0.0 and
+            car_avoidance_ground_distance_m is not None and
+            float(car_avoidance_ground_distance_m) <= car_cut_trigger_z
+        )
+        car_side_ready_z = (
+            car_side_trigger_z > 0.0 and
+            car_avoidance_ground_distance_m is not None and
+            float(car_avoidance_ground_distance_m) <= car_side_trigger_z
+        )
+        car_cut_ready_z_text = "1" if car_cut_ready_z else "0"
+        car_side_ready_z_text = "1" if car_side_ready_z else "0"
         car_miss_text = f"{int(car_avoidance_miss_frames)}"
         car_clear_text = f"{int(car_avoidance_clear_frames)}"
         car_pause_text = "1" if car_avoidance_state_paused else "0"
@@ -2843,15 +2949,29 @@ def serial_control_thread():
         car_psi_text = "无" if car_avoidance_control_psi is None else f"{float(car_avoidance_control_psi):.2f}"
         car_v_text = "无" if car_avoidance_control_speed_estimate is None else f"{float(car_avoidance_control_speed_estimate):.0f}"
 
+        def _car_side_cn(side):
+            side = str(side or "").lower()
+            if side == "left":
+                return "左侧"
+            if side == "right":
+                return "右侧"
+            return "未知侧"
+
+        car_avoidance_detail_log_enabled = bool(getattr(config, "CAR_AVOIDANCE_DETAIL_LOG_ENABLED", False))
         car_avoidance_visible_or_event = (
-            car_avoidance_active or
+            bool(car_avoidance_active) or
+            bool(car_avoidance_event) or
+            bool(car_avoidance_state_paused) or
+            str(car_avoidance_state) != "FOLLOW_LANE" or
             int(car_avoidance_detected_cars) > 0 or
-            bool(car_avoidance_event)
+            car_avoidance_ground_distance_m is not None
         )
-        if car_avoidance_visible_or_event:
+        if car_avoidance_detail_log_enabled and car_avoidance_visible_or_event:
             throttled_log(
                 "car_avoid_detail",
                 f">>> 避车#{car_avoidance_cycle_id}(B): event={car_avoidance_event or '-'} state={car_avoidance_state} rows={car_rows_text} "
+                f"car_z={car_z_text} side_trig={car_side_trigger_z_text} side_ready_z={car_side_ready_z_text} "
+                f"cut_trig={car_cut_trigger_z_text} cut_ready_z={car_cut_ready_z_text} "
                 f"det={int(car_avoidance_detected_cars)} locked={car_locked_text} hits={int(car_avoidance_locked_hit_frames)} "
                 f"miss={car_miss_text} clear={car_clear_text} pause={car_pause_text} path={car_path_text} "
                 f"inset={car_boundary_inset_text} side_ready={car_side_ready_text} ctrl_off={car_control_error_offset_text} weight={float(car_avoidance_avoid_weight):.2f} "
@@ -2863,6 +2983,11 @@ def serial_control_thread():
                     car_avoidance_event,
                     car_avoidance_state,
                     car_rows_text,
+                    car_z_text,
+                    car_side_trigger_z_text,
+                    car_side_ready_z_text,
+                    car_cut_trigger_z_text,
+                    car_cut_ready_z_text,
                     int(car_avoidance_detected_cars),
                     car_locked_text,
                     int(car_avoidance_locked_hit_frames),
@@ -2885,23 +3010,6 @@ def serial_control_thread():
                 ),
                 min_interval=float(getattr(config, "LOG_INTERVAL_CAR_AVOIDANCE_DETAIL", 1.0)),
             )
-        elif post_car_control_active:
-            throttled_log(
-                "post_car_control_detail",
-                f">>> 绕车后高速(B): profile={car_control_profile} cycles={car_avoidance_cycle_id} "
-                f" B=({car_kp_text},{car_kd_text},{car_psi_text}) v={car_v_text} "
-                f"target={int(round(float(getattr(config, 'POST_CAR_TARGET_SPEED', config.CONTROL_MAX_SPEED))))}",
-                state=(
-                    car_control_profile,
-                    car_avoidance_cycle_id,
-                    car_kp_text,
-                    car_kd_text,
-                    car_psi_text,
-                    car_v_text,
-                ),
-                min_interval=float(getattr(config, "LOG_INTERVAL_CAR_AVOIDANCE_DETAIL", 1.0)),
-            )
-
         if person_stop_event == "stop":
             throttled_log(
                 "person_stop_event",
@@ -2932,40 +3040,6 @@ def serial_control_thread():
                 ">>> 行人: 等待超时，走",
                 state=("release_timeout",),
                 min_interval=0.0,
-            )
-
-        if person_stop_active:
-            throttled_log(
-                "person_stop_detail",
-                (
-                    f">>> 行人: 停车待放行 area={person_area_text} "
-                    f"dist={person_dist_text} near={person_near_text} area_ok={person_area_ok_text} "
-                    f"dx={person_dx_text}/帧 abs={person_abs_dx_text} min={person_min_dx_text} "
-                    f"dir={person_dir_text} lock_dir={person_locked_dir_text} release_dir={person_release_dir_text} "
-                    f"move_ok={person_move_ok_text} line_ok={person_line_text} "
-                    f"left={left_boundary_text} right={right_boundary_text} "
-                    f"line={clear_line_text} side={person_clear_line_side or '无'} "
-                    f"center={road_center_text} clear={person_clear_frames} "
-                    f"lock_y={lock_bottom_text} cutoff_y={cutoff_line_text}"
-                ),
-                state=(
-                    "stop_wait_release",
-                    person_area_text,
-                    person_dist_text,
-                    left_boundary_text,
-                    right_boundary_text,
-                    clear_line_text,
-                    person_clear_line_side,
-                    person_clear_frames,
-                    lock_bottom_text,
-                    person_dx_text,
-                    person_abs_dx_text,
-                    person_dir_text,
-                    person_release_dir_text,
-                    person_line_text,
-                    person_move_ok_text,
-                ),
-                min_interval=float(getattr(config, "LOG_INTERVAL_PERSON_STOP_DETAIL", 1.0)),
             )
 
         if ser:

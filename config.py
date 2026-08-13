@@ -230,7 +230,16 @@ SIGN_LLM_TRIGGER_AREA = 10000 #16000
 # 触发语义路牌停车采样的 sign 截止距离，单位是 TARGET_RES 像素。
 # 路牌框底边距离画面底部小于等于该值，才认为已经足够近，可以停车采样。
 # 调大：更早停车；调小：更靠近再停车。
-SIGN_LLM_TRIGGER_DIST = 500
+SIGN_LLM_TRIGGER_DIST = 540
+# 路牌单目测距调试。
+# 原理: Z ~= fy_target * SIGN_REAL_HEIGHT_M / sign_box_height_px。
+# SIGN_REAL_HEIGHT_M 必须按现场路牌实际可见高度实测填写，单位米。
+SIGN_MONOCULAR_DISTANCE_ENABLED = True
+SIGN_REAL_HEIGHT_M = 0.12
+SIGN_DISTANCE_LABEL_ENABLED = True
+SIGN_DISTANCE_LABEL_DECIMALS = 2
+SIGN_DISTANCE_MIN_BOX_HEIGHT_PX = 8.0
+SIGN_LLM_TRIGGER_DISTANCE_M = 0.65
 # 硬性停车采样条件：Y 岔路特征点距离分割平面底部小于等于该行数时，
 # 若当前帧有不贴边的 sign 框，立刻停车开始路牌 OCR/千帆，不再受 sign 面积/高度限制。
 # 单位是 SEG_SIZE 坐标系像素行。
@@ -361,6 +370,63 @@ SEG_INPUT_CROP_TOP_RATIO = 0.5
 # 这些边缘常由 ROI crop / instance mask bbox 带出，不应参与八邻域边界追踪。
 SEG_MASK_IGNORE_TOP_ROWS = 3
 SEG_MASK_IGNORE_BOTTOM_ROWS = 3
+
+# 道路 mask 逆透视预览小窗。
+# 只影响网页/本地预览画面，不参与路径搜索和控制量计算。
+IPM_PREVIEW_ENABLED = True
+IPM_PREVIEW_TOP_RIGHT = (948, 8)
+IPM_PREVIEW_SIZE = (160, 180)
+IPM_PREVIEW_BG_COLOR = (12, 12, 12)
+IPM_PREVIEW_BORDER_COLOR = (0, 255, 255)
+IPM_PREVIEW_CENTER_LINE_COLOR = (90, 90, 90)
+IPM_PREVIEW_MASK_COLOR = (0, 255, 80)
+IPM_PREVIEW_ALPHA = 0.88
+IPM_PREVIEW_LABEL_ENABLED = True
+IPM_PREVIEW_LABEL = "IPM mask z+0.12 h0.14"
+IPM_PREVIEW_LABEL_COLOR = (255, 255, 255)
+IPM_PREVIEW_LABEL_BG_COLOR = (0, 0, 0)
+IPM_PREVIEW_LABEL_FONT_SCALE = 0.34
+IPM_PREVIEW_LABEL_THICKNESS = 1
+IPM_PREVIEW_PERSON_POINT_COLOR = (0, 0, 255)
+IPM_PREVIEW_CAR_POINT_COLOR = (0, 255, 255)
+IPM_PREVIEW_OBJECT_POINT_RADIUS = 4
+IPM_PREVIEW_OBJECT_POINT_THICKNESS = -1
+IPM_PREVIEW_DRAW_ROAD_BOUNDARIES = True
+IPM_PREVIEW_LEFT_BOUNDARY_COLOR = (255, 255, 0)
+IPM_PREVIEW_RIGHT_BOUNDARY_COLOR = (0, 165, 255)
+IPM_PREVIEW_BOUNDARY_POINT_RADIUS = 2
+IPM_PREVIEW_BOUNDARY_LINE_THICKNESS = 2
+
+# IPM 使用固定内参和当前推荐外参 baseline:
+# pos_offset = [0.0, 0.14, 0.12], euler_offset = [0.0, 0.0, 0.0]
+# OpenCV 相机坐标: x 向右, y 向下, z 向前。
+IPM_SOURCE_SIZE = (640, 480)
+IPM_CAMERA_K = (
+    (316.34668831, 0.0, 312.07420652),
+    (0.0, 318.61308429, 211.72834966),
+    (0.0, 0.0, 1.0),
+)
+IPM_CAMERA_D = (-0.01585373, 0.04236163, -0.00183995, -0.00313456, -0.03312241)
+IPM_POS_OFFSET = (0.0, 0.14, 0.12)
+IPM_EULER_OFFSET = (0.0, 0.0, 0.0)
+IPM_CAMERA_HEIGHT = 0.14
+IPM_CAMERA_FORWARD_OFFSET = 0.12
+IPM_OUTPUT_SIZE = (640, 720)
+IPM_X_RANGE = (-1.8, 1.8)
+IPM_Z_RANGE = (0.18, 5.0)
+# 小窗显示范围。比完整 IPM 范围更窄，等价于裁掉上方远处和左右空白后放大显示。
+IPM_PREVIEW_X_RANGE = (-1.05, 1.05)
+IPM_PREVIEW_Z_RANGE = (0.18, 3.2)
+IPM_PREVIEW_DISTANCE_LINE_ENABLED = True
+IPM_PREVIEW_DISTANCE_LINE_Z = 1.0
+IPM_PREVIEW_DISTANCE_LINE_COLOR = (255, 255, 0)
+IPM_PREVIEW_DISTANCE_LINE_THICKNESS = 2
+IPM_PREVIEW_SIGN_BOTTOM_LINE_ENABLED = True
+IPM_PREVIEW_SIGN_BOTTOM_LINE_COLOR = (255, 0, 255)
+IPM_PREVIEW_SIGN_BOTTOM_LINE_SHADOW_COLOR = (0, 0, 0)
+IPM_PREVIEW_SIGN_BOTTOM_LINE_THICKNESS = 4
+IPM_PREVIEW_SIGN_BOTTOM_LINE_MARGIN_Y = 18
+IPM_PREVIEW_DRAW_SIGN_BOTTOM_ON_MAIN = False
 
 # OCR 识别模型输入高度。
 # PaddleOCR 一类识别模型通常固定高度，再按宽高比自适应宽度。
@@ -534,7 +600,7 @@ MERGE_STATE_EXIT_CONFIRM_FRAMES = 2
 MERGE_STATE_EXIT_NO_EDGE_Y_TOP = 10
 # 退出补线时检查“不再贴边”的 y 范围下界。
 MERGE_STATE_EXIT_NO_EDGE_Y_BOTTOM = 140
-# 上面 NO_EDGE 检查范围内，允许多少行仍然贴左右边界。0 表示一行都不允许。
+# 上面 NO_EDGE 检查范围内，允许多少行仍然贴补线侧边界。0 表示一行都不允许。
 MERGE_STATE_EXIT_NO_EDGE_MAX_TOUCH_ROWS = 0
 
 # 贴边侧八邻域方向特征：作为汇合检测的额外 OR 条件。
@@ -1052,10 +1118,12 @@ DEFAULT_CONTROL_DATA = {
     "car_avoidance_active": False,
     "car_avoidance_state": "FOLLOW_LANE",
     "car_avoidance_rows_to_bottom": None,
+    "car_avoidance_ground_distance_m": None,
     "car_avoidance_miss_frames": 0,
     "car_avoidance_clear_frames": 0,
     "car_avoidance_state_paused": False,
     "car_avoidance_boundary_side": "",
+    "car_avoidance_nearest_boundary_side": "",
     "car_avoidance_boundary_x": None,
     "car_avoidance_boundary_error": None,
     "car_avoidance_left_boundary_error": None,
@@ -1546,14 +1614,17 @@ CAR_AVOIDANCE_MAX_CYCLES = 0
 # 只有 CLEARING 完成回到 FOLLOW_LANE 后才启用本组。
 POST_CAR_CONTROL_ENABLED = True
 POST_CAR_CONTROL_AFTER_CYCLES = 2
-# car 出现在分割平面内就允许参与锁定；这里只控制“什么时候切线接管”。
-# car 底部中心距离分割平面底部不超过这个行数时，才允许切线。
-# 日志里的 rows 就是这个距离；当前 SEG 高度是 160，rows=156 已经在 160 行窗口内。
+# car 出现在分割平面内就允许参与锁定；这里控制“什么时候判断左右/切线接管”。
+# 优先使用 car 底边中点的地面反投距离，单位米：
+# - <=1.1m: 开始按俯视图左右边界判断避让方向
+# - <=1.0m: 切线接管
+CAR_AVOIDANCE_SWITCH_DISTANCE_M = 1.1
+CAR_AVOIDANCE_SIDE_DECISION_DISTANCE_M = 1.1
+# 旧的分割平面行数门槛保留为距离估算不可用时的兜底。
 CAR_AVOIDANCE_SWITCH_MIN_BOTTOM_Y = 160.0
-# 选左/右绕车的更早判断门槛；到这里就先把方向定下来，但仍然不切线。
 CAR_AVOIDANCE_SIDE_DECISION_MIN_BOTTOM_Y = 180.0
 # 避车控制中心偏差外加量。设 10 表示最终循线误差：巡左边界 -10，巡右边界 +10。
-CAR_AVOIDANCE_CONTROL_ERROR_OFFSET_X = 30.0
+CAR_AVOIDANCE_CONTROL_ERROR_OFFSET_X = 40.0
 # 在预览画面上画出避车切线距离线；车框底边低于蓝线才允许切线避车。
 CAR_AVOIDANCE_DISTANCE_LINE_ENABLED = True
 CAR_AVOIDANCE_DISTANCE_LINE_COLOR = (255, 0, 0)
@@ -1606,10 +1677,14 @@ CAR_AVOIDANCE_CLEARING_RETURN_FRAMES = 5
 CAR_AVOIDANCE_RESET_CONTROLLER_ON_PATH_SWITCH = False
 # CLEARING 硬退出上限，避免丢车后长期挂在避车状态。
 CAR_AVOIDANCE_CLEARING_MAX_FRAMES = 20
+# 避车事件日志：只打印方向、开始、回正、结束。
+CAR_AVOIDANCE_EVENT_LOG_ENABLED = True
+# 避车详细日志默认关闭；打开该项才打印每帧详细字段。
+CAR_AVOIDANCE_DETAIL_LOG_ENABLED = False
 # 避车详细日志间隔。
 LOG_INTERVAL_CAR_AVOIDANCE_DETAIL = 1.0
-# 避车状态机过程日志，现场排查“避完车后丢线”时保持开启。
-CAR_AVOIDANCE_PROCESS_LOG_ENABLED = True
+# 避车状态机过程日志，打开后会打印较多内部字段。
+CAR_AVOIDANCE_PROCESS_LOG_ENABLED = False
 LOG_INTERVAL_CAR_AVOIDANCE_PROCESS = 0.5
 # 主分割调试图绘制风格。
 # 最终路径线颜色。

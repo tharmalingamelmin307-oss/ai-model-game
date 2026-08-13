@@ -397,6 +397,29 @@ class SegDebugOverlay:
                 int(round(float(pt[1]) * scale_y)),
             )
 
+        def _draw_boundary_polyline(polyline, color, thickness):
+            pts = None if polyline is None else np.array(polyline, dtype=np.int32).reshape((-1, 2))
+            if pts is None or len(pts) < 2:
+                return
+            skip_horizontal = bool(getattr(config, "SEG_DEBUG_BOUNDARY_SKIP_HORIZONTAL_EDGE_SEGMENTS", True))
+            max_dy = int(getattr(config, "SEG_DEBUG_BOUNDARY_HORIZONTAL_MAX_DY", 3))
+            min_dx = int(getattr(config, "SEG_DEBUG_BOUNDARY_HORIZONTAL_MIN_DX", 20))
+            for i in range(len(pts) - 1):
+                p1 = pts[i]
+                p2 = pts[i + 1]
+                dx = abs(int(p2[0]) - int(p1[0]))
+                dy = abs(int(p2[1]) - int(p1[1]))
+                if skip_horizontal and dy <= max_dy and dx >= min_dx:
+                    continue
+                cv2.line(
+                    image,
+                    (int(p1[0]), int(p1[1])),
+                    (int(p2[0]), int(p2[1])),
+                    color,
+                    thickness,
+                    cv2.LINE_AA,
+                )
+
         path_poly = _scaled_polyline(overlay.get("path"))
         left_poly = _scaled_polyline(overlay.get("left"))
         right_poly = _scaled_polyline(overlay.get("right"))
@@ -418,9 +441,9 @@ class SegDebugOverlay:
         if path_poly is not None:
             cv2.polylines(image, [path_poly], False, config.SEG_DEBUG_PATH_COLOR, path_thickness)
         if bool(getattr(config, "SEG_DEBUG_DRAW_BOUNDARIES", True)) and left_poly is not None:
-            cv2.polylines(image, [left_poly], False, config.SEG_DEBUG_LEFT_BOUNDARY_COLOR, boundary_thickness)
+            _draw_boundary_polyline(left_poly, config.SEG_DEBUG_LEFT_BOUNDARY_COLOR, boundary_thickness)
         if bool(getattr(config, "SEG_DEBUG_DRAW_BOUNDARIES", True)) and right_poly is not None:
-            cv2.polylines(image, [right_poly], False, config.SEG_DEBUG_RIGHT_BOUNDARY_COLOR, boundary_thickness)
+            _draw_boundary_polyline(right_poly, config.SEG_DEBUG_RIGHT_BOUNDARY_COLOR, boundary_thickness)
         if bool(getattr(config, "SEG_DEBUG_DRAW_MERGE_GUIDE", True)) and merge_guide_poly is not None:
             cv2.polylines(image, [merge_guide_poly], False, config.SEG_DEBUG_MERGE_GUIDE_COLOR, merge_guide_thickness, cv2.LINE_AA)
 
@@ -502,6 +525,23 @@ def draw_yolo_boxes(image, boxes):
     scale_x = img_w / float(target_w)
     scale_y = img_h / float(target_h)
 
+    def _estimate_sign_distance_m(box_h):
+        if not bool(getattr(config, "SIGN_MONOCULAR_DISTANCE_ENABLED", False)):
+            return None
+        min_h = max(1.0, float(getattr(config, "SIGN_DISTANCE_MIN_BOX_HEIGHT_PX", 8.0)))
+        if float(box_h) < min_h:
+            return None
+        try:
+            source_h = float(getattr(config, "IPM_SOURCE_SIZE", (640, 480))[1])
+            fy_source = float(config.IPM_CAMERA_K[1][1])
+            fy_target = fy_source * (float(target_h) / max(source_h, 1.0))
+            real_h = float(getattr(config, "SIGN_REAL_HEIGHT_M", 0.0))
+            if real_h <= 0.0:
+                return None
+            return float(fy_target * real_h / float(box_h))
+        except Exception:
+            return None
+
     for obj in boxes:
         rect = obj.get("rect", obj.get("box", (0, 0, 0, 0)))
         if len(rect) != 4:
@@ -526,6 +566,16 @@ def draw_yolo_boxes(image, boxes):
         cv2.rectangle(image, (x1, y1), (x2, y2), color, config.YOLO_BOX_THICKNESS)
 
         label = f"{cls_name}:{score:.2f}"
+        if (
+            cls_id == config.SIGN_CLASS_ID and
+            bool(getattr(config, "SIGN_DISTANCE_LABEL_ENABLED", True))
+        ):
+            sign_dist_m = obj.get("sign_distance_m")
+            if sign_dist_m is None:
+                sign_dist_m = _estimate_sign_distance_m(h)
+            if sign_dist_m is not None:
+                decimals = max(0, int(getattr(config, "SIGN_DISTANCE_LABEL_DECIMALS", 2)))
+                label += f" {float(sign_dist_m):.{decimals}f}m"
         if text:
             label += f" [{text}]"
 

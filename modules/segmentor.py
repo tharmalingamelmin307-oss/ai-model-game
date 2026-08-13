@@ -120,6 +120,8 @@ class RoadSegmentor:
         self.car_last_avoid_path_is_boundary = False
         self.car_last_boundary_inset_x = 0.0
         self.last_control_path_source = "normal"
+        self.last_car_avoid_event_log_state = None
+        self.last_car_avoid_event_log_at = 0.0
         self.last_car_avoid_log_at = 0.0
         self.last_car_avoid_log_state = None
         self.last_car_projection_log_at = 0.0
@@ -131,10 +133,468 @@ class RoadSegmentor:
         self.seg_strides = tuple(getattr(config, "SEG_HEAD_STRIDES", (8, 16, 32)))
         self.seg_reg_max = int(getattr(config, "SEG_REG_MAX", 16))
         self.last_infer_timing = {"rknn": 0.0, "decode": 0.0, "total": 0.0}
+        self.ipm_preview_maps = self._build_ipm_preview_maps()
 
     def _empty_seg_mask(self):
         w_seg, h_seg = config.SEG_SIZE
         return np.zeros((h_seg, w_seg), dtype=np.uint8)
+
+    def _build_ipm_preview_maps(self):
+        """预计算 IPM 小窗每个 BEV 像素对应的分割 mask 采样坐标."""
+        if not bool(getattr(config, "IPM_PREVIEW_ENABLED", False)):
+            return None
+
+        try:
+            preview_w, preview_h = map(int, getattr(config, "IPM_PREVIEW_SIZE", (160, 180)))
+            if preview_w <= 0 or preview_h <= 0:
+                return None
+
+            source_w, source_h = map(float, getattr(config, "IPM_SOURCE_SIZE", (640, 480)))
+            target_w, target_h = map(float, config.TARGET_RES)
+            seg_w, seg_h = map(float, config.SEG_SIZE)
+            fx = float(config.IPM_CAMERA_K[0][0])
+            fy = float(config.IPM_CAMERA_K[1][1])
+            cx = float(config.IPM_CAMERA_K[0][2])
+            cy = float(config.IPM_CAMERA_K[1][2])
+            camera_height = float(getattr(config, "IPM_CAMERA_HEIGHT", 0.14))
+            forward_offset = float(getattr(config, "IPM_CAMERA_FORWARD_OFFSET", 0.0))
+            x_min, x_max = map(float, getattr(
+                config,
+                "IPM_PREVIEW_X_RANGE",
+                getattr(config, "IPM_X_RANGE", (-1.8, 1.8)),
+            ))
+            z_near, z_far = map(float, getattr(
+                config,
+                "IPM_PREVIEW_Z_RANGE",
+                getattr(config, "IPM_Z_RANGE", (0.18, 5.0)),
+            ))
+            if x_max <= x_min or z_far <= z_near:
+                x_min, x_max = map(float, getattr(config, "IPM_X_RANGE", (-1.8, 1.8)))
+                z_near, z_far = map(float, getattr(config, "IPM_Z_RANGE", (0.18, 5.0)))
+
+            xs = np.linspace(x_min, x_max, preview_w, dtype=np.float32)
+            zs = np.linspace(z_far, z_near, preview_h, dtype=np.float32)
+            grid_x, grid_z = np.meshgrid(xs, zs)
+            z_eff = np.maximum(grid_z + forward_offset, 1e-4)
+
+            src_u = fx * grid_x / z_eff + cx
+            src_v = fy * camera_height / z_eff + cy
+
+            target_x = src_u * (target_w / max(source_w, 1.0))
+            target_y = src_v * (target_h / max(source_h, 1.0))
+            crop_ratio = float(getattr(config, "SEG_INPUT_CROP_TOP_RATIO", 0.0))
+            crop_ratio = max(0.0, min(0.95, crop_ratio))
+            crop_y = target_h * crop_ratio
+            crop_h = max(1.0, target_h - crop_y)
+
+            map_x = target_x * (seg_w / max(target_w, 1.0))
+            map_y = (target_y - crop_y) * (seg_h / crop_h)
+            invalid = (
+                (src_u < 0.0) | (src_u > source_w - 1.0) |
+                (src_v < 0.0) | (src_v > source_h - 1.0) |
+                (map_x < 0.0) | (map_x > seg_w - 1.0) |
+                (map_y < 0.0) | (map_y > seg_h - 1.0)
+            )
+            map_x = map_x.astype(np.float32)
+            map_y = map_y.astype(np.float32)
+            map_x[invalid] = -1.0
+            map_y[invalid] = -1.0
+            return map_x, map_y
+        except Exception as exc:
+            print(f"IPM preview disabled: {exc}", flush=True)
+            return None
+
+    def _target_point_to_ipm_preview(self, x_target, y_target, view_w, view_h):
+        """把 TARGET_RES 图像点按固定地面假设反投到 IPM 小窗坐标."""
+        ground = self._target_point_to_ground_xz(x_target, y_target)
+        if ground is None:
+            return None
+        return self._ground_xz_to_ipm_preview(ground[0], ground[1], view_w, view_h)
+
+    def _ipm_preview_ranges(self):
+        """返回当前 IPM 小窗显示使用的物理 X/Z 范围。"""
+        x_min, x_max = map(float, getattr(
+            config,
+            "IPM_PREVIEW_X_RANGE",
+            getattr(config, "IPM_X_RANGE", (-1.8, 1.8)),
+        ))
+        z_near, z_far = map(float, getattr(
+            config,
+            "IPM_PREVIEW_Z_RANGE",
+            getattr(config, "IPM_Z_RANGE", (0.18, 5.0)),
+        ))
+        if x_max <= x_min or z_far <= z_near:
+            x_min, x_max = map(float, getattr(config, "IPM_X_RANGE", (-1.8, 1.8)))
+            z_near, z_far = map(float, getattr(config, "IPM_Z_RANGE", (0.18, 5.0)))
+        return x_min, x_max, z_near, z_far
+
+    def _ground_xz_to_ipm_preview(self, x, z, view_w, view_h):
+        """把物理地面 X/Z 映射到 IPM 小窗坐标。"""
+        try:
+            x_min, x_max = map(float, getattr(
+                config,
+                "IPM_PREVIEW_X_RANGE",
+                getattr(config, "IPM_X_RANGE", (-1.8, 1.8)),
+            ))
+            z_near, z_far = map(float, getattr(
+                config,
+                "IPM_PREVIEW_Z_RANGE",
+                getattr(config, "IPM_Z_RANGE", (0.18, 5.0)),
+            ))
+            if x_max <= x_min or z_far <= z_near:
+                x_min, x_max = map(float, getattr(config, "IPM_X_RANGE", (-1.8, 1.8)))
+                z_near, z_far = map(float, getattr(config, "IPM_Z_RANGE", (0.18, 5.0)))
+
+            x = float(x)
+            z = float(z)
+            if z < z_near or z > z_far:
+                return None
+            if x < x_min or x > x_max:
+                return None
+
+            px = int(round((x - x_min) / max(x_max - x_min, 1e-6) * float(view_w - 1)))
+            py = int(round((z_far - z) / max(z_far - z_near, 1e-6) * float(view_h - 1)))
+            px = int(np.clip(px, 0, view_w - 1))
+            py = int(np.clip(py, 0, view_h - 1))
+            return px, py
+        except Exception:
+            return None
+
+    def _target_point_ground_z(self, x_target, y_target):
+        """把 TARGET_RES 图像点按地面假设反投成物理前向距离 Z."""
+        ground = self._target_point_to_ground_xz(x_target, y_target)
+        if ground is None:
+            return None
+        return float(ground[1])
+
+    def _target_point_to_ground_xz(self, x_target, y_target):
+        """把 TARGET_RES 图像点按地面假设反投成物理 X/Z."""
+        try:
+            target_w, target_h = map(float, config.TARGET_RES)
+            source_w, source_h = map(float, getattr(config, "IPM_SOURCE_SIZE", (640, 480)))
+            fx = float(config.IPM_CAMERA_K[0][0])
+            fy = float(config.IPM_CAMERA_K[1][1])
+            cx = float(config.IPM_CAMERA_K[0][2])
+            cy = float(config.IPM_CAMERA_K[1][2])
+            camera_height = float(getattr(config, "IPM_CAMERA_HEIGHT", 0.14))
+            forward_offset = float(getattr(config, "IPM_CAMERA_FORWARD_OFFSET", 0.0))
+            u = float(x_target) * (source_w / max(target_w, 1.0))
+            v = float(y_target) * (source_h / max(target_h, 1.0))
+            denom = v - cy
+            if denom <= 1e-4:
+                return None
+            z_eff = fy * camera_height / denom
+            z = z_eff - forward_offset
+            x = (u - cx) * z_eff / fx
+            return float(x), float(z)
+        except Exception:
+            return None
+
+    def _target_rect_bottom_ground_distance_m(self, rect):
+        """用检测框底边中点的地面反投估算距离，适用于车/人脚底这类贴地目标。"""
+        if rect is None or len(rect) != 4:
+            return None
+        try:
+            x, y, w, h = [float(v) for v in rect]
+        except (TypeError, ValueError):
+            return None
+        if w <= 0.0 or h <= 0.0:
+            return None
+        return self._target_point_ground_z(x + w * 0.5, y + h)
+
+    def _collect_ipm_object_points(self, current_yolo_boxes, view_w, view_h):
+        """收集需要画到 IPM 小窗里的行人/车辆检测框点."""
+        points = []
+        if not current_yolo_boxes:
+            return points
+
+        person_name = str(getattr(config, "PERSON_CLASS_NAME", "person"))
+        radius = max(1, int(getattr(config, "IPM_PREVIEW_OBJECT_POINT_RADIUS", 4)))
+        thickness = int(getattr(config, "IPM_PREVIEW_OBJECT_POINT_THICKNESS", -1))
+        car_cls_id = config.CLASS_NAMES.index("car") if "car" in config.CLASS_NAMES else -1
+        person_cls_id = config.CLASS_NAMES.index(person_name) if person_name in config.CLASS_NAMES else -1
+        for obj in current_yolo_boxes:
+            cls_name = str(obj.get("class_name", ""))
+            try:
+                cls_id = int(obj.get("class_id", -1))
+            except (TypeError, ValueError):
+                cls_id = -1
+            rect = obj.get("rect", obj.get("box", None))
+            if rect is None or len(rect) != 4:
+                continue
+            x, y, w, h = [float(v) for v in rect]
+            if w <= 0.0 or h <= 0.0:
+                continue
+
+            if cls_name == person_name or cls_id == person_cls_id:
+                pt = self._target_point_to_ipm_preview(x + w * 0.5, y + h, view_w, view_h)
+                if pt is not None:
+                    points.append((
+                        pt,
+                        getattr(config, "IPM_PREVIEW_PERSON_POINT_COLOR", (0, 0, 255)),
+                        radius,
+                        thickness,
+                    ))
+            elif cls_name == "car" or cls_id == car_cls_id:
+                for target_pt in ((x, y + h), (x + w, y + h)):
+                    pt = self._target_point_to_ipm_preview(target_pt[0], target_pt[1], view_w, view_h)
+                    if pt is not None:
+                        points.append((
+                            pt,
+                            getattr(config, "IPM_PREVIEW_CAR_POINT_COLOR", (0, 255, 255)),
+                            radius,
+                            thickness,
+                        ))
+        return points
+
+    def _ipm_preview_z_to_y(self, z, view_h):
+        """把物理前向距离 Z 映射到 IPM 小窗 y 坐标."""
+        try:
+            z_near, z_far = map(float, getattr(
+                config,
+                "IPM_PREVIEW_Z_RANGE",
+                getattr(config, "IPM_Z_RANGE", (0.18, 5.0)),
+            ))
+            if z_far <= z_near:
+                z_near, z_far = map(float, getattr(config, "IPM_Z_RANGE", (0.18, 5.0)))
+            z = float(z)
+            if z < z_near or z > z_far:
+                return None
+            return int(round((z_far - z) / max(z_far - z_near, 1e-6) * float(view_h - 1)))
+        except Exception:
+            return None
+
+    def _ipm_preview_z_to_y_clamped(self, z, view_h, margin_y=0):
+        """把 Z 映射到小窗 y，并把超出显示范围的值夹到可见区域内."""
+        try:
+            z_near, z_far = map(float, getattr(
+                config,
+                "IPM_PREVIEW_Z_RANGE",
+                getattr(config, "IPM_Z_RANGE", (0.18, 5.0)),
+            ))
+            if z_far <= z_near:
+                z_near, z_far = map(float, getattr(config, "IPM_Z_RANGE", (0.18, 5.0)))
+            z = float(np.clip(float(z), z_near, z_far))
+            y = int(round((z_far - z) / max(z_far - z_near, 1e-6) * float(view_h - 1)))
+            margin_y = max(0, int(margin_y))
+            return int(np.clip(y, margin_y, max(margin_y, view_h - 1 - margin_y)))
+        except Exception:
+            return None
+
+    def _collect_ipm_sign_bottom_lines(self, current_yolo_boxes, view_h):
+        """收集 sign 检测框底边在 IPM 小窗中的横线 y 坐标."""
+        lines = []
+        if not current_yolo_boxes or not bool(getattr(config, "IPM_PREVIEW_SIGN_BOTTOM_LINE_ENABLED", True)):
+            return lines
+
+        sign_cls_id = int(getattr(config, "SIGN_CLASS_ID", -1))
+        for obj in current_yolo_boxes:
+            cls_name = str(obj.get("class_name", ""))
+            try:
+                cls_id = int(obj.get("class_id", -1))
+            except (TypeError, ValueError):
+                cls_id = -1
+            if cls_name != "sign" and cls_id != sign_cls_id:
+                continue
+
+            rect = obj.get("rect", obj.get("box", None))
+            if rect is None or len(rect) != 4:
+                continue
+            x, y, w, h = [float(v) for v in rect]
+            if w <= 0.0 or h <= 0.0:
+                continue
+
+            z = self._target_point_ground_z(x + w * 0.5, y + h)
+            if z is None:
+                continue
+            margin_y = max(0, int(getattr(config, "IPM_PREVIEW_SIGN_BOTTOM_LINE_MARGIN_Y", 18)))
+            line_y = self._ipm_preview_z_to_y_clamped(z, view_h, margin_y=margin_y)
+            if line_y is not None:
+                lines.append(int(line_y))
+        return lines
+
+    def _boundary_points_to_ipm_preview(self, boundary_points, view_w, view_h, max_points=80):
+        """把当前路径边界点投到 IPM 小窗坐标。"""
+        if boundary_points is None:
+            return None
+        pts = np.array(boundary_points, dtype=np.float32).reshape((-1, 2))
+        if len(pts) < 2:
+            return None
+
+        max_points = max(2, int(max_points))
+        if len(pts) > max_points:
+            idxs = np.linspace(0, len(pts) - 1, max_points).astype(np.int32)
+            pts = pts[idxs]
+
+        out = []
+        for x_seg, y_seg in pts:
+            target_x, target_y = self._seg_point_to_target(float(x_seg), float(y_seg))
+            ipm_pt = self._target_point_to_ipm_preview(target_x, target_y, view_w, view_h)
+            if ipm_pt is not None:
+                out.append(ipm_pt)
+        if len(out) < 2:
+            return None
+        return np.array(out, dtype=np.int32).reshape((-1, 1, 2))
+
+    def _draw_ipm_road_boundaries(self, view):
+        """在 IPM 小窗中绘制当前选中道路的左右边界。"""
+        if view is None or not bool(getattr(config, "IPM_PREVIEW_DRAW_ROAD_BOUNDARIES", True)):
+            return view
+
+        overlay = self.debug_overlay.overlay
+        view_h, view_w = view.shape[:2]
+        left_poly = self._boundary_points_to_ipm_preview(overlay.get("left"), view_w, view_h)
+        right_poly = self._boundary_points_to_ipm_preview(overlay.get("right"), view_w, view_h)
+        line_thickness = max(1, int(getattr(config, "IPM_PREVIEW_BOUNDARY_LINE_THICKNESS", 2)))
+        point_radius = max(0, int(getattr(config, "IPM_PREVIEW_BOUNDARY_POINT_RADIUS", 2)))
+
+        def _draw(poly, color):
+            if poly is None:
+                return
+            cv2.polylines(view, [poly], False, color, line_thickness, cv2.LINE_AA)
+            if point_radius > 0:
+                for pt in poly.reshape((-1, 2)):
+                    cv2.circle(view, (int(pt[0]), int(pt[1])), point_radius, color, -1, cv2.LINE_AA)
+
+        _draw(left_poly, getattr(config, "IPM_PREVIEW_LEFT_BOUNDARY_COLOR", (255, 255, 0)))
+        _draw(right_poly, getattr(config, "IPM_PREVIEW_RIGHT_BOUNDARY_COLOR", (0, 165, 255)))
+        return view
+
+    def _render_ipm_mask_preview(self, mask, current_yolo_boxes=None):
+        """把当前道路 mask 采样成右上角鸟瞰小窗图像."""
+        if self.ipm_preview_maps is None or mask is None or mask.size == 0:
+            return None
+
+        map_x, map_y = self.ipm_preview_maps
+        ipm_mask = cv2.remap(
+            (mask > 0).astype(np.uint8) * 255,
+            map_x,
+            map_y,
+            interpolation=cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+        view = np.empty((ipm_mask.shape[0], ipm_mask.shape[1], 3), dtype=np.uint8)
+        view[:, :] = np.array(getattr(config, "IPM_PREVIEW_BG_COLOR", (12, 12, 12)), dtype=np.uint8)
+        active = ipm_mask > 0
+        if np.any(active):
+            color = np.array(getattr(config, "IPM_PREVIEW_MASK_COLOR", (0, 255, 80)), dtype=np.float32)
+            alpha = float(np.clip(getattr(config, "IPM_PREVIEW_ALPHA", 0.88), 0.0, 1.0))
+            view[active] = (
+                view[active].astype(np.float32) * (1.0 - alpha) + color * alpha
+            ).astype(np.uint8)
+
+        center_x = view.shape[1] // 2
+        cv2.line(
+            view,
+            (center_x, 0),
+            (center_x, view.shape[0] - 1),
+            getattr(config, "IPM_PREVIEW_CENTER_LINE_COLOR", (80, 80, 80)),
+            1,
+            cv2.LINE_AA,
+        )
+        if bool(getattr(config, "IPM_PREVIEW_DISTANCE_LINE_ENABLED", True)):
+            line_y = self._ipm_preview_z_to_y(
+                float(getattr(config, "IPM_PREVIEW_DISTANCE_LINE_Z", 1.0)),
+                view.shape[0],
+            )
+            if line_y is not None:
+                line_y = int(np.clip(line_y, 0, view.shape[0] - 1))
+                cv2.line(
+                    view,
+                    (0, line_y),
+                    (view.shape[1] - 1, line_y),
+                    getattr(config, "IPM_PREVIEW_DISTANCE_LINE_COLOR", (255, 255, 0)),
+                    max(1, int(getattr(config, "IPM_PREVIEW_DISTANCE_LINE_THICKNESS", 2))),
+                    cv2.LINE_AA,
+                )
+        for line_y in self._collect_ipm_sign_bottom_lines(current_yolo_boxes, view.shape[0]):
+            cv2.line(
+                view,
+                (0, line_y),
+                (view.shape[1] - 1, line_y),
+                getattr(config, "IPM_PREVIEW_SIGN_BOTTOM_LINE_SHADOW_COLOR", (0, 0, 0)),
+                max(1, int(getattr(config, "IPM_PREVIEW_SIGN_BOTTOM_LINE_THICKNESS", 4))) + 2,
+                cv2.LINE_AA,
+            )
+            cv2.line(
+                view,
+                (0, line_y),
+                (view.shape[1] - 1, line_y),
+                getattr(config, "IPM_PREVIEW_SIGN_BOTTOM_LINE_COLOR", (255, 0, 255)),
+                max(1, int(getattr(config, "IPM_PREVIEW_SIGN_BOTTOM_LINE_THICKNESS", 4))),
+                cv2.LINE_AA,
+            )
+        self._draw_ipm_road_boundaries(view)
+        for point, color, radius, thickness in self._collect_ipm_object_points(
+            current_yolo_boxes,
+            view.shape[1],
+            view.shape[0],
+        ):
+            cv2.circle(view, point, radius, color, thickness, cv2.LINE_AA)
+        return view
+
+    def _draw_ipm_preview_window(self, image, mask, current_yolo_boxes=None):
+        """把 IPM mask 小窗贴到预览画面右上角."""
+        if image is None or not bool(getattr(config, "IPM_PREVIEW_ENABLED", False)):
+            return image
+
+        ipm_view = self._render_ipm_mask_preview(mask, current_yolo_boxes=current_yolo_boxes)
+        if ipm_view is None:
+            return image
+
+        img_h, img_w = image.shape[:2]
+        desired_w, desired_h = map(int, getattr(config, "IPM_PREVIEW_SIZE", (160, 180)))
+        if img_w < 600 or img_h < 400:
+            scale = min(img_w / float(config.TARGET_RES[0]), img_h / float(config.TARGET_RES[1]))
+            scale = max(0.35, min(1.0, scale))
+            desired_w = int(round(desired_w * scale))
+            desired_h = int(round(desired_h * scale))
+        win_w = max(24, min(desired_w, img_w - 4))
+        win_h = max(24, min(desired_h, img_h - 4))
+        if ipm_view.shape[1] != win_w or ipm_view.shape[0] != win_h:
+            ipm_view = cv2.resize(ipm_view, (win_w, win_h), interpolation=cv2.INTER_NEAREST)
+
+        anchor_x, anchor_y = map(int, getattr(config, "IPM_PREVIEW_TOP_RIGHT", (img_w - 12, 8)))
+        x2 = max(1, min(anchor_x, img_w - 2))
+        y1 = max(2, min(anchor_y, img_h - win_h - 2))
+        x1 = max(2, x2 - win_w)
+        x2 = min(img_w - 2, x1 + win_w)
+        y2 = min(img_h - 2, y1 + win_h)
+        roi = image[y1:y2, x1:x2]
+        if roi.shape[:2] != ipm_view.shape[:2]:
+            ipm_view = cv2.resize(ipm_view, (roi.shape[1], roi.shape[0]), interpolation=cv2.INTER_NEAREST)
+
+        roi[:, :] = ipm_view
+        cv2.rectangle(
+            image,
+            (x1, y1),
+            (x2 - 1, y2 - 1),
+            getattr(config, "IPM_PREVIEW_BORDER_COLOR", (0, 255, 255)),
+            1,
+            cv2.LINE_AA,
+        )
+        if bool(getattr(config, "IPM_PREVIEW_LABEL_ENABLED", True)):
+            label = str(getattr(config, "IPM_PREVIEW_LABEL", "IPM mask"))
+            label_h = min(18, max(12, y2 - y1))
+            cv2.rectangle(
+                image,
+                (x1 + 1, y1 + 1),
+                (x2 - 2, y1 + label_h),
+                getattr(config, "IPM_PREVIEW_LABEL_BG_COLOR", (0, 0, 0)),
+                -1,
+            )
+            cv2.putText(
+                image,
+                label,
+                (x1 + 4, y1 + label_h - 5),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                float(getattr(config, "IPM_PREVIEW_LABEL_FONT_SCALE", 0.34)),
+                getattr(config, "IPM_PREVIEW_LABEL_COLOR", (255, 255, 255)),
+                int(getattr(config, "IPM_PREVIEW_LABEL_THICKNESS", 1)),
+                cv2.LINE_AA,
+            )
+        return image
 
     def _apply_mask_ignore_border(self, mask):
         """把上下边框行强制置黑，防止边界 trace 爬到 ROI 边缘。"""
@@ -281,14 +741,58 @@ class RoadSegmentor:
 
     def _log_car_avoidance_process(self, debug, event="", force=False):
         """打印避车状态机过程，用来定位躲车后丢线前的状态流转."""
-        if not bool(getattr(config, "CAR_AVOIDANCE_PROCESS_LOG_ENABLED", True)):
-            return
-
-        state = str(debug.get("state", self.car_avoidance_state))
         event = str(event or debug.get("event", ""))
+        state = str(debug.get("state", self.car_avoidance_state))
         active = bool(debug.get("active", False))
         cycle_id = int(debug.get("cycle_id", self.car_avoidance_cycle_id))
         detected = int(debug.get("detected_cars", 0))
+        ground_z = debug.get("ground_distance_m")
+        ground_z_text = "无" if ground_z is None else f"{float(ground_z):.2f}m"
+        boundary_side = str(debug.get("boundary_side", "") or "").lower()
+        nearest_side = str(debug.get("nearest_boundary_side", "") or "").lower()
+
+        def _side_cn(side):
+            if side == "left":
+                return "左侧"
+            if side == "right":
+                return "右侧"
+            return "未知侧"
+
+        if bool(getattr(config, "CAR_AVOIDANCE_EVENT_LOG_ENABLED", True)):
+            event_message = ""
+            if event == "side_decided":
+                event_message = (
+                    f"避车#{cycle_id}: 方向已判定，车在{_side_cn(nearest_side)}，"
+                    f"走{_side_cn(boundary_side)} car_z={ground_z_text}"
+                )
+            elif event == "enter_avoiding":
+                event_message = f"避车#{cycle_id}: 开始，走{_side_cn(boundary_side)} car_z={ground_z_text}"
+            elif event == "lost_enter_clearing":
+                event_message = f"避车#{cycle_id}: 目标消失，开始回正"
+            elif event == "clear_done":
+                event_message = f"避车#{cycle_id}: 结束，回到正常循线"
+            elif event == "pre_switch_lost_done":
+                event_message = "避车: 目标消失，未进入避车"
+
+            if event_message:
+                event_signature = (
+                    event,
+                    cycle_id,
+                    str(boundary_side or ""),
+                    str(nearest_side or ""),
+                    None if ground_z is None else round(float(ground_z), 2),
+                )
+                now = time.monotonic()
+                if force or event_signature != self.last_car_avoid_event_log_state or now - float(self.last_car_avoid_event_log_at) >= 2.0:
+                    print(f">>> {event_message}", flush=True)
+                    self.last_car_avoid_event_log_state = event_signature
+                    self.last_car_avoid_event_log_at = now
+
+        if not bool(getattr(config, "CAR_AVOIDANCE_PROCESS_LOG_ENABLED", False)):
+            return
+        if event in ("paused", "avoiding", "clearing", "tracking_wait_confirm", "locked_not_ready"):
+            return
+
         boundary_strength = float(debug.get("boundary_strength_x", 0.0))
         side_ready = bool(debug.get("boundary_side_ready", False))
         signature = (
@@ -302,6 +806,7 @@ class RoadSegmentor:
             str(debug.get("boundary_side", "") or ""),
             int(side_ready),
             round(boundary_strength, 1),
+            None if debug.get("ground_distance_m") is None else round(float(debug.get("ground_distance_m")), 2),
         )
 
         now = time.monotonic()
@@ -331,7 +836,10 @@ class RoadSegmentor:
         stage_label = "避车过程"
         stage_note = ""
         line_suffix = ""
-        if event == "enter_avoiding":
+        if event == "side_decided":
+            stage_label = "避车方向"
+            stage_note = "判断方向"
+        elif event == "enter_avoiding":
             stage_label = "避车开始"
             stage_note = "开始"
             line_suffix = "\033[0m"
@@ -342,12 +850,15 @@ class RoadSegmentor:
             stage_label = "避车结束"
             stage_note = "结束"
             line_suffix = "\033[0m"
+        if event not in ("side_decided", "enter_avoiding", "lost_enter_clearing", "clear_done", "pre_switch_lost_done", "cycle_limit"):
+            return
+
         print(
             ("\033[92m" if event in ("enter_avoiding", "clear_done") else "") +
             f"避车#{cycle_id} {stage_label}: {stage_note} "
             f"state={state} det={detected} locked={int(bool(debug.get('locked_confirmed', False)))} "
             f"hits={int(debug.get('locked_hit_frames', 0))} miss={int(debug.get('miss_frames', 0))} "
-            f"clear={int(debug.get('clear_frames', 0))} rows={rows_text} center={center_text} "
+            f"clear={int(debug.get('clear_frames', 0))} rows={rows_text} car_z={ground_z_text} center={center_text} "
             f"inset={float(debug.get('boundary_inset_x', 0.0)):.1f} side_ready={side_ready_text} "
             f"ctrl_off={control_error_offset:.1f} "
             f"weight={float(debug.get('avoid_weight', 0.0)):.2f} "
@@ -1365,8 +1876,8 @@ class RoadSegmentor:
             }
         return None
 
-    def _merge_bottom_width_exit_ready(self, search_mask):
-        """底部连续若干行总白区宽度小于阈值时，认为汇合补线可以退出."""
+    def _merge_bottom_width_exit_ready(self, search_mask, merge_side=None):
+        """底部变窄且补线侧不再贴边时，认为汇合补线可以退出."""
         if search_mask is None or search_mask.size == 0:
             return False
 
@@ -1395,10 +1906,14 @@ class RoadSegmentor:
         if no_edge_bottom < no_edge_top:
             no_edge_top, no_edge_bottom = no_edge_bottom, no_edge_top
         max_touch_rows = max(0, int(getattr(config, "MERGE_STATE_EXIT_NO_EDGE_MAX_TOUCH_ROWS", 0)))
+        merge_side = str(merge_side or "").lower()
+        if merge_side not in ("left", "right"):
+            return False
+        edge_index = 0 if merge_side == "left" else -1
         touch_rows = 0
         for y in range(no_edge_top, no_edge_bottom + 1):
             row = search_mask[y]
-            if row[0] > 0 or row[-1] > 0:
+            if row[edge_index] > 0:
                 touch_rows += 1
                 if touch_rows > max_touch_rows:
                     return False
@@ -1469,7 +1984,7 @@ class RoadSegmentor:
             else max(0.0, float(now_s - self.merge_state_enter_time))
         )
         hold_ready = hold_elapsed_s is None or hold_elapsed_s >= min_hold_s
-        if hold_ready and self._merge_bottom_width_exit_ready(search_mask):
+        if hold_ready and self._merge_bottom_width_exit_ready(search_mask, self.merge_state_side):
             self.merge_state_exit_frames += 1
         else:
             self.merge_state_exit_frames = 0
@@ -2248,8 +2763,15 @@ class RoadSegmentor:
         x, y, w, h = rect
         if w <= 1 or h <= 1:
             return None
-        if float(y) + float(h) <= self.seg_crop_top_target_y:
-            return None
+        bottom_y = float(y) + float(h)
+        if bottom_y <= self.seg_crop_top_target_y:
+            allow_by_distance = False
+            if class_name == "car":
+                car_z = self._target_rect_bottom_ground_distance_m(rect)
+                trigger_z = float(getattr(config, "CAR_AVOIDANCE_SIDE_DECISION_DISTANCE_M", 0.0))
+                allow_by_distance = car_z is not None and trigger_z > 0.0 and float(car_z) <= trigger_z
+            if not allow_by_distance:
+                return None
 
         corners = np.array([
             [x, y],
@@ -2282,6 +2804,7 @@ class RoadSegmentor:
                 "class_name": obj.get("class_name", "obj"),
                 "class_id": obj.get("class_id", -1),
                 "score": float(obj.get("score", 0.0)),
+                "rect": list(obj.get("rect", [])),
                 "seg_box": seg_box,
             })
 
@@ -2314,8 +2837,16 @@ class RoadSegmentor:
         )
         rect = nearest.get("rect", [0, 0, 0, 0])
         bottom_y = float(rect[1]) + float(rect[3]) if len(rect) == 4 else -1.0
+        car_z = self._target_rect_bottom_ground_distance_m(rect)
+        side_trigger_z = float(getattr(config, "CAR_AVOIDANCE_SIDE_DECISION_DISTANCE_M", 0.0))
+        cut_trigger_z = float(getattr(config, "CAR_AVOIDANCE_SWITCH_DISTANCE_M", 0.0))
         roi_top = float(self.seg_crop_top_target_y)
-        state = (len(yolo_cars), int(round(bottom_y)), int(round(roi_top)))
+        state = (
+            len(yolo_cars),
+            int(round(bottom_y)),
+            int(round(roi_top)),
+            None if car_z is None else round(float(car_z), 2),
+        )
         now = time.monotonic()
         interval = max(0.2, float(getattr(config, "LOG_INTERVAL_CAR_AVOIDANCE_PROCESS", 0.5)))
         if state == self.last_car_projection_log_state and now - float(self.last_car_projection_log_at) < interval:
@@ -2323,9 +2854,13 @@ class RoadSegmentor:
 
         self.last_car_projection_log_state = state
         self.last_car_projection_log_at = now
+        car_z_text = "无" if car_z is None else f"{float(car_z):.2f}m"
+        side_trigger_text = "关闭" if side_trigger_z <= 0.0 else f"{side_trigger_z:.2f}m"
+        cut_trigger_text = "关闭" if cut_trigger_z <= 0.0 else f"{cut_trigger_z:.2f}m"
         print(
             f"避车观察: yolo_car={len(yolo_cars)} planning_car=0 "
-            f"nearest_bottom_y={bottom_y:.1f} seg_roi_top_y={roi_top:.1f}",
+            f"car_z={car_z_text} side_trig={side_trigger_text} cut_trig={cut_trigger_text} "
+            f"bottom_y={bottom_y:.1f} seg_roi_top_y={roi_top:.1f}",
             flush=True,
         )
 
@@ -2479,6 +3014,38 @@ class RoadSegmentor:
             return left_x, right_x, None
         return left_x, right_x, max(0.0, float(right_x) - float(left_x))
 
+    def _seg_point_to_target(self, x_seg, y_seg):
+        """把分割平面坐标还原到 TARGET_RES 坐标。"""
+        target_x = float(x_seg) / max(float(self.scale_x_to_seg), 1e-6)
+        target_y = float(y_seg) / max(float(self.scale_y_to_seg), 1e-6) + float(self.seg_crop_top_target_y)
+        return target_x, target_y
+
+    def _boundary_ground_x_at_z(self, boundary_points, target_z):
+        """把图像边界点投到地面后，按 Z 插值得到物理 X。"""
+        if boundary_points is None:
+            return None
+        pts = np.array(boundary_points, dtype=np.float32).reshape((-1, 2))
+        ground_pts = []
+        for x_seg, y_seg in pts:
+            target_pt = self._seg_point_to_target(float(x_seg), float(y_seg))
+            ground = self._target_point_to_ground_xz(target_pt[0], target_pt[1])
+            if ground is not None and np.isfinite(ground[0]) and np.isfinite(ground[1]):
+                ground_pts.append(ground)
+        if len(ground_pts) < 2:
+            return None
+        ground_arr = np.array(ground_pts, dtype=np.float32)
+        order = np.argsort(ground_arr[:, 1])
+        zs = ground_arr[order, 1]
+        xs = ground_arr[order, 0]
+        unique_zs, unique_indices = np.unique(zs, return_index=True)
+        unique_xs = xs[unique_indices]
+        if len(unique_zs) < 2:
+            return None
+        z = float(target_z)
+        if z < float(unique_zs[0]) or z > float(unique_zs[-1]):
+            return None
+        return float(np.interp(z, unique_zs, unique_xs))
+
     def _select_car_avoidance_boundary_side(self, locked_car, left_boundary, right_boundary):
         """根据车框底边几何选择更空的一侧做避车参考线.
 
@@ -2531,6 +3098,37 @@ class RoadSegmentor:
             if selected_x is None:
                 return None, None
             return float(selected_x), float(selected_x) - target_x
+
+        ground_left = measurement.get("ground_bottom_left")
+        ground_right = measurement.get("ground_bottom_right")
+        ground_distance_m = measurement.get("ground_distance_m")
+        if (
+            ground_left is not None and
+            ground_right is not None and
+            ground_distance_m is not None and
+            left_boundary is not None and
+            right_boundary is not None
+        ):
+            bev_left_x = self._boundary_ground_x_at_z(left_boundary, float(ground_distance_m))
+            bev_right_x = self._boundary_ground_x_at_z(right_boundary, float(ground_distance_m))
+            if bev_left_x is not None and bev_right_x is not None:
+                car_left_x = float(ground_left[0])
+                car_right_x = float(ground_right[0])
+                left_clearance = car_left_x - float(bev_left_x)
+                right_clearance = float(bev_right_x) - car_right_x
+                bev_width = max(1e-3, float(bev_right_x) - float(bev_left_x))
+                boundary_nearest = "left" if left_clearance <= right_clearance else "right"
+                avoid_side = _avoid_from_nearest(boundary_nearest)
+                boundary_x, boundary_error = _selected_boundary(avoid_side)
+                confidence = min(1.0, abs(left_clearance - right_clearance) / max(bev_width, 1e-3))
+                return (
+                    avoid_side,
+                    boundary_x,
+                    boundary_error,
+                    boundary_nearest,
+                    "bev_boundary",
+                    confidence,
+                )
 
         if left_x is not None and right_x is not None:
             left_clearance = left_bottom_x - float(left_x)
@@ -2593,6 +3191,18 @@ class RoadSegmentor:
         max_area = float(getattr(config, "CAR_AVOIDANCE_MAX_AREA", 0.0))
         if max_area > 0.0 and area > max_area:
             return None
+        rect = item.get("rect")
+        ground_distance_m = self._target_rect_bottom_ground_distance_m(rect)
+        ground_bottom_left = None
+        ground_bottom_right = None
+        if rect is not None and len(rect) == 4:
+            try:
+                rx, ry, rw, rh = [float(v) for v in rect]
+                ground_bottom_left = self._target_point_to_ground_xz(rx, ry + rh)
+                ground_bottom_right = self._target_point_to_ground_xz(rx + rw, ry + rh)
+            except (TypeError, ValueError):
+                ground_bottom_left = None
+                ground_bottom_right = None
 
         y_sorted = np.argsort(box[:, 1])
         bottom_pts = box[y_sorted[-2:]]
@@ -2623,6 +3233,9 @@ class RoadSegmentor:
             "bottom_center": (bottom_center_x, bottom_center_y),
             "raw_bottom_y": raw_bottom_y,
             "raw_top_y": raw_top_y,
+            "ground_distance_m": ground_distance_m,
+            "ground_bottom_left": ground_bottom_left,
+            "ground_bottom_right": ground_bottom_right,
         }
 
     def _update_locked_car(self, measurements, base, hold_misses=True):
@@ -2774,9 +3387,15 @@ class RoadSegmentor:
         center_y = float(np.clip(smooth_cy, path_y_min, path_y_max))
         path_bottom_y = float(np.max(base[:, 1]))
         rows_to_car = max(0.0, path_bottom_y - center_y)
-        switch_rows = max(0.0, float(getattr(config, "CAR_AVOIDANCE_SWITCH_MIN_BOTTOM_Y", 160.0)))
-        if rows_to_car > switch_rows:
-            return 0.0, (center_y, path_bottom_y), False, "switch_rows_limit", None
+        ground_distance_m = measurement.get("ground_distance_m")
+        switch_distance_m = float(getattr(config, "CAR_AVOIDANCE_SWITCH_DISTANCE_M", 0.0))
+        if switch_distance_m > 0.0 and ground_distance_m is not None:
+            if float(ground_distance_m) > switch_distance_m:
+                return 0.0, (center_y, path_bottom_y), False, "switch_distance_limit", None
+        else:
+            switch_rows = max(0.0, float(getattr(config, "CAR_AVOIDANCE_SWITCH_MIN_BOTTOM_Y", 160.0)))
+            if rows_to_car > switch_rows:
+                return 0.0, (center_y, path_bottom_y), False, "switch_rows_limit", None
 
         _left_x, _right_x, road_width = self._car_road_width_at_y(
             left_boundary,
@@ -2913,17 +3532,6 @@ class RoadSegmentor:
                 return offset
             return 0.0
 
-        if not bool(state_updates_enabled):
-            debug["cycle_id"] = int(self.car_avoidance_cycle_id)
-            debug["state"] = self.car_avoidance_state
-            debug["clear_frames"] = int(self.car_clearing_frames)
-            debug["miss_frames"] = int(self.locked_car_miss_frames)
-            debug["active"] = self.car_avoidance_state != "FOLLOW_LANE"
-            debug["paused"] = True
-            debug["event"] = "paused"
-            self._log_car_avoidance_process(debug, "paused")
-            return 0.0, debug, None
-
         if self.car_avoidance_state == "CLEARING" and self.car_last_avoid_path is not None:
             debug["cycle_id"] = int(self.car_avoidance_cycle_id)
             self.locked_car = None
@@ -3021,6 +3629,32 @@ class RoadSegmentor:
                 measurements.append(measurement)
         debug["detected_cars"] = int(len(measurements))
 
+        if not bool(state_updates_enabled):
+            if measurements:
+                best_measurement = max(
+                    measurements,
+                    key=lambda m: (
+                        float(m.get("area", 0.0)),
+                        float(m.get("bottom_center", (0.0, 0.0))[1]),
+                        float(m.get("score", 0.0)),
+                    ),
+                )
+                debug["ground_distance_m"] = (
+                    None
+                    if best_measurement.get("ground_distance_m") is None
+                    else float(best_measurement.get("ground_distance_m"))
+                )
+                debug["locked_center"] = tuple(map(float, best_measurement.get("bottom_center", (0.0, 0.0))))
+            debug["cycle_id"] = int(self.car_avoidance_cycle_id)
+            debug["state"] = self.car_avoidance_state
+            debug["clear_frames"] = int(self.car_clearing_frames)
+            debug["miss_frames"] = int(self.locked_car_miss_frames)
+            debug["active"] = self.car_avoidance_state != "FOLLOW_LANE"
+            debug["paused"] = True
+            debug["event"] = "paused"
+            self._log_car_avoidance_process(debug, "paused")
+            return 0.0, debug, None
+
         had_locked_before_update = self.locked_car is not None
         hold_misses = self.car_avoidance_state == "AVOIDING"
         locked_car = self._update_locked_car(measurements, base, hold_misses=hold_misses)
@@ -3072,6 +3706,11 @@ class RoadSegmentor:
         debug["locked_confirmed"] = bool(locked_car.get("confirmed", False))
         debug["locked_hit_frames"] = int(locked_car.get("hit_frames", 0))
         debug["locked_center"] = (float(_smooth_cx), float(smooth_cy))
+        measurement = locked_car.get("measurement", {})
+        car_ground_distance_m = None
+        if isinstance(measurement, dict):
+            car_ground_distance_m = measurement.get("ground_distance_m")
+        debug["ground_distance_m"] = None if car_ground_distance_m is None else float(car_ground_distance_m)
 
         side_decision_rows = max(0.0, float(getattr(
             config,
@@ -3079,7 +3718,11 @@ class RoadSegmentor:
             float(getattr(config, "CAR_AVOIDANCE_SWITCH_MIN_BOTTOM_Y", 160.0)),
         )))
         side_cache_ready = self.car_avoidance_boundary_side in ("left", "right")
-        side_decision_ready = rows_to_car <= side_decision_rows
+        side_decision_distance_m = float(getattr(config, "CAR_AVOIDANCE_SIDE_DECISION_DISTANCE_M", 0.0))
+        if side_decision_distance_m > 0.0 and car_ground_distance_m is not None:
+            side_decision_ready = float(car_ground_distance_m) <= side_decision_distance_m
+        else:
+            side_decision_ready = rows_to_car <= side_decision_rows
         debug["boundary_side_ready"] = bool(side_decision_ready or side_cache_ready)
         resolved_side = None
         boundary_x = None
@@ -3088,6 +3731,7 @@ class RoadSegmentor:
         side_source = ""
         side_confidence = 0.0
         if debug["boundary_side_ready"]:
+            had_side_before = self.car_avoidance_boundary_side in ("left", "right")
             resolved_side, boundary_x, boundary_error, nearest_side, side_source, side_confidence = self._select_car_avoidance_boundary_side(
                 locked_car,
                 left_boundary,
@@ -3106,6 +3750,9 @@ class RoadSegmentor:
             debug["nearest_boundary_side"] = nearest_side
             debug["side_source"] = side_source
             debug["side_confidence"] = float(side_confidence)
+            if not had_side_before and selected_side in ("left", "right"):
+                debug["event"] = "side_decided"
+                self._log_car_avoidance_process(debug, "side_decided", force=True)
 
         inset, y_range, boundary_ready, not_ready_event, road_width = self._car_avoidance_boundary_inset(
             locked_car,
@@ -3238,6 +3885,7 @@ class RoadSegmentor:
         external_boundary_side="left",
         sign_route_pending=False,
         debug_drive_active=True,
+        car_avoidance_state_updates_enabled=True,
         render_enabled=True,
     ):
         """对已推理出的 mask 做路径规划、控制器调用和调试渲染.
@@ -3564,7 +4212,7 @@ class RoadSegmentor:
                 h_seg,
                 left_boundary=left_boundary_pts,
                 right_boundary=right_boundary_pts,
-                state_updates_enabled=bool(debug_drive_active),
+                state_updates_enabled=bool(car_avoidance_state_updates_enabled),
             )
             car_active = car_path_debug is not None and car_path_debug.get("active")
             external_boundary_inset_x = float(external_boundary_inset_x)
@@ -3769,6 +4417,7 @@ class RoadSegmentor:
             "car_active": bool(car_active),
             "car_state": str(car_state if 'car_state' in locals() else "FOLLOW_LANE"),
             "car_rows_to_bottom": float(car_path_debug.get("rows_to_bottom", 0.0)) if car_path_debug is not None and car_path_debug.get("rows_to_bottom") is not None else None,
+            "car_ground_distance_m": float(car_path_debug.get("ground_distance_m", 0.0)) if car_path_debug is not None and car_path_debug.get("ground_distance_m") is not None else None,
             "car_miss_frames": int(car_path_debug.get("miss_frames", 0)) if car_path_debug is not None else 0,
             "car_clear_frames": int(car_path_debug.get("clear_frames", 0)) if car_path_debug is not None else 0,
             "car_state_paused": bool(car_path_debug.get("paused", False)) if car_path_debug is not None else False,
@@ -3872,6 +4521,7 @@ class RoadSegmentor:
             car_active=bool(car_active) if 'car_active' in locals() else False,
         )
         if ai_view is not None:
+            self._draw_ipm_preview_window(ai_view, mask, current_yolo_boxes=current_yolo_boxes)
             draw_seg_status_text(
                 ai_view,
                 fps_stats=fps_stats,
@@ -3914,6 +4564,8 @@ class RoadSegmentor:
         external_boundary_side="left",
         sign_route_pending=False,
         debug_drive_active=True,
+        car_avoidance_state_updates_enabled=True,
+        preview_frame=None,
     ):
         """兼容旧串行调用：推理和后处理在同一个线程里连续执行."""
         t_total_start = time.perf_counter()
@@ -3927,8 +4579,10 @@ class RoadSegmentor:
             sign_route_choice=sign_route_choice,
             infer_s=infer_s,
             total_start=t_total_start,
+            preview_frame=preview_frame,
             external_boundary_inset_x=external_boundary_inset_x,
             external_boundary_side=external_boundary_side,
             sign_route_pending=sign_route_pending,
             debug_drive_active=debug_drive_active,
+            car_avoidance_state_updates_enabled=car_avoidance_state_updates_enabled,
         )
