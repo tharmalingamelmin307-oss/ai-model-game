@@ -258,6 +258,9 @@ SIGN_LLM_STABLE_SIZE_TOLERANCE_RATIO = 0.15
 # 停车采集 OCR 的最长等待时间，单位秒。
 # 到时后即使没收满样本，也会尝试 force 提交；0 个有效样本仍不会提交。
 SIGN_LLM_COLLECT_TIMEOUT = 3.0
+# 单次 OCR 后端卡住时，最多等待多久再放弃本次路牌会话。
+# 到时释放停车和 OCR 状态，避免一条坏路牌永久占住流程。
+SIGN_LLM_OCR_INFLIGHT_TIMEOUT = 5.0
 # 千帆 API 请求超时时间，单位秒。
 # 太小可能导致正常网络波动被判失败；太大会让车辆等待更久。
 SIGN_LLM_API_TIMEOUT = 10.0
@@ -1060,6 +1063,8 @@ DEFAULT_CONTROL_DATA = {
     "sign_llm_frame_id": -1,
     "sign_llm_ocr_inflight": False,
     "sign_llm_ocr_inflight_started_at": None,
+    "sign_llm_ocr_started": False,
+    "sign_llm_ocr_job_frame_id": -1,
     "sign_llm_stable_rect": None,
     "sign_llm_stable_frames": 0,
     "sign_llm_ocr_ready": False,
@@ -1072,6 +1077,7 @@ DEFAULT_CONTROL_DATA = {
     "sign_route_llm_used": False,
     "post_sign_phase": False,
     "sign_route_locked_rect": None,
+    "sign_route_blocked_rect": None,
     "sign_route_drive_started_at": None,
     "sign_route_fork_entered_at": None,
     "sign_route_single_road_frames": 0,
@@ -1280,7 +1286,7 @@ PERSON_DEBUG_DRAW_RELEASE_LINE = True
 # 兼容旧参数名，保留给外部脚本读取；当前主逻辑不再依赖中心带状窗口。
 PERSON_CLEAR_CENTER_WINDOW_X = 25.0
 # 行人停车后连续漏检超过这个时间就放行，单位秒。
-PERSON_STOP_MISSING_TIMEOUT_SECONDS = 1.0
+PERSON_STOP_MISSING_TIMEOUT_SECONDS = 0.1
 # 兼容保留字段；当前普通行人停车不再按时间自动释放。
 PERSON_STOP_MAX_SECONDS = 8.0
 # 兼容保留字段；当前漏检放行按 PERSON_STOP_MISSING_TIMEOUT_SECONDS 计时。

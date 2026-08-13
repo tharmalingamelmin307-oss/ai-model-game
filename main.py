@@ -829,10 +829,19 @@ def update_sign_llm_rect_stability(state, current_rect):
 
     need_frames = max(1, int(getattr(config, "SIGN_LLM_STABLE_FRAMES", 3)))
     prev_rect = state.get("sign_llm_stable_rect")
+    # 首次稳定后，路牌框即使因检测抖动短暂变化，也不要重新开启
+    # “稳定三帧”闸门；否则同一次停车会反复进入 OCR。
+    if (
+        bool(state.get("sign_llm_ocr_ready", False)) or
+        bool(state.get("sign_llm_ocr_started", False))
+    ):
+        if current_rect is not None:
+            state["sign_llm_stable_rect"] = list(current_rect)
+        return True
+
     if current_rect is None:
         state["sign_llm_stable_frames"] = 0
         state["sign_llm_stable_rect"] = None
-        state["sign_llm_ocr_ready"] = False
         return False
 
     stable_frames = int(state.get("sign_llm_stable_frames", 0))
@@ -847,19 +856,12 @@ def update_sign_llm_rect_stability(state, current_rect):
     was_ready = bool(state.get("sign_llm_ocr_ready", False))
     state["sign_llm_ocr_ready"] = ready
     if ready and not was_ready:
-        state["sign_llm_started_at"] = time.monotonic()
+        state["sign_llm_ocr_started"] = True
         throttled_log(
             "sign_llm_stable_ready",
             f"语义路牌框已稳定，开始OCR采样: stable={stable_frames}/{need_frames} rect={list(current_rect)}",
             state=(stable_frames, tuple(int(float(v)) for v in current_rect)),
             min_interval=0.0,
-        )
-    elif not ready:
-        throttled_log(
-            "sign_llm_wait_stable",
-            f"语义路牌停车等待框稳定: stable={stable_frames}/{need_frames} rect={list(current_rect)}",
-            state=(stable_frames, tuple(int(float(v)) for v in current_rect)),
-            min_interval=0.5,
         )
     return ready
 
@@ -875,6 +877,8 @@ def clear_sign_llm_state(state, keep_completed=False):
     state["sign_llm_frame_id"] = -1
     state["sign_llm_ocr_inflight"] = False
     state["sign_llm_ocr_inflight_started_at"] = None
+    state["sign_llm_ocr_started"] = False
+    state["sign_llm_ocr_job_frame_id"] = -1
     state["sign_llm_stable_rect"] = None
     state["sign_llm_stable_frames"] = 0
     state["sign_llm_ocr_ready"] = False
@@ -897,6 +901,8 @@ def reset_sign_route_state(state, next_state="IDLE"):
     state["sign_route_api_submitted"] = False
     state["sign_llm_ocr_inflight"] = False
     state["sign_llm_ocr_inflight_started_at"] = None
+    state["sign_llm_ocr_started"] = False
+    state["sign_llm_ocr_job_frame_id"] = -1
     state["sign_llm_stable_rect"] = None
     state["sign_llm_stable_frames"] = 0
     state["sign_llm_ocr_ready"] = False
@@ -1144,15 +1150,39 @@ def pending_fixed_route_choice(state, current_yolo_boxes=None):
 
 def reset_sign_route_after_drive(state):
     """一次路线锁定完成后释放；路牌模式需等当前路牌离开画面再接下一次."""
+    locked_rect = state.get("sign_route_locked_rect")
+    if locked_rect is not None:
+        state["sign_route_blocked_rect"] = list(locked_rect)
     next_state = "WAIT_SIGN_GONE" if sign_route_uses_llm() else "IDLE"
     reset_sign_route_state(state, next_state=next_state)
 
 
-def update_wait_sign_gone_state(state, route_trigger_rect):
+def block_sign_until_gone(state, rect=None):
+    """失败/完成后锁住当前路牌，直到它连续离开画面."""
+    blocked_rect = rect if rect is not None else state.get("sign_route_locked_rect")
+    if blocked_rect is not None and len(blocked_rect) == 4:
+        state["sign_route_blocked_rect"] = list(blocked_rect)
+    state["sign_route_sign_gone_frames"] = 0
+    state["sign_route_state"] = "WAIT_SIGN_GONE"
+
+
+def update_wait_sign_gone_state(state, route_trigger_rect, visible_sign_rects=None):
     """等待当前路牌稳定离开，避免一帧漏检导致同一块牌重复触发."""
     if str(state.get("sign_route_state", "IDLE")) != "WAIT_SIGN_GONE":
         return str(state.get("sign_route_state", "IDLE"))
-    if route_trigger_rect is not None:
+    blocked_rect = state.get("sign_route_blocked_rect")
+    visible_sign_rects = visible_sign_rects or []
+    same_sign_visible = False
+    if blocked_rect is not None:
+        same_sign_visible = any(
+            rect_center_distance(blocked_rect, rect) <= 120.0
+            for rect in visible_sign_rects
+            if rect is not None and len(rect) == 4
+        )
+    elif route_trigger_rect is not None:
+        same_sign_visible = True
+
+    if same_sign_visible:
         state["sign_route_sign_gone_frames"] = 0
         return "WAIT_SIGN_GONE"
 
@@ -1162,6 +1192,7 @@ def update_wait_sign_gone_state(state, route_trigger_rect):
     if gone_frames >= need_frames:
         state["sign_route_state"] = "IDLE"
         state["sign_route_sign_gone_frames"] = 0
+        state["sign_route_blocked_rect"] = None
         return "IDLE"
     return "WAIT_SIGN_GONE"
 
@@ -1259,21 +1290,57 @@ def maybe_submit_sign_llm_job(state, frame_id, force=False):
     # OCR 仍在请求百度接口；不能把这次任务提前判成失败，否则稍后
     # 返回的文字无法再进入样本，路线状态也会被错误地标记为已完成。
     if force and bool(state.get("sign_llm_ocr_inflight", False)):
+        inflight_started_at = state.get("sign_llm_ocr_inflight_started_at")
+        inflight_timeout = max(
+            0.5,
+            float(getattr(config, "SIGN_LLM_OCR_INFLIGHT_TIMEOUT", 5.0)),
+        )
+        inflight_elapsed = (
+            0.0
+            if inflight_started_at is None
+            else max(0.0, time.monotonic() - float(inflight_started_at))
+        )
+        if inflight_elapsed < inflight_timeout:
+            return False
+
+        # 后端已经超过单次上限，放弃这次会话。OCR worker 即使稍后返回，
+        # record_sign_llm_sample 也会因为状态已离开 SIGN_STOP_COLLECT 而丢弃迟到结果。
+        timeout_frame_id = int(state.get("sign_llm_frame_id", frame_id))
+        timeout_elapsed = inflight_elapsed
+        locked_rect = state.get("sign_route_locked_rect")
+        state["sign_llm_ocr_inflight"] = False
+        state["sign_llm_ocr_inflight_started_at"] = None
+        clear_sign_llm_state(state, keep_completed=False)
+        state["sign_llm_error"] = f"ocr_inflight_timeout:{timeout_elapsed:.1f}s"
+        state["sign_route_pass_index"] = 1
+        state["sign_route_llm_used"] = False
+        state["sign_route_first_choice"] = 0
+        reset_sign_route_state(state, next_state="WAIT_SIGN_GONE")
+        block_sign_until_gone(state, locked_rect)
         throttled_log(
-            "sign_llm_wait_ocr",
-            "语义路牌OCR仍在执行，暂不结束采样等待结果",
-            state=(int(state.get("sign_llm_frame_id", -1)),),
-            min_interval=0.5,
+            "sign_llm_ocr_timeout",
+            f"语义路牌OCR超时，放弃本次会话并等待路牌离开: frame={timeout_frame_id} "
+            f"elapsed={timeout_elapsed:.1f}s",
+            state=(timeout_frame_id,),
+            min_interval=0.0,
         )
         return False
     samples = list(state.get("sign_llm_samples", []))
     attempts = int(state.get("sign_llm_attempts", len(samples)))
     if force and not bool(state.get("sign_llm_ocr_ready", False)) and attempts <= 0:
+        locked_rect = state.get("sign_route_locked_rect")
+        clear_sign_llm_state(state, keep_completed=False)
+        state["sign_llm_error"] = "collect_timeout_waiting_stable"
+        state["sign_route_pass_index"] = 1
+        state["sign_route_llm_used"] = False
+        state["sign_route_first_choice"] = 0
+        reset_sign_route_state(state, next_state="WAIT_SIGN_GONE")
+        block_sign_until_gone(state, locked_rect)
         throttled_log(
             "sign_llm_wait_stable_timeout",
-            "语义路牌仍在等待停车稳定，暂不结束采样",
+            "语义路牌停车稳定超时，放弃本次会话并等待路牌离开",
             state=(int(state.get("sign_llm_frame_id", -1)),),
-            min_interval=0.5,
+            min_interval=0.0,
         )
         return False
     valid_samples = [sample for sample in samples if str(sample.get("text", "")).strip()]
@@ -1298,6 +1365,7 @@ def maybe_submit_sign_llm_job(state, frame_id, force=False):
                 state=(len(valid_samples), attempts, int(force)),
                 min_interval=0.0,
             )
+            locked_rect = state.get("sign_route_locked_rect")
             clear_sign_llm_state(state, keep_completed=False)
             state["sign_llm_error"] = reason
             # 第一次路牌判定失败不能直接标记为“第三圈已完成”。
@@ -1307,6 +1375,7 @@ def maybe_submit_sign_llm_job(state, frame_id, force=False):
             state["sign_route_llm_used"] = False
             state["sign_route_first_choice"] = 0
             reset_sign_route_state(state, next_state="WAIT_SIGN_GONE")
+            block_sign_until_gone(state, locked_rect)
             return False
         else:
             throttled_log(
@@ -1369,10 +1438,18 @@ def record_sign_llm_sample(state, frame_id, text="", score=0.0, reason=""):
     return maybe_submit_sign_llm_job(state, int(frame_id))
 
 
-def mark_sign_ocr_done():
+def mark_sign_ocr_done(frame_id=None):
     with data_lock:
+        active_frame_id = int(global_control_data.get("sign_llm_ocr_job_frame_id", -1))
+        if (
+            frame_id is not None and
+            active_frame_id >= 0 and
+            int(frame_id) != active_frame_id
+        ):
+            return
         global_control_data["sign_llm_ocr_inflight"] = False
         global_control_data["sign_llm_ocr_inflight_started_at"] = None
+        global_control_data["sign_llm_ocr_job_frame_id"] = -1
 
 
 def create_ocr_recognizer(backend=None):
@@ -1536,6 +1613,7 @@ def drain_sign_llm_results():
         with data_lock:
             waiting = bool(global_control_data.get("sign_llm_waiting_result", False))
             active_fid = int(global_control_data.get("sign_llm_frame_id", -1))
+            active_rect = global_control_data.get("sign_route_locked_rect")
             current_fid = int(global_yolo_frame_id)
             max_age = max(1, int(getattr(config, "SIGN_LLM_RESULT_MAX_AGE_FRAMES", 60)))
             too_old = current_fid >= 0 and frame_id >= 0 and current_fid - frame_id > max_age
@@ -1562,6 +1640,7 @@ def drain_sign_llm_results():
                 global_control_data["sign_llm_error"] = fallback_error
                 global_control_data["sign_route_pass_index"] = 3
                 reset_sign_route_state(global_control_data, next_state="WAIT_SIGN_GONE")
+                block_sign_until_gone(global_control_data, active_rect)
 
         if result in ("LEFT", "RIGHT"):
             sample_text = [(s.get("text"), round(float(s.get("score", 0.0)), 3)) for s in samples]
@@ -1717,18 +1796,18 @@ def yolo_worker(core_id=None, worker_id=0):
                     f"dist={route_skip_debug['dist']:.0f} "
                     f"sign_z={route_skip_debug.get('sign_distance_m')} "
                     f"rect={route_skip_debug['rect']}",
-                    state=(
-                        route_skip_debug["reason"],
-                        int(route_skip_debug["area"] // 500),
-                        int(route_skip_debug["dist"] // 20),
-                    ),
-                    min_interval=0.5,
+                    state=route_skip_debug["reason"],
+                    min_interval=2.0,
                 )
 
             sign_llm_collecting_now = False
             with data_lock:
                 if sign_route_uses_llm():
-                    route_state = update_wait_sign_gone_state(global_control_data, route_trigger_rect)
+                    route_state = update_wait_sign_gone_state(
+                        global_control_data,
+                        route_trigger_rect,
+                        visible_sign_rects=visible_sign_rects,
+                    )
                     if route_trigger_rect is not None and route_state == "IDLE":
                         pass_index = sign_route_pass_index(global_control_data)
                         first_choice = int(global_control_data.get("sign_route_first_choice", 0))
@@ -1752,8 +1831,10 @@ def yolo_worker(core_id=None, worker_id=0):
                                 min_interval=0.0,
                             )
                         elif llm_used or pass_index >= 3:
+                            locked_rect = list(route_trigger_rect)
                             clear_sign_llm_state(global_control_data, keep_completed=True)
                             reset_sign_route_state(global_control_data, next_state="WAIT_SIGN_GONE")
+                            block_sign_until_gone(global_control_data, locked_rect)
                             throttled_log(
                                 "sign_route_llm_done_ignore",
                                 f"路牌识别已使用过，不再启动OCR/千帆: frame={frame_id} rect={route_trigger_rect}",
@@ -1780,6 +1861,8 @@ def yolo_worker(core_id=None, worker_id=0):
                             global_control_data["sign_llm_attempts"] = 0
                             global_control_data["sign_llm_ocr_inflight"] = False
                             global_control_data["sign_llm_ocr_inflight_started_at"] = None
+                            global_control_data["sign_llm_ocr_started"] = False
+                            global_control_data["sign_llm_ocr_job_frame_id"] = -1
                             global_control_data["sign_llm_stable_rect"] = None
                             global_control_data["sign_llm_stable_frames"] = 0
                             global_control_data["sign_llm_ocr_ready"] = False
@@ -1806,10 +1889,6 @@ def yolo_worker(core_id=None, worker_id=0):
                 if ocr_ready:
                     if current_sign_rect is not None:
                         sign_jobs.append((-1, config.SIGN_CLASS_ID, list(current_sign_rect)))
-                    elif locked_rect is not None:
-                        sign_jobs.append((-1, config.SIGN_CLASS_ID, list(locked_rect)))
-                    else:
-                        sign_jobs.extend(pending_sign_jobs)
 
             if sign_jobs:
                 if sign_llm_collecting_now:
@@ -1819,6 +1898,8 @@ def yolo_worker(core_id=None, worker_id=0):
                         else:
                             global_control_data["sign_llm_ocr_inflight"] = True
                             global_control_data["sign_llm_ocr_inflight_started_at"] = time.monotonic()
+                            global_control_data["sign_llm_ocr_started"] = True
+                            global_control_data["sign_llm_ocr_job_frame_id"] = int(frame_id)
 
             if sign_jobs:
                 job_names = tuple(class_name_from_id(cls_id) for _, cls_id, _ in sign_jobs)
@@ -1879,13 +1960,16 @@ def ocr_worker():
     - 同一帧里的多个 OCR 结果，会按“中心点最近”去匹配各个路牌框
     - 匹配结果回写时还会再核对 frame_id，避免旧帧 OCR 迟到污染新状态
     """
+    job_frame_id = None
     while True:
         try:
+            job_frame_id = None
             job = ocr_queue.get()
             if job is None:
                 break
 
             frame_data, sign_jobs, frame_id = job
+            job_frame_id = int(frame_id)
             with data_lock:
                 sign_collecting = (
                     sign_route_uses_llm() and
@@ -1896,7 +1980,7 @@ def ocr_worker():
                 if item[1] != config.SIGN_CLASS_ID or sign_collecting
             ]
             if not sign_jobs:
-                mark_sign_ocr_done()
+                mark_sign_ocr_done(job_frame_id)
                 continue
 
             updates = []
@@ -1943,7 +2027,7 @@ def ocr_worker():
                     state=tuple((b.get("backend"), len(b.get("results", []) or []), str(b.get("error", ""))[:40]) for b in backend_outputs),
                     min_interval=config.LOG_INTERVAL_OCR_RAW
                 )
-                mark_sign_ocr_done()
+                mark_sign_ocr_done(job_frame_id)
                 continue
 
             min_ocr_score = float(config.OCR_MIN_SCORE)
@@ -2075,7 +2159,7 @@ def ocr_worker():
                     state=(len(ocr_results), len(sign_jobs)),
                     min_interval=config.LOG_INTERVAL_OCR_RAW
                 )
-                mark_sign_ocr_done()
+                mark_sign_ocr_done(job_frame_id)
                 continue
 
             # 回写时再做一次 class_id 检查，避免队列延迟导致“框已经换帧”的情况。
@@ -2143,10 +2227,10 @@ def ocr_worker():
                                     state="RIGHT",
                                     min_interval=config.LOG_INTERVAL_TURN_INTENT
                                 )
-            mark_sign_ocr_done()
+            mark_sign_ocr_done(job_frame_id)
 
         except Exception as e:
-            mark_sign_ocr_done()
+            mark_sign_ocr_done(job_frame_id)
             log_once("ocr_worker_error", f"OCR线程异常: {e}")
 
 # ==============================================================================
