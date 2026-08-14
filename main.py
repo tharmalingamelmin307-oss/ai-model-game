@@ -3002,8 +3002,22 @@ def serial_control_thread():
         car_z_text = "无" if car_avoidance_ground_distance_m is None else f"{float(car_avoidance_ground_distance_m):.2f}m"
         car_cut_trigger_z = float(getattr(config, "CAR_AVOIDANCE_SWITCH_DISTANCE_M", 0.0))
         car_side_trigger_z = float(getattr(config, "CAR_AVOIDANCE_SIDE_DECISION_DISTANCE_M", car_cut_trigger_z))
-        car_cut_trigger_z_text = "关闭" if car_cut_trigger_z <= 0.0 else f"{car_cut_trigger_z:.2f}m"
-        car_side_trigger_z_text = "关闭" if car_side_trigger_z <= 0.0 else f"{car_side_trigger_z:.2f}m"
+        car_cut_trigger_rows = max(0.0, float(getattr(config, "CAR_AVOIDANCE_SWITCH_MIN_BOTTOM_Y", 160.0)))
+        car_side_trigger_rows = max(0.0, float(getattr(
+            config,
+            "CAR_AVOIDANCE_SIDE_DECISION_MIN_BOTTOM_Y",
+            car_cut_trigger_rows,
+        )))
+        car_cut_trigger_z_text = (
+            f"{car_cut_trigger_z:.2f}m/{car_cut_trigger_rows:.0f}行"
+            if car_cut_trigger_z > 0.0 else
+            f"关闭/{car_cut_trigger_rows:.0f}行"
+        )
+        car_side_trigger_z_text = (
+            f"{car_side_trigger_z:.2f}m/{car_side_trigger_rows:.0f}行"
+            if car_side_trigger_z > 0.0 else
+            f"关闭/{car_side_trigger_rows:.0f}行"
+        )
         car_cut_ready_z = (
             car_cut_trigger_z > 0.0 and
             car_avoidance_ground_distance_m is not None and
@@ -3014,8 +3028,34 @@ def serial_control_thread():
             car_avoidance_ground_distance_m is not None and
             float(car_avoidance_ground_distance_m) <= car_side_trigger_z
         )
-        car_cut_ready_z_text = "1" if car_cut_ready_z else "0"
-        car_side_ready_z_text = "1" if car_side_ready_z else "0"
+        car_cut_ready_rows = (
+            car_avoidance_rows_to_bottom is not None and
+            float(car_avoidance_rows_to_bottom) <= car_cut_trigger_rows
+        )
+        car_side_ready_rows = (
+            car_avoidance_rows_to_bottom is not None and
+            float(car_avoidance_rows_to_bottom) <= car_side_trigger_rows
+        )
+        car_cut_ready_z_text = f"{int(car_cut_ready_z or car_cut_ready_rows)}(z={int(car_cut_ready_z)},r={int(car_cut_ready_rows)})"
+        car_side_ready_z_text = f"{int(car_side_ready_z or car_side_ready_rows)}(z={int(car_side_ready_z)},r={int(car_side_ready_rows)})"
+
+        def _car_trigger_source(z_ready, row_ready):
+            if z_ready and row_ready:
+                return "距离+行距"
+            if z_ready:
+                return "距离"
+            if row_ready:
+                return "行距"
+            return "未触发"
+
+        car_side_ready_source_text = (
+            f"{_car_trigger_source(car_side_ready_z, car_side_ready_rows)}"
+            f"(距离={int(car_side_ready_z)},行距={int(car_side_ready_rows)})"
+        )
+        car_cut_ready_source_text = (
+            f"{_car_trigger_source(car_cut_ready_z, car_cut_ready_rows)}"
+            f"(距离={int(car_cut_ready_z)},行距={int(car_cut_ready_rows)})"
+        )
         car_miss_text = f"{int(car_avoidance_miss_frames)}"
         car_clear_text = f"{int(car_avoidance_clear_frames)}"
         car_pause_text = "1" if car_avoidance_state_paused else "0"
@@ -3053,12 +3093,13 @@ def serial_control_thread():
         if car_avoidance_detail_log_enabled and car_avoidance_visible_or_event:
             throttled_log(
                 "car_avoid_detail",
-                f">>> 避车#{car_avoidance_cycle_id}(B): event={car_avoidance_event or '-'} state={car_avoidance_state} rows={car_rows_text} "
-                f"car_z={car_z_text} side_trig={car_side_trigger_z_text} side_ready_z={car_side_ready_z_text} "
-                f"cut_trig={car_cut_trigger_z_text} cut_ready_z={car_cut_ready_z_text} "
+                f">>> 避车#{car_avoidance_cycle_id}(B): event={car_avoidance_event or '-'} state={car_avoidance_state} "
+                f"车底距底={car_rows_text}行 car_z={car_z_text} "
+                f"判左右阈值={car_side_trigger_z_text} 触发={car_side_ready_source_text} "
+                f"绕车阈值={car_cut_trigger_z_text} 触发={car_cut_ready_source_text} "
                 f"det={int(car_avoidance_detected_cars)} locked={car_locked_text} hits={int(car_avoidance_locked_hit_frames)} "
                 f"miss={car_miss_text} clear={car_clear_text} pause={car_pause_text} path={car_path_text} "
-                f"inset={car_boundary_inset_text} side_ready={car_side_ready_text} ctrl_off={car_control_error_offset_text} weight={float(car_avoidance_avoid_weight):.2f} "
+                f"inset={car_boundary_inset_text} boundary_side_ready={car_side_ready_text} ctrl_off={car_control_error_offset_text} weight={float(car_avoidance_avoid_weight):.2f} "
                 f"side={car_side_text} boundary_x={car_boundary_x_text} boundary_e={car_boundary_error_text} "
                 f"ctrl_e={car_control_error_text} "
                 f"B=({car_kp_text},{car_kd_text},{car_psi_text}) v={car_v_text}",

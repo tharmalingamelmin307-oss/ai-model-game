@@ -109,6 +109,9 @@ class RoadSegmentor:
         self.merge_state_enter_time = None
         self.merge_state_info = None
         self.merge_state_side = None
+        self.merge_state_source = None
+        self.merge_bottom_left_wide_after_right_enabled = False
+        self.merge_bottom_left_wide_hit_logged = False
         self.merge_edge_trace_debug_counter = 0
         self.locked_car = None
         self.locked_car_miss_frames = 0
@@ -748,6 +751,54 @@ class RoadSegmentor:
         detected = int(debug.get("detected_cars", 0))
         ground_z = debug.get("ground_distance_m")
         ground_z_text = "无" if ground_z is None else f"{float(ground_z):.2f}m"
+        rows = debug.get("rows_to_bottom")
+        rows_text = "无" if rows is None else f"{float(rows):.1f}"
+        side_trigger_z = float(getattr(config, "CAR_AVOIDANCE_SIDE_DECISION_DISTANCE_M", 0.0))
+        cut_trigger_z = float(getattr(config, "CAR_AVOIDANCE_SWITCH_DISTANCE_M", 0.0))
+        side_trigger_rows = max(0.0, float(getattr(
+            config,
+            "CAR_AVOIDANCE_SIDE_DECISION_MIN_BOTTOM_Y",
+            float(getattr(config, "CAR_AVOIDANCE_SWITCH_MIN_BOTTOM_Y", 160.0)),
+        )))
+        cut_trigger_rows = max(0.0, float(getattr(config, "CAR_AVOIDANCE_SWITCH_MIN_BOTTOM_Y", 160.0)))
+        side_ready_z = (
+            side_trigger_z > 0.0 and
+            ground_z is not None and
+            float(ground_z) <= side_trigger_z
+        )
+        cut_ready_z = (
+            cut_trigger_z > 0.0 and
+            ground_z is not None and
+            float(ground_z) <= cut_trigger_z
+        )
+        side_ready_rows = rows is not None and float(rows) <= side_trigger_rows
+        cut_ready_rows = rows is not None and float(rows) <= cut_trigger_rows
+        side_trigger_text = (
+            f"{side_trigger_z:.2f}m/{side_trigger_rows:.0f}行"
+            if side_trigger_z > 0.0 else
+            f"关闭/{side_trigger_rows:.0f}行"
+        )
+        cut_trigger_text = (
+            f"{cut_trigger_z:.2f}m/{cut_trigger_rows:.0f}行"
+            if cut_trigger_z > 0.0 else
+            f"关闭/{cut_trigger_rows:.0f}行"
+        )
+        def _trigger_source(z_ready, row_ready):
+            if z_ready and row_ready:
+                return "距离+行距"
+            if z_ready:
+                return "距离"
+            if row_ready:
+                return "行距"
+            return "未触发"
+
+        trigger_detail = (
+            f"车底距底={rows_text}行 "
+            f"判左右阈值={side_trigger_text} 触发={_trigger_source(side_ready_z, side_ready_rows)}"
+            f"(距离={int(side_ready_z)},行距={int(side_ready_rows)}) "
+            f"绕车阈值={cut_trigger_text} 触发={_trigger_source(cut_ready_z, cut_ready_rows)}"
+            f"(距离={int(cut_ready_z)},行距={int(cut_ready_rows)})"
+        )
         boundary_side = str(debug.get("boundary_side", "") or "").lower()
         nearest_side = str(debug.get("nearest_boundary_side", "") or "").lower()
 
@@ -763,10 +814,10 @@ class RoadSegmentor:
             if event == "side_decided":
                 event_message = (
                     f"避车#{cycle_id}: 方向已判定，车在{_side_cn(nearest_side)}，"
-                    f"走{_side_cn(boundary_side)} car_z={ground_z_text}"
+                    f"走{_side_cn(boundary_side)} car_z={ground_z_text} {trigger_detail}"
                 )
             elif event == "enter_avoiding":
-                event_message = f"避车#{cycle_id}: 开始，走{_side_cn(boundary_side)} car_z={ground_z_text}"
+                event_message = f"避车#{cycle_id}: 开始，走{_side_cn(boundary_side)} car_z={ground_z_text} {trigger_detail}"
             elif event == "lost_enter_clearing":
                 event_message = f"避车#{cycle_id}: 目标消失，开始回正"
             elif event == "clear_done":
@@ -819,8 +870,6 @@ class RoadSegmentor:
         self.last_car_avoid_log_state = signature
         self.last_car_avoid_log_at = now
 
-        rows = debug.get("rows_to_bottom")
-        rows_text = "无" if rows is None else f"{float(rows):.1f}"
         center = debug.get("locked_center")
         center_text = "无" if center is None else f"({float(center[0]):.1f},{float(center[1]):.1f})"
         boundary_side = str(debug.get("boundary_side", "") or "").upper() or "无"
@@ -858,8 +907,12 @@ class RoadSegmentor:
             f"避车#{cycle_id} {stage_label}: {stage_note} "
             f"state={state} det={detected} locked={int(bool(debug.get('locked_confirmed', False)))} "
             f"hits={int(debug.get('locked_hit_frames', 0))} miss={int(debug.get('miss_frames', 0))} "
-            f"clear={int(debug.get('clear_frames', 0))} rows={rows_text} car_z={ground_z_text} center={center_text} "
-            f"inset={float(debug.get('boundary_inset_x', 0.0)):.1f} side_ready={side_ready_text} "
+            f"clear={int(debug.get('clear_frames', 0))} 车底距底={rows_text}行 car_z={ground_z_text} center={center_text} "
+            f"判左右阈值={side_trigger_text} 触发={_trigger_source(side_ready_z, side_ready_rows)}"
+            f"(距离={int(side_ready_z)},行距={int(side_ready_rows)}) "
+            f"绕车阈值={cut_trigger_text} 触发={_trigger_source(cut_ready_z, cut_ready_rows)}"
+            f"(距离={int(cut_ready_z)},行距={int(cut_ready_rows)}) "
+            f"inset={float(debug.get('boundary_inset_x', 0.0)):.1f} boundary_side_ready={side_ready_text} "
             f"ctrl_off={control_error_offset:.1f} "
             f"weight={float(debug.get('avoid_weight', 0.0)):.2f} "
             f"path={int(bool(debug.get('boundary_path_active', False)))} ready={int(bool(debug.get('boundary_ready', False)))} "
@@ -1656,6 +1709,62 @@ class RoadSegmentor:
             "guide_polyline": guide_polyline,
         }
 
+    def _detect_bottom_left_wide_merge_guide(self, search_mask, edge_mask):
+        """顶部若干行足够宽时，直接按左侧汇合补左线."""
+        if not bool(getattr(config, "MERGE_BOTTOM_LEFT_WIDE_TRIGGER_ENABLED", True)):
+            return None
+        if not bool(self.merge_bottom_left_wide_after_right_enabled):
+            return None
+        if search_mask is None or search_mask.size == 0:
+            return None
+
+        h, _ = search_mask.shape[:2]
+        y_top = int(np.clip(int(getattr(config, "MERGE_BOTTOM_LEFT_WIDE_Y_TOP", 0)), 0, h - 1))
+        y_bottom = int(np.clip(int(getattr(config, "MERGE_BOTTOM_LEFT_WIDE_Y_BOTTOM", 9)), 0, h - 1))
+        if y_bottom < y_top:
+            y_top, y_bottom = y_bottom, y_top
+
+        width_thresh = float(getattr(config, "MERGE_BOTTOM_LEFT_WIDE_WIDTH_THRESH", 340.0))
+        min_rows = max(1, int(getattr(config, "MERGE_BOTTOM_LEFT_WIDE_MIN_ROWS", 2)))
+        hit_rows = []
+        for y in range(y_top, y_bottom + 1):
+            xs = np.where(search_mask[y] > 0)[0]
+            if len(xs) == 0:
+                continue
+            row_width = float(xs[-1] - xs[0])
+            if row_width > width_thresh:
+                hit_rows.append({
+                    "y": int(y),
+                    "row_width": row_width,
+                })
+                if len(hit_rows) >= min_rows:
+                    break
+
+        if len(hit_rows) < min_rows:
+            return None
+
+        guide_polyline = self._build_merge_guide_line([0, 1], "left", search_mask, edge_mask)
+        if guide_polyline is None:
+            return None
+        if not bool(self.merge_bottom_left_wide_hit_logged):
+            row_text = ",".join(
+                f"{item['y']}:{item['row_width']:.0f}"
+                for item in hit_rows
+            )
+            print(
+                ">>> 汇合快捷判断: 顶部宽行命中，按左侧汇合补左线 "
+                f"范围={y_top}-{y_bottom}行 阈值>{width_thresh:.0f} 命中={len(hit_rows)}/{min_rows} "
+                f"行宽={row_text}",
+                flush=True,
+            )
+            self.merge_bottom_left_wide_hit_logged = True
+        return {
+            "side": "left",
+            "guide_polyline": guide_polyline,
+            "source": "bottom_left_wide",
+            "wide_rows": hit_rows,
+        }
+
     def _detect_edge_trace_merge_guide(self, search_mask, edge_mask):
         """沿左右贴边八连通边缘的连续生长方向找汇合补线触发特征."""
         if not bool(getattr(config, "MERGE_EDGE_TRACE_ENABLED", True)):
@@ -1975,6 +2084,7 @@ class RoadSegmentor:
             if len(self.merge_state_hit_times) >= confirm_frames and self.merge_state_info is not None:
                 self.merge_state_active = True
                 self.merge_state_side = self.merge_state_info.get("side")
+                self.merge_state_source = self.merge_state_info.get("source")
                 self.merge_state_enter_time = now_s
             else:
                 return None
@@ -1990,6 +2100,12 @@ class RoadSegmentor:
             self.merge_state_exit_frames = 0
 
         if self.merge_state_exit_frames >= exit_confirm_frames:
+            bottom_left_wide_state_done = self.merge_state_source == "bottom_left_wide"
+            if bottom_left_wide_state_done:
+                print(
+                    ">>> 汇合快捷判断: 第一次汇合补线结束，关闭顶部宽行左汇合判断",
+                    flush=True,
+                )
             self.merge_state_active = False
             self.merge_state_hit_frames = 0
             self.merge_state_hit_times = []
@@ -1998,6 +2114,10 @@ class RoadSegmentor:
             self.merge_state_enter_time = None
             self.merge_state_info = None
             self.merge_state_side = None
+            self.merge_state_source = None
+            if bottom_left_wide_state_done:
+                self.merge_bottom_left_wide_after_right_enabled = False
+                self.merge_bottom_left_wide_hit_logged = False
             return None
 
         if self.merge_state_info is not None:
@@ -2857,9 +2977,16 @@ class RoadSegmentor:
         car_z_text = "无" if car_z is None else f"{float(car_z):.2f}m"
         side_trigger_text = "关闭" if side_trigger_z <= 0.0 else f"{side_trigger_z:.2f}m"
         cut_trigger_text = "关闭" if cut_trigger_z <= 0.0 else f"{cut_trigger_z:.2f}m"
+        side_trigger_rows = max(0.0, float(getattr(
+            config,
+            "CAR_AVOIDANCE_SIDE_DECISION_MIN_BOTTOM_Y",
+            float(getattr(config, "CAR_AVOIDANCE_SWITCH_MIN_BOTTOM_Y", 160.0)),
+        )))
+        cut_trigger_rows = max(0.0, float(getattr(config, "CAR_AVOIDANCE_SWITCH_MIN_BOTTOM_Y", 160.0)))
         print(
             f"避车观察: yolo_car={len(yolo_cars)} planning_car=0 "
-            f"car_z={car_z_text} side_trig={side_trigger_text} cut_trig={cut_trigger_text} "
+            f"car_z={car_z_text} side_trig={side_trigger_text}/{side_trigger_rows:.0f}行 "
+            f"cut_trig={cut_trigger_text}/{cut_trigger_rows:.0f}行 "
             f"bottom_y={bottom_y:.1f} seg_roi_top_y={roi_top:.1f}",
             flush=True,
         )
@@ -3389,13 +3516,16 @@ class RoadSegmentor:
         rows_to_car = max(0.0, path_bottom_y - center_y)
         ground_distance_m = measurement.get("ground_distance_m")
         switch_distance_m = float(getattr(config, "CAR_AVOIDANCE_SWITCH_DISTANCE_M", 0.0))
-        if switch_distance_m > 0.0 and ground_distance_m is not None:
-            if float(ground_distance_m) > switch_distance_m:
-                return 0.0, (center_y, path_bottom_y), False, "switch_distance_limit", None
-        else:
-            switch_rows = max(0.0, float(getattr(config, "CAR_AVOIDANCE_SWITCH_MIN_BOTTOM_Y", 160.0)))
-            if rows_to_car > switch_rows:
-                return 0.0, (center_y, path_bottom_y), False, "switch_rows_limit", None
+        switch_rows = max(0.0, float(getattr(config, "CAR_AVOIDANCE_SWITCH_MIN_BOTTOM_Y", 160.0)))
+        switch_ready_by_rows = rows_to_car <= switch_rows
+        switch_ready_by_distance = (
+            switch_distance_m > 0.0 and
+            ground_distance_m is not None and
+            float(ground_distance_m) <= switch_distance_m
+        )
+        if not (switch_ready_by_rows or switch_ready_by_distance):
+            reason = "switch_distance_rows_limit" if switch_distance_m > 0.0 else "switch_rows_limit"
+            return 0.0, (center_y, path_bottom_y), False, reason, None
 
         _left_x, _right_x, road_width = self._car_road_width_at_y(
             left_boundary,
@@ -3719,10 +3849,13 @@ class RoadSegmentor:
         )))
         side_cache_ready = self.car_avoidance_boundary_side in ("left", "right")
         side_decision_distance_m = float(getattr(config, "CAR_AVOIDANCE_SIDE_DECISION_DISTANCE_M", 0.0))
-        if side_decision_distance_m > 0.0 and car_ground_distance_m is not None:
-            side_decision_ready = float(car_ground_distance_m) <= side_decision_distance_m
-        else:
-            side_decision_ready = rows_to_car <= side_decision_rows
+        side_decision_ready_by_rows = rows_to_car <= side_decision_rows
+        side_decision_ready_by_distance = (
+            side_decision_distance_m > 0.0 and
+            car_ground_distance_m is not None and
+            float(car_ground_distance_m) <= side_decision_distance_m
+        )
+        side_decision_ready = side_decision_ready_by_rows or side_decision_ready_by_distance
         debug["boundary_side_ready"] = bool(side_decision_ready or side_cache_ready)
         resolved_side = None
         boundary_x = None
@@ -3730,6 +3863,7 @@ class RoadSegmentor:
         nearest_side = None
         side_source = ""
         side_confidence = 0.0
+        side_decided_now = False
         if debug["boundary_side_ready"]:
             had_side_before = self.car_avoidance_boundary_side in ("left", "right")
             resolved_side, boundary_x, boundary_error, nearest_side, side_source, side_confidence = self._select_car_avoidance_boundary_side(
@@ -3751,8 +3885,7 @@ class RoadSegmentor:
             debug["side_source"] = side_source
             debug["side_confidence"] = float(side_confidence)
             if not had_side_before and selected_side in ("left", "right"):
-                debug["event"] = "side_decided"
-                self._log_car_avoidance_process(debug, "side_decided", force=True)
+                side_decided_now = True
 
         inset, y_range, boundary_ready, not_ready_event, road_width = self._car_avoidance_boundary_inset(
             locked_car,
@@ -3782,6 +3915,7 @@ class RoadSegmentor:
         if y_range is not None:
             debug["blocked_y_range"] = (float(y_range[0]), float(y_range[1]))
         if resolved_side is None:
+            had_side_before = self.car_avoidance_boundary_side in ("left", "right")
             resolved_side, boundary_x, boundary_error, nearest_side, side_source, side_confidence = self._select_car_avoidance_boundary_side(
                 locked_car,
                 left_boundary,
@@ -3800,6 +3934,8 @@ class RoadSegmentor:
             debug["nearest_boundary_side"] = nearest_side
             debug["side_source"] = side_source
             debug["side_confidence"] = float(side_confidence)
+            if not had_side_before and selected_side in ("left", "right"):
+                side_decided_now = True
         selected_side = self.car_avoidance_boundary_side if self.car_avoidance_boundary_side in ("left", "right") else resolved_side
         avoid_path, path_ok = _build_avoid_path_for_side(selected_side, inset)
         if prev_state != "AVOIDING":
@@ -3827,8 +3963,11 @@ class RoadSegmentor:
             if path_ok else None
         )
         debug["active"] = True
-        debug["event"] = "enter_avoiding" if prev_state != "AVOIDING" else "avoiding"
         debug["cycle_id"] = int(self.car_avoidance_cycle_id)
+        if side_decided_now:
+            debug["event"] = "side_decided"
+            self._log_car_avoidance_process(debug, "side_decided", force=True)
+        debug["event"] = "enter_avoiding" if prev_state != "AVOIDING" else "avoiding"
         self._log_car_avoidance_process(debug, debug["event"], force=prev_state != "AVOIDING")
         debug["active"] = True
         return float(inset), debug, avoid_path if path_ok else None
@@ -3932,7 +4071,9 @@ class RoadSegmentor:
             merge_detect_info = self._detect_merge_guide(search_mask, search_edge_mask)
             if merge_detect_info is None:
                 merge_detect_info = self._detect_edge_trace_merge_guide(search_mask, search_edge_mask)
-        merge_guide_info = self._update_merge_state(merge_detect_info, search_mask)
+        merge_guide_info = None
+        if self.merge_state_active or merge_detect_info is not None:
+            merge_guide_info = self._update_merge_state(merge_detect_info, search_mask)
         merge_side = None
         if merge_guide_info is not None:
             merge_side = merge_guide_info.get("side")
@@ -3961,6 +4102,34 @@ class RoadSegmentor:
             y_fork_info = {"active": False, "fork_point": None, "split_rows": 0}
         else:
             y_fork_info = self._detect_y_fork(search_mask)
+            if not bool(y_fork_info.get("active")):
+                merge_detect_info = self._detect_bottom_left_wide_merge_guide(search_mask, search_edge_mask)
+                merge_guide_info = self._update_merge_state(merge_detect_info, search_mask)
+                if merge_guide_info is not None:
+                    merge_side = merge_guide_info.get("side")
+                    if merge_detect_info is None or merge_guide_info is not merge_detect_info:
+                        current_guide_polyline = self._build_merge_guide_line(
+                            [0, 1],
+                            merge_side,
+                            search_mask,
+                            search_edge_mask,
+                        )
+                        if current_guide_polyline is not None:
+                            merge_guide_info = {
+                                "side": merge_side,
+                                "guide_polyline": current_guide_polyline,
+                            }
+                        else:
+                            merge_guide_info = None
+                            merge_side = None
+                    if merge_guide_info is not None:
+                        search_mask = self._apply_merge_guide(
+                            search_mask,
+                            merge_guide_info.get("guide_polyline"),
+                        )
+                        search_mask = self._apply_mask_ignore_border(search_mask)
+                        search_edge_mask = self._extract_edge_mask(search_mask)
+                        y_fork_info = {"active": False, "fork_point": None, "split_rows": 0}
         fork_bottom_mid = None
         branch_pair_count_max = 0
         branch_support_rows = 0
@@ -4176,6 +4345,14 @@ class RoadSegmentor:
                     )
                 )
             )
+            if bool(y_fork_active) and fork_selected_side == "right":
+                if not bool(self.merge_bottom_left_wide_after_right_enabled):
+                    print(
+                        ">>> 汇合快捷判断: 明确Y岔走右，开启顶部宽行左汇合判断",
+                        flush=True,
+                    )
+                    self.merge_bottom_left_wide_hit_logged = False
+                self.merge_bottom_left_wide_after_right_enabled = True
             if (
                 not branch_route_switch and
                 self.last_poly_coeffs is not None and

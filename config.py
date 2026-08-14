@@ -585,6 +585,13 @@ MERGE_BOUNDARY_WIDTH_RATIO = 0.80
 # 汇合 guide line 画入搜索 mask 时使用的线宽。
 MERGE_GUIDE_LINE_THICKNESS = 2
 # 汇合状态机：连续命中若干帧才进入补线；进入后等底部赛道宽度稳定恢复再退出。
+# 顶部宽路快捷触发：seg 图像最上边 10 行里只要有若干行总道路宽度大于阈值，
+# 就直接视为左侧汇合，用右边界按固定赛道宽度反推左边界。
+MERGE_BOTTOM_LEFT_WIDE_TRIGGER_ENABLED = True
+MERGE_BOTTOM_LEFT_WIDE_Y_TOP = 0
+MERGE_BOTTOM_LEFT_WIDE_Y_BOTTOM = 9
+MERGE_BOTTOM_LEFT_WIDE_WIDTH_THRESH = 380.0
+MERGE_BOTTOM_LEFT_WIDE_MIN_ROWS = 2
 # 汇合特征连续命中多少帧才正式进入补线状态。
 MERGE_STATE_CONFIRM_FRAMES = 3
 # 汇合特征命中统计窗口，单位秒；窗口内累计命中 CONFIRM_FRAMES 次即确认。
@@ -1621,14 +1628,13 @@ CAR_AVOIDANCE_MAX_CYCLES = 0
 POST_CAR_CONTROL_ENABLED = True
 POST_CAR_CONTROL_AFTER_CYCLES = 2
 # car 出现在分割平面内就允许参与锁定；这里控制“什么时候判断左右/切线接管”。
-# 优先使用 car 底边中点的地面反投距离，单位米：
-# - <=1.1m: 开始按俯视图左右边界判断避让方向
-# - <=1.0m: 切线接管
-CAR_AVOIDANCE_SWITCH_DISTANCE_M = 1.1
+# 米制距离和分割平面行数同时生效，任意一个更早达标就触发：
+# - <=1.1m 或车底边距离分割图底部 <=170 行：开始判断左右
+# - <=1.0m 或车底边距离分割图底部 <=160 行：切线接管
+CAR_AVOIDANCE_SWITCH_DISTANCE_M = 1.0
 CAR_AVOIDANCE_SIDE_DECISION_DISTANCE_M = 1.1
-# 旧的分割平面行数门槛保留为距离估算不可用时的兜底。
 CAR_AVOIDANCE_SWITCH_MIN_BOTTOM_Y = 160.0
-CAR_AVOIDANCE_SIDE_DECISION_MIN_BOTTOM_Y = 180.0
+CAR_AVOIDANCE_SIDE_DECISION_MIN_BOTTOM_Y = 170.0
 # 避车控制中心偏差外加量。设 10 表示最终循线误差：巡左边界 -10，巡右边界 +10。
 CAR_AVOIDANCE_CONTROL_ERROR_OFFSET_X = 40.0
 # 在预览画面上画出避车切线距离线；车框底边低于蓝线才允许切线避车。
