@@ -1985,31 +1985,32 @@ class RoadSegmentor:
             }
         return None
 
-    def _merge_bottom_width_exit_ready(self, search_mask, merge_side=None):
-        """底部变窄且补线侧不再贴边时，认为汇合补线可以退出."""
+    def _merge_bottom_width_exit_ready(self, search_mask, merge_side=None, require_bottom_width=True):
+        """检查普通汇合的底部宽度和补线侧贴边退出条件."""
         if search_mask is None or search_mask.size == 0:
             return False
 
         h, _ = search_mask.shape[:2]
-        rows_need = max(1, int(getattr(config, "MERGE_STATE_EXIT_BOTTOM_ROWS", 5)))
-        width_thresh = float(getattr(config, "MERGE_STATE_EXIT_WIDTH_THRESH", 340.0))
-        # SEG_MASK_IGNORE_BOTTOM_ROWS 会把图像最底部几行强制置黑。
-        # 退出检查不能再把这些黑边当成“没有赛道”，否则这里会永远失败。
-        ignored_bottom_rows = max(
-            0,
-            int(getattr(config, "SEG_MASK_IGNORE_BOTTOM_ROWS", 0)),
-        )
-        valid_bottom = max(0, h - min(ignored_bottom_rows, h))
-        start_y = max(0, valid_bottom - rows_need)
-        if valid_bottom <= start_y:
-            return False
-        for y in range(start_y, valid_bottom):
-            xs = np.where(search_mask[y] > 0)[0]
-            if len(xs) == 0:
+        if bool(require_bottom_width):
+            rows_need = max(1, int(getattr(config, "MERGE_STATE_EXIT_BOTTOM_ROWS", 5)))
+            width_thresh = float(getattr(config, "MERGE_STATE_EXIT_WIDTH_THRESH", 340.0))
+            # SEG_MASK_IGNORE_BOTTOM_ROWS 会把图像最底部几行强制置黑。
+            # 退出检查不能再把这些黑边当成“没有赛道”，否则这里会永远失败。
+            ignored_bottom_rows = max(
+                0,
+                int(getattr(config, "SEG_MASK_IGNORE_BOTTOM_ROWS", 0)),
+            )
+            valid_bottom = max(0, h - min(ignored_bottom_rows, h))
+            start_y = max(0, valid_bottom - rows_need)
+            if valid_bottom <= start_y:
                 return False
-            row_width = float(xs[-1] - xs[0])
-            if row_width >= width_thresh:
-                return False
+            for y in range(start_y, valid_bottom):
+                xs = np.where(search_mask[y] > 0)[0]
+                if len(xs) == 0:
+                    return False
+                row_width = float(xs[-1] - xs[0])
+                if row_width >= width_thresh:
+                    return False
         no_edge_top = int(np.clip(int(getattr(config, "MERGE_STATE_EXIT_NO_EDGE_Y_TOP", 40)), 0, h - 1))
         no_edge_bottom = int(np.clip(int(getattr(config, "MERGE_STATE_EXIT_NO_EDGE_Y_BOTTOM", 150)), 0, h - 1))
         if no_edge_bottom < no_edge_top:
@@ -2086,24 +2087,51 @@ class RoadSegmentor:
                 self.merge_state_side = self.merge_state_info.get("side")
                 self.merge_state_source = self.merge_state_info.get("source")
                 self.merge_state_enter_time = now_s
+                if self.merge_state_source == "bottom_left_wide":
+                    print(
+                        ">>> 汇合快捷判断: 顶部宽行快捷汇合开始补左线",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        ">>> 汇合补线开始: "
+                        f"补{self.merge_state_side or '未知'}线 source={self.merge_state_source or '普通判断'}",
+                        flush=True,
+                    )
             else:
                 return None
 
+        quick_merge_state = self.merge_state_source == "bottom_left_wide"
         hold_elapsed_s = (
             None if self.merge_state_enter_time is None
             else max(0.0, float(now_s - self.merge_state_enter_time))
         )
-        hold_ready = hold_elapsed_s is None or hold_elapsed_s >= min_hold_s
-        if hold_ready and self._merge_bottom_width_exit_ready(search_mask, self.merge_state_side):
+        hold_ready = (
+            quick_merge_state or
+            hold_elapsed_s is None or
+            hold_elapsed_s >= min_hold_s
+        )
+        if hold_ready and self._merge_bottom_width_exit_ready(
+            search_mask,
+            self.merge_state_side,
+            require_bottom_width=not quick_merge_state,
+        ):
             self.merge_state_exit_frames += 1
         else:
             self.merge_state_exit_frames = 0
 
         if self.merge_state_exit_frames >= exit_confirm_frames:
-            bottom_left_wide_state_done = self.merge_state_source == "bottom_left_wide"
-            if bottom_left_wide_state_done:
+            armed_merge_state_done = bool(self.merge_bottom_left_wide_after_right_enabled)
+            if armed_merge_state_done:
                 print(
-                    ">>> 汇合快捷判断: 第一次汇合补线结束，关闭顶部宽行左汇合判断",
+                    ">>> 汇合快捷判断: 第一次完整汇合补线结束 "
+                    f"source={self.merge_state_source or '普通判断'}，关闭顶部宽行左汇合判断",
+                    flush=True,
+                )
+            else:
+                print(
+                    ">>> 汇合补线结束: "
+                    f"补{self.merge_state_side or '未知'}线 source={self.merge_state_source or '普通判断'}",
                     flush=True,
                 )
             self.merge_state_active = False
@@ -2115,7 +2143,7 @@ class RoadSegmentor:
             self.merge_state_info = None
             self.merge_state_side = None
             self.merge_state_source = None
-            if bottom_left_wide_state_done:
+            if armed_merge_state_done:
                 self.merge_bottom_left_wide_after_right_enabled = False
                 self.merge_bottom_left_wide_hit_logged = False
             return None
@@ -3595,7 +3623,28 @@ class RoadSegmentor:
         }
         base = np.array(base_path, dtype=np.float32).reshape((-1, 2))
         prev_state = self.car_avoidance_state
-        if len(base) < 2 or not bool(getattr(config, "CAR_AVOIDANCE_ENABLED", True)):
+        if not bool(getattr(config, "CAR_AVOIDANCE_ENABLED", True)):
+            if (
+                prev_state != "FOLLOW_LANE" or
+                self.locked_car is not None or
+                self.car_last_avoid_path is not None
+            ):
+                print(">>> 避车: 开关关闭，回到正常循线", flush=True)
+            self.locked_car = None
+            self.locked_car_miss_frames = 0
+            self.car_avoidance_state = "FOLLOW_LANE"
+            self.car_avoidance_boundary_side = None
+            self.car_clearing_frames = 0
+            self.car_last_avoid_path = None
+            self.car_last_avoid_path_is_boundary = False
+            self.car_last_boundary_inset_x = 0.0
+            debug["state"] = self.car_avoidance_state
+            debug["boundary_side"] = ""
+            debug["miss_frames"] = 0
+            debug["clear_frames"] = 0
+            debug["event"] = "disabled"
+            return 0.0, debug, None
+        if len(base) < 2:
             return 0.0, debug, None
 
         max_cycles = int(getattr(config, "CAR_AVOIDANCE_MAX_CYCLES", 0))
@@ -4066,8 +4115,47 @@ class RoadSegmentor:
         search_mask = self._prepare_search_mask(mask)
         search_mask = self._apply_mask_ignore_border(search_mask)
         search_edge_mask = self._extract_edge_mask(search_mask)
+        try:
+            route_choice_raw = int(sign_route_choice)
+        except (TypeError, ValueError):
+            route_choice_raw = 0
+        try:
+            turn_intent_raw = int(turn_intent)
+        except (TypeError, ValueError):
+            turn_intent_raw = -1
+        route_choice = route_choice_raw if route_choice_raw in (-1, 1) else 0
+        preferred_turn_default = route_choice if route_choice in (-1, 1) else turn_intent_raw
+        if preferred_turn_default not in (-1, 1):
+            preferred_turn_default = -1
+        sign_route_has_priority = bool(sign_route_pending) or route_choice in (-1, 1)
+        y_fork_info = None
+        if sign_route_has_priority:
+            y_fork_info = self._detect_y_fork(search_mask)
+            if (
+                self.merge_state_active and
+                y_fork_info is not None and
+                bool(y_fork_info.get("active"))
+            ):
+                print(
+                    ">>> 语义Y岔优先: 检测到岔路，打断当前汇合补线 "
+                    f"source={self.merge_state_source or '普通判断'}",
+                    flush=True,
+                )
+                self.merge_state_active = False
+                self.merge_state_hit_frames = 0
+                self.merge_state_hit_times = []
+                self.merge_state_miss_frames = 0
+                self.merge_state_exit_frames = 0
+                self.merge_state_enter_time = None
+                self.merge_state_info = None
+                self.merge_state_side = None
+                self.merge_state_source = None
         merge_detect_info = None
-        if not self.merge_state_active:
+        if not self.merge_state_active and not (
+            sign_route_has_priority and
+            y_fork_info is not None and
+            bool(y_fork_info.get("active"))
+        ):
             merge_detect_info = self._detect_merge_guide(search_mask, search_edge_mask)
             if merge_detect_info is None:
                 merge_detect_info = self._detect_edge_trace_merge_guide(search_mask, search_edge_mask)
@@ -4101,7 +4189,8 @@ class RoadSegmentor:
             search_edge_mask = self._extract_edge_mask(search_mask)
             y_fork_info = {"active": False, "fork_point": None, "split_rows": 0}
         else:
-            y_fork_info = self._detect_y_fork(search_mask)
+            if y_fork_info is None:
+                y_fork_info = self._detect_y_fork(search_mask)
             if not bool(y_fork_info.get("active")):
                 merge_detect_info = self._detect_bottom_left_wide_merge_guide(search_mask, search_edge_mask)
                 merge_guide_info = self._update_merge_state(merge_detect_info, search_mask)
@@ -4149,18 +4238,6 @@ class RoadSegmentor:
         best_path = None
         best_nodes = None
         fork_selected_side = None
-        try:
-            route_choice_raw = int(sign_route_choice)
-        except (TypeError, ValueError):
-            route_choice_raw = 0
-        try:
-            turn_intent_raw = int(turn_intent)
-        except (TypeError, ValueError):
-            turn_intent_raw = -1
-        route_choice = route_choice_raw if route_choice_raw in (-1, 1) else 0
-        preferred_turn_default = route_choice if route_choice in (-1, 1) else turn_intent_raw
-        if preferred_turn_default not in (-1, 1):
-            preferred_turn_default = -1
         route_boundary_side = None
         car_path_debug = None
         car_avoid_path = None

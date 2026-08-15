@@ -1265,12 +1265,14 @@ PERSON_CLASS_NAME = "person"
 PERSON_CLASS_ID_FALLBACK = 2
 
 # 行人停车/放行逻辑。
+# 总开关：False 时忽略行人停车/放行逻辑。
+PERSON_STOP_ENABLED = True
 # 触发不做路径 ROI 过滤；person 框底边足够靠近画面底部后停车观察。
 # 当前策略: 先停车观察；确认行人沿某一方向稳定移动，并且对应侧底角跨过“行人放行线”后，再直接释放停车。
 # 画面上先画“停车截至横线”，它直接对应 PERSON_STOP_TRIGGER_DIST。
 # 竖向放行线后面再按调试需要打开。
 # 行人框底边距离画面底部小于该值才触发停车，单位 TARGET_RES 像素。
-PERSON_STOP_TRIGGER_DIST = 420
+PERSON_STOP_TRIGGER_DIST = 360 #420
 # 行人停车后，用最后一次有效看到的底部 y 行锁定一个纵向范围。
 # 后续最靠近车身的 person 如果跳到该范围上方超过这个行数，才按丢失计时。
 PERSON_STOP_LOCK_ROW_MARGIN = 45.0

@@ -774,6 +774,7 @@ def preview_index_html():
             .param { display:flex; align-items:center; gap:6px; margin:6px 0; }
             .param label { width:78px; }
             .param input { width:92px; box-sizing:border-box; color:#111; }
+            .toggle input { width:auto; }
             #debug-panel button {
                 margin:6px 4px 0 0; padding:4px 9px; color:#fff;
                 background:#333; border:1px solid #888; border-radius:4px;
@@ -789,6 +790,8 @@ def preview_index_html():
             <div class="param"><label for="kd">Kd</label><input id="kd" type="number" step="0.001"></div>
             <div class="param"><label for="psi">Psi</label><input id="psi" type="number" step="0.01"></div>
             <div class="param"><label for="speed">电机速度</label><input id="speed" type="number" step="1"></div>
+            <div class="param toggle"><label for="person_stop_enabled">行人停车</label><input id="person_stop_enabled" type="checkbox"></div>
+            <div class="param toggle"><label for="car_avoidance_enabled">车辆躲避</label><input id="car_avoidance_enabled" type="checkbox"></div>
             <button type="button" onclick="applyParams()">应用参数</button>
             <button type="button" onclick="driveStart()">发车</button>
             <button type="button" onclick="driveStop()">停车</button>
@@ -796,6 +799,7 @@ def preview_index_html():
         </div>
         <script>
         const fields = ['kp', 'kd', 'psi', 'speed'];
+        const toggles = ['person_stop_enabled', 'car_avoidance_enabled'];
         function setStatus(text, ok) {
             const node = document.getElementById('debug-status');
             node.textContent = text || '';
@@ -805,6 +809,11 @@ def preview_index_html():
             fields.forEach(function (name) {
                 if (values && values[name] !== undefined) {
                     document.getElementById(name).value = values[name];
+                }
+            });
+            toggles.forEach(function (name) {
+                if (values && values[name] !== undefined) {
+                    document.getElementById(name).checked = Boolean(values[name]);
                 }
             });
         }
@@ -821,6 +830,9 @@ def preview_index_html():
             const values = {};
             fields.forEach(function (name) {
                 values[name] = Number(document.getElementById(name).value);
+            });
+            toggles.forEach(function (name) {
+                values[name] = document.getElementById(name).checked;
             });
             fetch('/debug_control_params', {
                 method: 'POST',

@@ -315,6 +315,45 @@ def update_person_stop_state(state, person_info, left_boundary_x, right_boundary
     active = bool(state.get("person_stop_active", False))
     prev_active = active
     yolo_frame_id = int(yolo_frame_id)
+    if not bool(getattr(config, "PERSON_STOP_ENABLED", True)):
+        state["person_stop_active"] = False
+        state["person_bottom_y"] = None
+        state["person_bottom_left_x"] = None
+        state["person_bottom_center_x"] = None
+        state["person_bottom_right_x"] = None
+        state["person_bottom_area"] = None
+        state["person_dist_to_bottom"] = None
+        state["person_car_on_left"] = False
+        state["person_left_boundary_x"] = None
+        state["person_right_boundary_x"] = None
+        state["person_road_center_x"] = None
+        state["person_clear_line_x"] = None
+        state["person_clear_line_side"] = ""
+        state["person_stop_cutoff_y"] = None
+        state["person_miss_frames"] = 0
+        state["person_clear_frames"] = 0
+        state["person_move_direction"] = 0
+        state["person_current_direction"] = 0
+        state["person_release_direction"] = 0
+        state["person_move_dx"] = 0.0
+        state["person_abs_move_dx"] = 0.0
+        state["person_min_move_dx"] = float(getattr(
+            config,
+            "PERSON_CLEAR_MIN_MOVE_DX",
+            getattr(config, "PERSON_CLEAR_MIN_RIGHT_DX", 3.0),
+        ))
+        state["person_line_reached"] = False
+        state["person_movement_confirmed"] = False
+        state["person_near_bottom"] = False
+        state["person_enough_area"] = False
+        state["person_missing_started_at"] = None
+        state["person_stop_started_at"] = None
+        state["person_stop_max_released"] = False
+        state["person_lock_bottom_y"] = None
+        state["person_last_frame_id"] = yolo_frame_id
+        state["person_last_bottom_center_x"] = None
+        state["person_stop_event"] = "disabled_release" if prev_active else ""
+        return False
     last_frame_id = int(state.get("person_last_frame_id", -1))
     if yolo_frame_id == last_frame_id:
         if person_info is not None:
@@ -2366,7 +2405,10 @@ def seg_worker(core_id, worker_id=0):
             current_yolo_fps = fps_stats["yolo_fps"]
 
         if rendered_img is not None:
-            if bool(getattr(config, "CAR_AVOIDANCE_DISTANCE_LINE_ENABLED", True)):
+            if (
+                bool(getattr(config, "CAR_AVOIDANCE_ENABLED", True)) and
+                bool(getattr(config, "CAR_AVOIDANCE_DISTANCE_LINE_ENABLED", True))
+            ):
                 target_w, target_h = config.TARGET_RES
                 crop_ratio = float(getattr(config, "SEG_INPUT_CROP_TOP_RATIO", 0.0))
                 crop_ratio = max(0.0, min(0.95, crop_ratio))
@@ -2390,7 +2432,7 @@ def seg_worker(core_id, worker_id=0):
                     max(1, int(getattr(config, "CAR_AVOIDANCE_DISTANCE_LINE_THICKNESS", 3))),
                     cv2.LINE_AA,
                 )
-            if person_info is not None:
+            if bool(getattr(config, "PERSON_STOP_ENABLED", True)) and person_info is not None:
                 target_w, target_h = config.TARGET_RES
                 scale_y = rendered_img.shape[0] / float(target_h)
                 default_cutoff_y = float(target_h) - float(getattr(config, "PERSON_STOP_TRIGGER_DIST", 0.0))
@@ -3166,6 +3208,13 @@ def serial_control_thread():
                 state=("release_timeout",),
                 min_interval=0.0,
             )
+        elif person_stop_event == "disabled_release":
+            throttled_log(
+                "person_stop_event",
+                ">>> 行人: 开关关闭，放行",
+                state=("disabled_release",),
+                min_interval=0.0,
+            )
 
         if ser:
             packet = struct.pack(
@@ -3326,6 +3375,8 @@ def _debug_control_param_values():
         "kd": float(getattr(config, "STANLEY_LATERAL_D_GAIN", 0.0)),
         "psi": float(getattr(config, "STANLEY_HEADING_GAIN", 0.0)),
         "speed": int(round(float(getattr(config, "CONTROL_MAX_SPEED", 0.0)))),
+        "person_stop_enabled": bool(getattr(config, "PERSON_STOP_ENABLED", True)),
+        "car_avoidance_enabled": bool(getattr(config, "CAR_AVOIDANCE_ENABLED", True)),
     }
 
 
@@ -3356,7 +3407,18 @@ def _apply_debug_control_params(payload):
             raise ValueError(f"{name} 不是有效数字")
         parsed[name] = max(lower, min(upper, value))
 
-    if not parsed:
+    bool_updates = {}
+    for name in ("person_stop_enabled", "car_avoidance_enabled"):
+        if name not in values:
+            continue
+        value = values[name]
+        if isinstance(value, str):
+            value = value.strip().lower() in ("1", "true", "yes", "on", "开", "开启")
+        else:
+            value = bool(value)
+        bool_updates[name] = value
+
+    if not parsed and not bool_updates:
         raise ValueError("没有可更新的参数")
 
     if "kp" in parsed:
@@ -3371,6 +3433,10 @@ def _apply_debug_control_params(payload):
         config.CONTROL_MAX_SPEED = speed
         # B 算法的速度估计同步更新，否则调速后横向纠偏比例会不一致。
         config.STANLEY_SPEED_ESTIMATE = float(speed)
+    if "person_stop_enabled" in bool_updates:
+        config.PERSON_STOP_ENABLED = bool(bool_updates["person_stop_enabled"])
+    if "car_avoidance_enabled" in bool_updates:
+        config.CAR_AVOIDANCE_ENABLED = bool(bool_updates["car_avoidance_enabled"])
 
     return _debug_control_param_values()
 
