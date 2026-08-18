@@ -103,6 +103,8 @@ OCR_BACKEND = "baidu_api"
 OCR_DUAL_BACKEND_ENABLED = True
 OCR_LOCAL_BACKEND = "local"
 OCR_API_BACKEND = "baidu_api"
+# 路牌停车采样是否始终只跑本地 OCR。默认 False：采样总时长内同时收集本地和百度 OCR。
+SIGN_LLM_OCR_LOCAL_ONLY = False
 
 # 百度 OCR API 请求参数。
 # 密钥从项目根目录 .env 读取:
@@ -208,7 +210,8 @@ OCR_MIN_SCORE = 0.4
 # 在 llm_once 模式下设为 False 会关闭路牌 OCR/千帆流程。
 SIGN_LLM_ENABLED = True
 # 语义岔路决策模式:
-# - "llm_once": 第一次看到岔路牌即第二圈，OCR + 千帆判断；第三圈再次看到岔路牌时取反
+# - "llm_once": 首次看到路牌就交给分割线程优先监视 Y 岔；检测到 Y 岔立即沿临时中线
+#   接近，达到测距阈值后才停车 OCR + 千帆判断；第三圈再次看到岔路牌时取反
 # - "fixed_sequence": 不跑路牌 OCR/千帆；第一圈忽略岔路；第二、三圈按固定序列走
 SIGN_ROUTE_DECISION_MODE = "llm_once"
 # SIGN_ROUTE_DECISION_MODE = "fixed_sequence"
@@ -227,9 +230,7 @@ SIGN_ROUTE_FIXED_REQUIRE_SIGN = True
 # 触发语义路牌停车采样的 sign 框面积阈值，单位是 TARGET_RES 坐标系像素面积。
 # 它会和 SIGN_LLM_T0RIGGER_DIST、SIGN_LLM_TRIGGER_EDGE_MARGIN_RATIO 同时满足后才停车。
 SIGN_LLM_TRIGGER_AREA = 10000 #16000
-# 触发语义路牌停车采样的 sign 截止距离，单位是 TARGET_RES 像素。
-# 路牌框底边距离画面底部小于等于该值，才认为已经足够近，可以停车采样。
-# 调大：更早停车；调小：更靠近再停车。
+# 旧版图像距离阈值，单位是 TARGET_RES 像素；当前仅保留兼容，不参与停车触发。
 SIGN_LLM_TRIGGER_DIST = 540
 # 路牌单目测距调试。
 # 原理: Z ~= fy_target * SIGN_REAL_HEIGHT_M / sign_box_height_px。
@@ -239,25 +240,22 @@ SIGN_REAL_HEIGHT_M = 0.12
 SIGN_DISTANCE_LABEL_ENABLED = True
 SIGN_DISTANCE_LABEL_DECIMALS = 2
 SIGN_DISTANCE_MIN_BOX_HEIGHT_PX = 8.0
+# 路牌出现后，分割线程检测到 Y 岔即保持岔路中线；单目距离小于等于该值才停车采样。
 SIGN_LLM_TRIGGER_DISTANCE_M = 0.65
 # 硬性停车采样条件：Y 岔路特征点距离分割平面底部小于等于该行数时，
 # 若当前帧有不贴边的 sign 框，立刻停车开始路牌 OCR/千帆，不再受 sign 面积/高度限制。
 # 单位是 SEG_SIZE 坐标系像素行。
 SIGN_LLM_FORK_POINT_TRIGGER_ROWS = 120
-# 停车后希望采集的有效 OCR 样本数量。
-# 收满后会提交给千帆；如果超时，则有几个有效样本就提交几个。
+# 停车采样期间，本地和百度 OCR 各自最多保留多少条有效文本。
+# 两边各收满此数量可提前提交；否则采样总时长到后，把已有的本地/百度文本一起送千帆。
 SIGN_LLM_OCR_SAMPLES = 3
 # 正常提交给千帆的最少有效样本数；超时兜底时仍允许 1 个有效样本提交。
 SIGN_LLM_MIN_VALID_SAMPLES = 3
-# 路牌触发停车后，检测框连续稳定多少帧才开始 OCR。
-SIGN_LLM_STABLE_FRAMES = 3
-# 路牌框中心位置允许的单帧最大变化，单位是 TARGET_RES 像素。
-SIGN_LLM_STABLE_POSITION_TOLERANCE = 12.0
-# 路牌框宽高允许的单帧相对变化比例。
-SIGN_LLM_STABLE_SIZE_TOLERANCE_RATIO = 0.15
+# 路牌停车后延时多久再开始 OCR，单位秒。
+SIGN_LLM_OCR_START_DELAY_SECONDS = 0.3
 # 停车采集 OCR 的最长等待时间，单位秒。
 # 到时后即使没收满样本，也会尝试 force 提交；0 个有效样本仍不会提交。
-SIGN_LLM_COLLECT_TIMEOUT = 3.0
+SIGN_LLM_COLLECT_TIMEOUT = 8.0
 # 单次 OCR 后端卡住时，最多等待多久再放弃本次路牌会话。
 # 到时释放停车和 OCR 状态，避免一条坏路牌永久占住流程。
 SIGN_LLM_OCR_INFLIGHT_TIMEOUT = 5.0
@@ -590,8 +588,16 @@ MERGE_GUIDE_LINE_THICKNESS = 2
 MERGE_BOTTOM_LEFT_WIDE_TRIGGER_ENABLED = True
 MERGE_BOTTOM_LEFT_WIDE_Y_TOP = 0
 MERGE_BOTTOM_LEFT_WIDE_Y_BOTTOM = 9
-MERGE_BOTTOM_LEFT_WIDE_WIDTH_THRESH = 380.0
+MERGE_BOTTOM_LEFT_WIDE_WIDTH_THRESH = 340.0
 MERGE_BOTTOM_LEFT_WIDE_MIN_ROWS = 2
+# 明确走右岔后，延时多久才允许顶部宽行快捷汇合判断。
+MERGE_BOTTOM_LEFT_WIDE_AFTER_RIGHT_DELAY_SECONDS = 1.0
+# 快捷汇合退出：顶部 10 行均没有道路宽度大于此值才计为一帧退出。
+MERGE_BOTTOM_LEFT_WIDE_EXIT_Y_TOP = 0
+MERGE_BOTTOM_LEFT_WIDE_EXIT_Y_BOTTOM = 9
+MERGE_BOTTOM_LEFT_WIDE_EXIT_WIDTH_THRESH = 300.0
+# 上述退出条件连续满足多少帧，才关闭快捷汇合补线。
+MERGE_BOTTOM_LEFT_WIDE_EXIT_CONFIRM_FRAMES = 3
 # 汇合特征连续命中多少帧才正式进入补线状态。
 MERGE_STATE_CONFIRM_FRAMES = 3
 # 汇合特征命中统计窗口，单位秒；窗口内累计命中 CONFIRM_FRAMES 次即确认。
@@ -1037,6 +1043,9 @@ STEER_SIGNAL_NO_TARGET_GAIN = 1.0
 # - turn_intent: OCR 识别出的语义分叉意图，-1 表示左，1 表示右
 # - turn_intent_fid: 上一次更新 turn_intent 时对应的帧号
 # - sign_llm_*: 大面积语义路牌停车、多次 OCR、千帆判定状态
+# - sign_route_state: IDLE -> APPROACH_SIGN(首次路牌出现后，Y 岔时沿中线接近)
+#   -> REVERSE_APPROACH_SIGN(第二次路牌出现后等待带牌Y岔取反) -> SIGN_STOP_COLLECT / WAIT_API
+#   -> CHOICE_READY / IN_FORK
 # - sign_route_pass_index: 岔路/路牌事件阶段；llm_once 下 0=待第二圈路牌判定，2=待第三圈取反，3=完成
 # - person_stop_active: 当前是否已经进入“行人强制停车”状态
 # - person_*: 行人停车/放行判定用的最近状态
@@ -1073,7 +1082,6 @@ DEFAULT_CONTROL_DATA = {
     "sign_llm_ocr_started": False,
     "sign_llm_ocr_job_frame_id": -1,
     "sign_llm_stable_rect": None,
-    "sign_llm_stable_frames": 0,
     "sign_llm_ocr_ready": False,
     "sign_llm_result": "",
     "sign_llm_error": "",
@@ -1102,6 +1110,8 @@ DEFAULT_CONTROL_DATA = {
     "person_bottom_right_x": None,
     "person_bottom_area": None,
     "person_dist_to_bottom": None,
+    "person_ground_distance_m": None,
+    "person_stop_trigger_source": "",
     "person_car_on_left": False,
     "person_left_boundary_x": None,
     "person_right_boundary_x": None,
@@ -1267,12 +1277,17 @@ PERSON_CLASS_ID_FALLBACK = 2
 # 行人停车/放行逻辑。
 # 总开关：False 时忽略行人停车/放行逻辑。
 PERSON_STOP_ENABLED = True
+# 行人测距停车：person 框底边反投到地面后，小于等于该距离就停车。
+PERSON_STOP_DISTANCE_ENABLED = True
+PERSON_STOP_DISTANCE_M = 0.6
+# 是否保留原来的“框底边离画面底部像素距离”停车条件作为兜底。
+PERSON_STOP_PIXEL_TRIGGER_ENABLED = False
 # 触发不做路径 ROI 过滤；person 框底边足够靠近画面底部后停车观察。
 # 当前策略: 先停车观察；确认行人沿某一方向稳定移动，并且对应侧底角跨过“行人放行线”后，再直接释放停车。
 # 画面上先画“停车截至横线”，它直接对应 PERSON_STOP_TRIGGER_DIST。
 # 竖向放行线后面再按调试需要打开。
 # 行人框底边距离画面底部小于该值才触发停车，单位 TARGET_RES 像素。
-PERSON_STOP_TRIGGER_DIST = 360 #420
+PERSON_STOP_TRIGGER_DIST = 420
 # 行人停车后，用最后一次有效看到的底部 y 行锁定一个纵向范围。
 # 后续最靠近车身的 person 如果跳到该范围上方超过这个行数，才按丢失计时。
 PERSON_STOP_LOCK_ROW_MARGIN = 45.0
@@ -1677,6 +1692,12 @@ CAR_AVOIDANCE_NEAR_MISS_FRAMES = 2
 CAR_AVOIDANCE_MISS_X_PREDICT_GAIN = 0.0
 # car 检测最低置信度过滤；0 表示不额外过滤。
 CAR_AVOIDANCE_MIN_SCORE = 0.0
+# car 框高度超过画面高度的这个比例，就直接忽略。
+CAR_AVOIDANCE_IGNORE_HEIGHT_RATIO = 0.6
+# 允许把“和当前选中道路不重叠但离得很近”的车也算进避障池。
+CAR_AVOIDANCE_SELECTED_ROAD_MAX_GAP_PX = 48.0
+CAR_AVOIDANCE_SELECTED_ROAD_MAX_GAP_RATIO = 0.18
+CAR_AVOIDANCE_SELECTED_ROAD_MAX_GAP_M = 0.25
 # car 检测最大面积过滤；0 表示不额外过滤。
 CAR_AVOIDANCE_MAX_AREA = 0.0
 # 避障退出状态机。
@@ -1685,7 +1706,7 @@ CAR_AVOIDANCE_CLEARING_MISS_FRAMES = 0
 # CLEARING 前段继续追选定侧边界的帧数。
 CAR_AVOIDANCE_CLEARING_HOLD_FRAMES = 15
 # CLEARING 后段从选定侧边界切回正常循线的帧数。
-CAR_AVOIDANCE_CLEARING_RETURN_FRAMES = 5
+CAR_AVOIDANCE_CLEARING_RETURN_FRAMES = 2
 # 是否在避车路径/正常循线路径切换时清空转向控制器历史。
 # Stanley/Control-C 本身依赖 EMA 历史抑制跳变，默认关闭，避免弯道切换时第一帧过冲。
 CAR_AVOIDANCE_RESET_CONTROLLER_ON_PATH_SWITCH = False

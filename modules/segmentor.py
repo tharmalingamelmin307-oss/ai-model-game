@@ -111,6 +111,7 @@ class RoadSegmentor:
         self.merge_state_side = None
         self.merge_state_source = None
         self.merge_bottom_left_wide_after_right_enabled = False
+        self.merge_bottom_left_wide_after_right_armed_at = None
         self.merge_bottom_left_wide_hit_logged = False
         self.merge_edge_trace_debug_counter = 0
         self.locked_car = None
@@ -2029,6 +2030,35 @@ class RoadSegmentor:
                     return False
         return True
 
+    def _quick_merge_top_wide_present(self, search_mask):
+        """快捷汇合顶部 10 行内是否仍有宽度大于阈值的道路行。"""
+        if search_mask is None or search_mask.size == 0:
+            return False
+
+        h, _ = search_mask.shape[:2]
+        y_top = int(np.clip(
+            int(getattr(config, "MERGE_BOTTOM_LEFT_WIDE_EXIT_Y_TOP", 0)),
+            0,
+            h - 1,
+        ))
+        y_bottom = int(np.clip(
+            int(getattr(config, "MERGE_BOTTOM_LEFT_WIDE_EXIT_Y_BOTTOM", 9)),
+            0,
+            h - 1,
+        ))
+        if y_bottom < y_top:
+            y_top, y_bottom = y_bottom, y_top
+        width_thresh = float(getattr(
+            config,
+            "MERGE_BOTTOM_LEFT_WIDE_EXIT_WIDTH_THRESH",
+            300.0,
+        ))
+        for y in range(y_top, y_bottom + 1):
+            xs = np.where(search_mask[y] > 0)[0]
+            if len(xs) >= 2 and float(xs[-1] - xs[0]) > width_thresh:
+                return True
+        return False
+
     def _update_merge_state(self, merge_detect_info, search_mask):
         """汇合补线状态机：时间窗口内累计命中确认，底部宽度连续恢复后退出."""
         confirm_frames = max(1, int(getattr(config, "MERGE_STATE_CONFIRM_FRAMES", 3)))
@@ -2111,11 +2141,29 @@ class RoadSegmentor:
             hold_elapsed_s is None or
             hold_elapsed_s >= min_hold_s
         )
-        if hold_ready and self._merge_bottom_width_exit_ready(
-            search_mask,
-            self.merge_state_side,
-            require_bottom_width=not quick_merge_state,
-        ):
+        if quick_merge_state:
+            # 快捷汇合退出不能只看顶部宽行消失；还必须同时满足普通汇合的
+            # 底部宽度/贴边恢复条件，两个条件连续成立才允许撤掉补线。
+            exit_ready = (
+                not self._quick_merge_top_wide_present(search_mask) and
+                self._merge_bottom_width_exit_ready(
+                    search_mask,
+                    self.merge_state_side,
+                    require_bottom_width=True,
+                )
+            )
+            exit_confirm_frames = max(1, int(getattr(
+                config,
+                "MERGE_BOTTOM_LEFT_WIDE_EXIT_CONFIRM_FRAMES",
+                3,
+            )))
+        else:
+            exit_ready = hold_ready and self._merge_bottom_width_exit_ready(
+                search_mask,
+                self.merge_state_side,
+                require_bottom_width=True,
+            )
+        if exit_ready:
             self.merge_state_exit_frames += 1
         else:
             self.merge_state_exit_frames = 0
@@ -2145,6 +2193,7 @@ class RoadSegmentor:
             self.merge_state_source = None
             if armed_merge_state_done:
                 self.merge_bottom_left_wide_after_right_enabled = False
+                self.merge_bottom_left_wide_after_right_armed_at = None
                 self.merge_bottom_left_wide_hit_logged = False
             return None
 
@@ -3201,6 +3250,75 @@ class RoadSegmentor:
             return None
         return float(np.interp(z, unique_zs, unique_xs))
 
+    def _car_measurement_on_selected_road(self, measurement, left_boundary, right_boundary, base):
+        """过滤不在当前选中道路上的车，以及过高的异常车框."""
+        rect = measurement.get("rect")
+        if rect is not None and len(rect) == 4:
+            try:
+                _, _, _, rh = [float(v) for v in rect]
+                ignore_ratio = float(getattr(config, "CAR_AVOIDANCE_IGNORE_HEIGHT_RATIO", 0.6))
+                target_h = float(config.TARGET_RES[1])
+                if target_h > 0.0 and rh / target_h > ignore_ratio:
+                    return False, "too_tall"
+            except (TypeError, ValueError):
+                pass
+
+        _smooth_cx, smooth_cy = measurement.get("bottom_center", (0.0, 0.0))
+        ground_distance_m = measurement.get("ground_distance_m")
+        ground_left = measurement.get("ground_bottom_left")
+        ground_right = measurement.get("ground_bottom_right")
+        selected_gap_px = max(
+            float(getattr(config, "CAR_AVOIDANCE_SELECTED_ROAD_MAX_GAP_PX", 48.0)),
+            0.0,
+        )
+        selected_gap_ratio = max(
+            0.0,
+            float(getattr(config, "CAR_AVOIDANCE_SELECTED_ROAD_MAX_GAP_RATIO", 0.18)),
+        )
+        selected_gap_m = max(
+            0.0,
+            float(getattr(config, "CAR_AVOIDANCE_SELECTED_ROAD_MAX_GAP_M", 0.25)),
+        )
+
+        if (
+            ground_distance_m is not None and
+            ground_left is not None and
+            ground_right is not None and
+            left_boundary is not None and
+            right_boundary is not None
+        ):
+            bev_left_x = self._boundary_ground_x_at_z(left_boundary, float(ground_distance_m))
+            bev_right_x = self._boundary_ground_x_at_z(right_boundary, float(ground_distance_m))
+            if bev_left_x is not None and bev_right_x is not None:
+                road_left_x = min(float(bev_left_x), float(bev_right_x))
+                road_right_x = max(float(bev_left_x), float(bev_right_x))
+                car_left_x = float(ground_left[0])
+                car_right_x = float(ground_right[0])
+                overlap = min(car_right_x, road_right_x) - max(car_left_x, road_left_x)
+                if overlap <= 0.0:
+                    ground_gap = max(road_left_x - car_right_x, car_left_x - road_right_x, 0.0)
+                    if ground_gap > selected_gap_m:
+                        return False, "off_selected_road"
+                    return True, "ground_near"
+                return True, "ground_overlap"
+
+        left_x, right_x, road_width = self._car_road_width_at_y(left_boundary, right_boundary, float(smooth_cy))
+        if left_x is not None and right_x is not None:
+            car_left_x = float(measurement.get("x_min", left_x))
+            car_right_x = float(measurement.get("x_max", right_x))
+            overlap = min(car_right_x, float(right_x)) - max(car_left_x, float(left_x))
+            if overlap <= 0.0:
+                road_gap = max(float(left_x) - car_right_x, car_left_x - float(right_x), 0.0)
+                width_gap = selected_gap_px
+                if road_width is not None and road_width > 0.0:
+                    width_gap = max(width_gap, float(road_width) * selected_gap_ratio)
+                if road_gap > width_gap:
+                    return False, "off_selected_road"
+                return True, "image_near"
+            return True, "image_overlap"
+
+        return True, "road_unknown"
+
     def _select_car_avoidance_boundary_side(self, locked_car, left_boundary, right_boundary):
         """根据车框底边几何选择更空的一侧做避车参考线.
 
@@ -3377,6 +3495,7 @@ class RoadSegmentor:
             "box": box,
             "score": float(item.get("score", 0.0)),
             "area": area,
+            "rect": None if rect is None else list(rect),
             "x_min": x_min,
             "x_max": x_max,
             "y_min": y_min,
@@ -3806,7 +3925,22 @@ class RoadSegmentor:
             measurement = self._car_measurement_from_item(item, w_seg, h_seg, base)
             if measurement is not None:
                 measurements.append(measurement)
+        filtered_measurements = []
+        filtered_out = 0
+        for measurement in measurements:
+            keep, _reason = self._car_measurement_on_selected_road(
+                measurement,
+                left_boundary,
+                right_boundary,
+                base,
+            )
+            if keep:
+                filtered_measurements.append(measurement)
+            else:
+                filtered_out += 1
+        measurements = filtered_measurements
         debug["detected_cars"] = int(len(measurements))
+        debug["filtered_out_cars"] = int(filtered_out)
 
         if not bool(state_updates_enabled):
             if measurements:
@@ -4302,6 +4436,13 @@ class RoadSegmentor:
                     best_candidate = fork_center_candidate
                     fork_selected_side = None
                     pending_centerline_active = True
+                    if not bool(self.last_branch_stats.get("sign_route_pending_centerline", False)):
+                        print(
+                            ">>> 路牌岔路中线已拉起: "
+                            f"bottom={tuple(round(v, 1) for v in fork_bottom_mid)} "
+                            f"fork={tuple(round(v, 1) for v in y_fork_info.get('fork_point'))}",
+                            flush=True,
+                        )
                 else:
                     preferred_turn = self._resolve_preferred_turn(preferred_turn_default)
                     best_candidate = right_best if preferred_turn == 1 else left_best
@@ -4422,14 +4563,36 @@ class RoadSegmentor:
                     )
                 )
             )
-            if bool(y_fork_active) and fork_selected_side == "right":
-                if not bool(self.merge_bottom_left_wide_after_right_enabled):
+            now_s = time.monotonic()
+            # 快捷汇合只属于路牌已经确认的右支路。普通岔路默认选右、
+            # 石头避让等路径不能给它计时，避免把无关宽路误判为汇合。
+            if (
+                route_choice == 1 and
+                bool(y_fork_active) and
+                fork_selected_side == "right"
+            ):
+                if self.merge_bottom_left_wide_after_right_armed_at is None:
+                    self.merge_bottom_left_wide_after_right_armed_at = now_s
+            elif route_choice == -1 or (bool(y_fork_active) and fork_selected_side == "left"):
+                self.merge_bottom_left_wide_after_right_armed_at = None
+
+            if (
+                self.merge_bottom_left_wide_after_right_armed_at is not None and
+                not bool(self.merge_bottom_left_wide_after_right_enabled)
+            ):
+                arm_delay_s = max(0.0, float(getattr(
+                    config,
+                    "MERGE_BOTTOM_LEFT_WIDE_AFTER_RIGHT_DELAY_SECONDS",
+                    1.0,
+                )))
+                arm_elapsed_s = now_s - float(self.merge_bottom_left_wide_after_right_armed_at)
+                if arm_elapsed_s >= arm_delay_s:
                     print(
-                        ">>> 汇合快捷判断: 明确Y岔走右，开启顶部宽行左汇合判断",
+                        f">>> 汇合快捷判断: 明确Y岔走右{arm_delay_s:.1f}秒后，开启顶部宽行左汇合判断",
                         flush=True,
                     )
                     self.merge_bottom_left_wide_hit_logged = False
-                self.merge_bottom_left_wide_after_right_enabled = True
+                    self.merge_bottom_left_wide_after_right_enabled = True
             if (
                 not branch_route_switch and
                 self.last_poly_coeffs is not None and
