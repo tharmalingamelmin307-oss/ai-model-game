@@ -1797,7 +1797,14 @@ def yolo_worker(core_id=None, worker_id=0):
             visible_sign_rect = None
             route_trigger_rect = None
             route_skip_debug = None
-            route_sign_gate_enabled = sign_route_uses_llm()
+            # 距离、贴边门槛只服务于首次停车 OCR。首次结果已确定后，第二次
+            # 路牌只用于武装取反，不能再被这些门槛拦住或输出“未达标”。
+            with data_lock:
+                route_pass_index_for_scan = sign_route_pass_index(global_control_data)
+            route_sign_gate_enabled = (
+                sign_route_uses_llm() and
+                route_pass_index_for_scan <= 1
+            )
             for idx, obj in enumerate(objs):
                 cls_id = obj.get("class_id")
                 if cls_id != config.SIGN_CLASS_ID:
@@ -1825,18 +1832,26 @@ def yolo_worker(core_id=None, worker_id=0):
                 if not should_enqueue:
                     continue
                 pending_sign_jobs.append((idx, cls_id, rect))
-            if route_trigger_rect is None and route_skip_debug is not None:
-                throttled_log(
-                    "sign_route_trigger_skip",
-                    "语义路牌未达标: "
-                    f"原因={route_skip_debug['reason']} "
-                    f"area={route_skip_debug['area']:.0f} "
-                    f"dist={route_skip_debug['dist']:.0f} "
-                    f"sign_z={route_skip_debug.get('sign_distance_m')} "
-                    f"rect={route_skip_debug['rect']}",
-                    state=route_skip_debug["reason"],
-                    min_interval=2.0,
-                )
+            if (
+                route_sign_gate_enabled and
+                route_trigger_rect is None and
+                route_skip_debug is not None
+            ):
+                # 与取反状态在同一把锁内复核，避免旧 YOLO 帧在取反之后才把
+                # 已经无意义的贴边诊断打印出来。
+                with data_lock:
+                    if sign_route_pass_index(global_control_data) < 3:
+                        throttled_log(
+                            "sign_route_trigger_skip",
+                            "语义路牌未达标: "
+                            f"原因={route_skip_debug['reason']} "
+                            f"area={route_skip_debug['area']:.0f} "
+                            f"dist={route_skip_debug['dist']:.0f} "
+                            f"sign_z={route_skip_debug.get('sign_distance_m')} "
+                            f"rect={route_skip_debug['rect']}",
+                            state=route_skip_debug["reason"],
+                            min_interval=2.0,
+                        )
 
             sign_llm_collecting_now = False
             with data_lock:
