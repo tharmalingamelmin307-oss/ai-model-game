@@ -2944,7 +2944,10 @@ def serial_control_thread():
             person_near_bottom = bool(global_control_data.get("person_near_bottom", False))
             person_enough_area = bool(global_control_data.get("person_enough_area", False))
         debug_keyboard_state = get_debug_drive_keyboard_state()
+        debug_keyboard_enabled = bool(debug_keyboard_state.get("enabled", False))
         debug_keyboard_stop_active = bool(debug_keyboard_state.get("manual_stop_active", False))
+        drive_elapsed_seconds = float(debug_keyboard_state.get("drive_elapsed_seconds", 0.0) or 0.0)
+        timed_spin_active = False
 
         try:
             if sign_llm_collecting:
@@ -3002,6 +3005,20 @@ def serial_control_thread():
             if debug_keyboard_stop_active:
                 target_speed = 0
 
+            # 发车计时动作放在所有停车条件之后；任意停车状态都能立即抢占，
+            # 因而定时转圈不会阻塞网页/键盘停车。
+            timed_spin_delay = max(0.0, float(getattr(config, "TIMED_SPIN_DELAY_SECONDS", 60.0)))
+            timed_spin_active = (
+                bool(getattr(config, "TIMED_SPIN_ENABLED", False)) and
+                debug_keyboard_enabled and
+                not sign_llm_stop_active and
+                not person_stop_active and
+                not debug_keyboard_stop_active and
+                drive_elapsed_seconds >= timed_spin_delay
+            )
+            if timed_spin_active:
+                target_speed = int(getattr(config, "TIMED_SPIN_SPEED", 20))
+
             limit_applied = False
             if bool(getattr(config, "CONTROL_SPEED_SMOOTH_ENABLED", True)):
                 if target_speed < 0:
@@ -3020,6 +3037,10 @@ def serial_control_thread():
                     else:
                         last_output_speed = int(target_speed)
                 target_speed = int(last_output_speed)
+            if timed_spin_active:
+                # 定时动作是明确的固定档位，即使普通最小速度被调成 0 也必须输出 20。
+                target_speed = int(getattr(config, "TIMED_SPIN_SPEED", 20))
+                last_output_speed = int(target_speed)
 
             pwm_gain = float(config.STEER_SIGNAL_PWM_GAIN)
             control_mode = str(getattr(config, "STEER_CONTROL_MODE", "weighted_slope")).lower()
@@ -3054,6 +3075,12 @@ def serial_control_thread():
 
                 servo_pwm = int(round(max(config.SERVO_MIN, min(config.SERVO_MAX, filtered_servo))))
             last_output_servo = int(servo_pwm)
+            if timed_spin_active:
+                # 定时动作要求固定舵机值，绕过普通舵机滤波；停车时不会进入此分支。
+                servo_pwm = int(max(
+                    config.SERVO_MIN,
+                    min(config.SERVO_MAX, int(getattr(config, "TIMED_SPIN_SERVO_PWM", 630))),
+                ))
         except:
             target_speed = config.CONTROL_MIN_SPEED
             servo_pwm = config.SERVO_CENTER
@@ -3116,11 +3143,13 @@ def serial_control_thread():
             person_near_bottom = False
             person_enough_area = False
             debug_keyboard_state = get_debug_drive_keyboard_state()
+            debug_keyboard_enabled = bool(debug_keyboard_state.get("enabled", False))
             debug_keyboard_stop_active = bool(debug_keyboard_state.get("manual_stop_active", False))
             if sign_llm_stop_active or person_stop_active:
                 target_speed = 0
             if debug_keyboard_stop_active:
                 target_speed = 0
+            timed_spin_active = False
 
         with data_lock:
             global_control_data["person_stop_active"] = person_stop_active
@@ -3129,6 +3158,8 @@ def serial_control_thread():
             global_control_data["debug_keyboard_enabled"] = bool(debug_keyboard_state.get("enabled", False))
             global_control_data["debug_keyboard_stop_active"] = bool(debug_keyboard_stop_active)
             global_control_data["debug_keyboard_message"] = str(debug_keyboard_state.get("message", ""))
+            global_control_data["timed_spin_active"] = bool(timed_spin_active)
+            global_control_data["timed_spin_elapsed_seconds"] = float(drive_elapsed_seconds)
 
         person_area_text = "无" if 'person_area' not in locals() or person_area is None else f"{float(person_area):.0f}"
         person_dist_text = "无" if person_dist_to_bottom is None else f"{float(person_dist_to_bottom):.1f}"
@@ -3501,8 +3532,10 @@ def _debug_control_param_values():
         "kd": float(getattr(config, "STANLEY_LATERAL_D_GAIN", 0.0)),
         "psi": float(getattr(config, "STANLEY_HEADING_GAIN", 0.0)),
         "speed": int(round(float(getattr(config, "CONTROL_MAX_SPEED", 0.0)))),
+        "timed_spin_delay": float(getattr(config, "TIMED_SPIN_DELAY_SECONDS", 60.0)),
         "person_stop_enabled": bool(getattr(config, "PERSON_STOP_ENABLED", True)),
         "car_avoidance_enabled": bool(getattr(config, "CAR_AVOIDANCE_ENABLED", True)),
+        "timed_spin_enabled": bool(getattr(config, "TIMED_SPIN_ENABLED", False)),
     }
 
 
@@ -3520,6 +3553,7 @@ def _apply_debug_control_params(payload):
         "kd": (0.0, 1.0),
         "psi": (0.0, 5.0),
         "speed": (0.0, 100.0),
+        "timed_spin_delay": (1.0, 3600.0),
     }
     parsed = {}
     for name, (lower, upper) in limits.items():
@@ -3534,7 +3568,7 @@ def _apply_debug_control_params(payload):
         parsed[name] = max(lower, min(upper, value))
 
     bool_updates = {}
-    for name in ("person_stop_enabled", "car_avoidance_enabled"):
+    for name in ("person_stop_enabled", "car_avoidance_enabled", "timed_spin_enabled"):
         if name not in values:
             continue
         value = values[name]
@@ -3559,10 +3593,14 @@ def _apply_debug_control_params(payload):
         config.CONTROL_MAX_SPEED = speed
         # B 算法的速度估计同步更新，否则调速后横向纠偏比例会不一致。
         config.STANLEY_SPEED_ESTIMATE = float(speed)
+    if "timed_spin_delay" in parsed:
+        config.TIMED_SPIN_DELAY_SECONDS = float(parsed["timed_spin_delay"])
     if "person_stop_enabled" in bool_updates:
         config.PERSON_STOP_ENABLED = bool(bool_updates["person_stop_enabled"])
     if "car_avoidance_enabled" in bool_updates:
         config.CAR_AVOIDANCE_ENABLED = bool(bool_updates["car_avoidance_enabled"])
+    if "timed_spin_enabled" in bool_updates:
+        config.TIMED_SPIN_ENABLED = bool(bool_updates["timed_spin_enabled"])
 
     return _debug_control_param_values()
 

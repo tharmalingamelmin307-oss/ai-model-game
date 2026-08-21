@@ -31,6 +31,7 @@ class DebugDriveKeyboardControl:
             "DEBUG_DRIVE_INITIAL_STOPPED",
             getattr(config, "DEBUG_KEYBOARD_DRIVE_INITIAL_STOPPED", True),
         ))
+        self.drive_started_at = None if self.manual_stop_active else time.monotonic()
         self.last_key = ""
         self.last_event_at = None
         self.message = "未启动"
@@ -41,6 +42,7 @@ class DebugDriveKeyboardControl:
                 self.enabled = False
                 self.listening = False
                 self.manual_stop_active = False
+                self.drive_started_at = None
                 self.message = "调试发车/停车已关闭"
             return self
 
@@ -127,6 +129,7 @@ class DebugDriveKeyboardControl:
                     self.enabled = False
                     self.listening = False
                     self.manual_stop_active = False
+                    self.drive_started_at = None
                     self.message = f"监听异常: {e}"
                 print(f"调试键盘控制停止: {e}", flush=True)
                 return
@@ -143,6 +146,8 @@ class DebugDriveKeyboardControl:
         with self._lock:
             changed = bool(self.manual_stop_active) != bool(active)
             self.manual_stop_active = bool(active)
+            # 停车清零计时；每次发车都从当前按钮事件重新计时。
+            self.drive_started_at = None if bool(active) else time.monotonic()
             self.last_key = str(key)
             self.last_event_at = time.time()
             self.message = str(label)
@@ -155,6 +160,11 @@ class DebugDriveKeyboardControl:
                 "enabled": bool(self.enabled),
                 "listening": bool(self.listening),
                 "manual_stop_active": bool(self.enabled and self.manual_stop_active),
+                "drive_started_at": self.drive_started_at,
+                "drive_elapsed_seconds": (
+                    0.0 if self.drive_started_at is None else
+                    max(0.0, time.monotonic() - float(self.drive_started_at))
+                ),
                 "last_key": self.last_key,
                 "last_event_at": self.last_event_at,
                 "message": self.message,
@@ -790,16 +800,18 @@ def preview_index_html():
             <div class="param"><label for="kd">Kd</label><input id="kd" type="number" step="0.001"></div>
             <div class="param"><label for="psi">Psi</label><input id="psi" type="number" step="0.01"></div>
             <div class="param"><label for="speed">电机速度</label><input id="speed" type="number" step="1"></div>
+            <div class="param"><label for="timed_spin_delay">转圈延时(s)</label><input id="timed_spin_delay" type="number" min="1" step="1"></div>
             <div class="param toggle"><label for="person_stop_enabled">行人停车</label><input id="person_stop_enabled" type="checkbox"></div>
             <div class="param toggle"><label for="car_avoidance_enabled">车辆躲避</label><input id="car_avoidance_enabled" type="checkbox"></div>
+            <div class="param toggle"><label for="timed_spin_enabled">定时转圈</label><input id="timed_spin_enabled" type="checkbox"></div>
             <button type="button" onclick="applyParams()">应用参数</button>
             <button type="button" onclick="driveStart()">发车</button>
             <button type="button" onclick="driveStop()">停车</button>
             <div id="debug-status"></div>
         </div>
         <script>
-        const fields = ['kp', 'kd', 'psi', 'speed'];
-        const toggles = ['person_stop_enabled', 'car_avoidance_enabled'];
+        const fields = ['kp', 'kd', 'psi', 'speed', 'timed_spin_delay'];
+        const toggles = ['person_stop_enabled', 'car_avoidance_enabled', 'timed_spin_enabled'];
         function setStatus(text, ok) {
             const node = document.getElementById('debug-status');
             node.textContent = text || '';

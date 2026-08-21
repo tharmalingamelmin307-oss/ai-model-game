@@ -1065,6 +1065,13 @@ DEBUG_KEYBOARD_DRIVE_START_KEY = "b"
 DEBUG_KEYBOARD_DRIVE_STOP_KEY = "e"
 DEBUG_KEYBOARD_DRIVE_POLL_INTERVAL = 0.05
 
+# 发车后定时动作：达到延时后以固定速度和舵机 PWM 转圈。
+# 默认关闭，需在网页调试面板中开启；停车状态始终优先于该动作。
+TIMED_SPIN_ENABLED = False
+TIMED_SPIN_DELAY_SECONDS = 60.0
+TIMED_SPIN_SPEED = 20
+TIMED_SPIN_SERVO_PWM = 630
+
 DEFAULT_CONTROL_DATA = {
     "steer_signal": 0.0,
     "turn_intent": -1,
@@ -1167,6 +1174,8 @@ DEFAULT_CONTROL_DATA = {
     "debug_keyboard_enabled": False,
     "debug_keyboard_stop_active": False,
     "debug_keyboard_message": "",
+    "timed_spin_active": False,
+    "timed_spin_elapsed_seconds": 0.0,
     "actual_servo_pwm": SERVO_CENTER,
     "target_speed": 10,
 }
