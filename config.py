@@ -1079,6 +1079,7 @@ DEFAULT_CONTROL_DATA = {
     "sign_llm_frame_id": -1,
     "sign_llm_ocr_inflight": False,
     "sign_llm_ocr_inflight_started_at": None,
+    "sign_llm_ocr_active_backends": [],
     "sign_llm_ocr_started": False,
     "sign_llm_ocr_job_frame_id": -1,
     "sign_llm_stable_rect": None,

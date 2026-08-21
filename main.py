@@ -45,10 +45,15 @@ from modules.ocr_system import OCRRecognizer as LocalOCRRecognizer
 from modules.qianfan_client import request_road_choice
 from utils.yolo_rknn_post import letterbox_bgr_or_rgb
 try:
-    from utils.rknn_quiet import install_rknn_warning_filter
+    from utils.rknn_quiet import install_rknn_warning_filter, suppress_rknn_init_output
 except ImportError:
     def install_rknn_warning_filter():
         return
+
+    from contextlib import nullcontext
+
+    def suppress_rknn_init_output():
+        return nullcontext()
 
 app = Flask(__name__)
 logging.getLogger("werkzeug").disabled = True
@@ -92,6 +97,10 @@ ocr_queue = Queue(maxsize=config.OCR_QUEUE_MAXSIZE)
 # 本地 OCR 与百度 OCR 分开排队：慢网络请求不能占住本地 OCR 的工作线程。
 ocr_local_executor = ThreadPoolExecutor(max_workers=1)
 ocr_api_executor = ThreadPoolExecutor(max_workers=1)
+# OCR executor 各自单线程，后端实例可安全复用。尤其本地 RKNN 不应每次采样都
+# 重载 det/rec 模型，否则会刷静态 shape 提示并浪费数百毫秒初始化时间。
+ocr_recognizer_lock = threading.Lock()
+ocr_recognizers = {}
 llm_queue = MPQueue(maxsize=2)
 llm_result_queue = MPQueue(maxsize=2)
 
@@ -914,6 +923,7 @@ def clear_sign_llm_state(state, keep_completed=False):
     state["sign_llm_frame_id"] = -1
     state["sign_llm_ocr_inflight"] = False
     state["sign_llm_ocr_inflight_started_at"] = None
+    state["sign_llm_ocr_active_backends"] = []
     state["sign_llm_ocr_started"] = False
     state["sign_llm_ocr_job_frame_id"] = -1
     state["sign_llm_stable_rect"] = None
@@ -937,6 +947,7 @@ def reset_sign_route_state(state, next_state="IDLE"):
     state["sign_route_api_submitted"] = False
     state["sign_llm_ocr_inflight"] = False
     state["sign_llm_ocr_inflight_started_at"] = None
+    state["sign_llm_ocr_active_backends"] = []
     state["sign_llm_ocr_started"] = False
     state["sign_llm_ocr_job_frame_id"] = -1
     state["sign_llm_stable_rect"] = None
@@ -1445,18 +1456,23 @@ def record_sign_llm_sample(state, frame_id, text="", score=0.0, reason="", backe
     return maybe_submit_sign_llm_job(state, int(frame_id))
 
 
-def mark_sign_ocr_done(frame_id=None):
+def mark_sign_ocr_done(frame_id=None, backend=None):
     with data_lock:
-        active_frame_id = int(global_control_data.get("sign_llm_ocr_job_frame_id", -1))
-        if (
-            frame_id is not None and
-            active_frame_id >= 0 and
-            int(frame_id) != active_frame_id
-        ):
-            return
-        global_control_data["sign_llm_ocr_inflight"] = False
-        global_control_data["sign_llm_ocr_inflight_started_at"] = None
-        global_control_data["sign_llm_ocr_job_frame_id"] = -1
+        active_backends = set(global_control_data.get("sign_llm_ocr_active_backends", []))
+        label = backend_label(backend) if backend else ""
+        if label:
+            active_backends.discard(label)
+        else:
+            active_backends.clear()
+        global_control_data["sign_llm_ocr_active_backends"] = sorted(active_backends)
+        # 百度网络请求不该暂停 YOLO；只有本地 RKNN OCR 会与检测共享 NPU。
+        local_busy = "local" in active_backends
+        global_control_data["sign_llm_ocr_inflight"] = local_busy
+        global_control_data["sign_llm_ocr_inflight_started_at"] = (
+            global_control_data.get("sign_llm_ocr_inflight_started_at") if local_busy else None
+        )
+        if not active_backends:
+            global_control_data["sign_llm_ocr_job_frame_id"] = -1
 
 
 def create_ocr_recognizer(backend=None):
@@ -1471,6 +1487,19 @@ def create_ocr_recognizer(backend=None):
     if backend in ("local", "rknn", "rknn_local"):
         return LocalOCRRecognizer(core_id=config.REC_CORE)
     raise RuntimeError(f"unsupported OCR_BACKEND: {backend}")
+
+
+def get_ocr_recognizer(backend):
+    """每个 OCR 后端只初始化一次，采样期间复用其模型/云端 token 缓存。"""
+    normalized = str(backend or getattr(config, "OCR_BACKEND", "local")).strip().lower()
+    with ocr_recognizer_lock:
+        recognizer = ocr_recognizers.get(normalized)
+        if recognizer is None:
+            # RKNN 静态模型的 native 初始化提示没有诊断价值，且只应发生一次。
+            with suppress_rknn_init_output():
+                recognizer = create_ocr_recognizer(normalized)
+            ocr_recognizers[normalized] = recognizer
+        return recognizer
 
 
 def sign_ocr_backends():
@@ -1501,10 +1530,9 @@ def backend_label(backend):
 
 
 def run_ocr_backend_once(backend, frame_data):
-    recognizer = None
     label = backend_label(backend)
     try:
-        recognizer = create_ocr_recognizer(backend)
+        recognizer = get_ocr_recognizer(backend)
         results = recognizer.run_full_frame(frame_data)
         return {
             "backend": label,
@@ -1525,17 +1553,30 @@ def run_ocr_backend_once(backend, frame_data):
             "rec_exception_count": 0,
             "rec_valid_count": 0,
         }
-    finally:
-        if recognizer is not None:
-            try:
-                recognizer.close()
-            except Exception as exc:
-                log_once(f"ocr_release_error_{label}", f"OCR释放失败({label}): {exc}")
-
-
 def submit_sign_ocr_backends(frame_data, sign_jobs, frame_id):
     """分别提交本地/API OCR，让任一后端完成时立即回写对应样本。"""
-    for backend in sign_ocr_backends():
+    with data_lock:
+        if not bool(global_control_data.get("sign_llm_collecting", False)):
+            return
+        sample_need = max(1, int(getattr(config, "SIGN_LLM_OCR_SAMPLES", 3)))
+        samples = list(global_control_data.get("sign_llm_samples", []))
+        active_backends = set(global_control_data.get("sign_llm_ocr_active_backends", []))
+        backends = []
+        for backend in sign_ocr_backends():
+            label = backend_label(backend)
+            completed = sum(1 for sample in samples if sample.get("backend") == label)
+            if completed < sample_need and label not in active_backends:
+                backends.append(backend)
+                active_backends.add(label)
+        if not backends:
+            return
+        global_control_data["sign_llm_ocr_active_backends"] = sorted(active_backends)
+        if "local" in {backend_label(backend) for backend in backends}:
+            global_control_data["sign_llm_ocr_inflight"] = True
+            global_control_data["sign_llm_ocr_inflight_started_at"] = time.monotonic()
+            global_control_data["sign_llm_ocr_job_frame_id"] = int(frame_id)
+
+    for backend in backends:
         label = backend_label(backend)
         executor = ocr_api_executor if label == "api" else ocr_local_executor
         future = executor.submit(run_ocr_backend_once, backend, frame_data)
@@ -1662,7 +1703,11 @@ def drain_sign_llm_results():
                 global_control_data["sign_llm_result"] = ""
                 clear_sign_llm_state(global_control_data, keep_completed=True)
                 global_control_data["sign_llm_error"] = fallback_error
-                global_control_data["sign_route_pass_index"] = 3
+                # 千帆网络失败时，当前岔路按既有默认 LEFT 放行；它仍是本次路线
+                # 的首次选择，下一次“带路牌的 Y 岔”必须以此为基准走 RIGHT。
+                fallback_choice = -1
+                global_control_data["sign_route_first_choice"] = fallback_choice
+                global_control_data["sign_route_pass_index"] = 2
                 reset_sign_route_state(global_control_data, next_state="WAIT_SIGN_GONE")
                 block_sign_until_gone(global_control_data, active_rect)
 
@@ -1676,7 +1721,7 @@ def drain_sign_llm_results():
             )
         else:
             print(
-                f"千帆路牌识别失败，按石头优先/默认左路放行: {error} "
+                f"千帆路牌识别失败，当前按默认LEFT放行；下一次带路牌岔路将取反为RIGHT: {error} "
                 f"耗时={total_elapsed_s:.2f}s API={api_elapsed_s:.2f}s 排队={queue_wait_s:.2f}s",
                 flush=True,
             )
@@ -1958,6 +2003,7 @@ def yolo_worker(core_id=None, worker_id=0):
                         global_control_data["sign_llm_attempts"] = 0
                         global_control_data["sign_llm_ocr_inflight"] = False
                         global_control_data["sign_llm_ocr_inflight_started_at"] = None
+                        global_control_data["sign_llm_ocr_active_backends"] = []
                         global_control_data["sign_llm_ocr_started"] = False
                         global_control_data["sign_llm_ocr_job_frame_id"] = -1
                         global_control_data["sign_llm_stable_rect"] = None
@@ -1988,13 +2034,9 @@ def yolo_worker(core_id=None, worker_id=0):
             if sign_jobs:
                 if sign_llm_collecting_now:
                     with data_lock:
-                        if bool(global_control_data.get("sign_llm_ocr_inflight", False)):
-                            sign_jobs = []
-                        else:
-                            global_control_data["sign_llm_ocr_inflight"] = True
-                            global_control_data["sign_llm_ocr_inflight_started_at"] = time.monotonic()
-                            global_control_data["sign_llm_ocr_started"] = True
-                            global_control_data["sign_llm_ocr_job_frame_id"] = int(frame_id)
+                        # 具体后端的并发占用由 submit_sign_ocr_backends 管理：本地和
+                        # 百度各最多一条在途，慢百度不会阻止本地继续补足三个样本。
+                        global_control_data["sign_llm_ocr_started"] = True
 
             if sign_jobs:
                 job_names = tuple(class_name_from_id(cls_id) for _, cls_id, _ in sign_jobs)
@@ -2056,9 +2098,11 @@ def ocr_worker():
     - 匹配结果回写时还会再核对 frame_id，避免旧帧 OCR 迟到污染新状态
     """
     job_frame_id = None
+    sample_backend = None
     while True:
         try:
             job_frame_id = None
+            sample_backend = None
             job = ocr_queue.get()
             if job is None:
                 break
@@ -2121,6 +2165,7 @@ def ocr_worker():
                         "",
                         0.0,
                         "no_ocr_results",
+                        backend=sample_backend,
                     )
                     if submitted:
                         throttled_log(
@@ -2137,7 +2182,7 @@ def ocr_worker():
                     state=tuple((b.get("backend"), len(b.get("results", []) or []), str(b.get("error", ""))[:40]) for b in backend_outputs),
                     min_interval=config.LOG_INTERVAL_OCR_RAW
                 )
-                mark_sign_ocr_done(job_frame_id)
+                mark_sign_ocr_done(job_frame_id, sample_backend)
                 continue
 
             min_ocr_score = float(config.OCR_MIN_SCORE)
@@ -2271,7 +2316,7 @@ def ocr_worker():
                     state=(len(ocr_results), len(sign_jobs)),
                     min_interval=config.LOG_INTERVAL_OCR_RAW
                 )
-                mark_sign_ocr_done(job_frame_id)
+                mark_sign_ocr_done(job_frame_id, sample_backend)
                 continue
 
             # 回写时再做一次 class_id 检查，避免队列延迟导致“框已经换帧”的情况。
@@ -2340,10 +2385,10 @@ def ocr_worker():
                                     state="RIGHT",
                                     min_interval=config.LOG_INTERVAL_TURN_INTENT
                                 )
-            mark_sign_ocr_done(job_frame_id)
+            mark_sign_ocr_done(job_frame_id, sample_backend)
 
         except Exception as e:
-            mark_sign_ocr_done(job_frame_id)
+            mark_sign_ocr_done(job_frame_id, sample_backend)
             log_once("ocr_worker_error", f"OCR线程异常: {e}")
 
 # ==============================================================================

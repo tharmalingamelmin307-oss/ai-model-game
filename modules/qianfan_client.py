@@ -1,5 +1,7 @@
 import json
 import os
+import signal
+import threading
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -8,6 +10,14 @@ from pathlib import Path
 API_URL = "https://qianfan.baidubce.com/v2/chat/completions"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 ENV_PATH = PROJECT_ROOT / ".env"
+
+
+class QianfanRequestTimeout(TimeoutError):
+    pass
+
+
+def _timeout_handler(_signum, _frame):
+    raise QianfanRequestTimeout("qianfan request exceeded configured timeout")
 
 
 def load_project_env(env_path=ENV_PATH):
@@ -98,12 +108,27 @@ def request_road_choice(samples, model=None, timeout=3.0):
         },
     )
 
+    timeout = max(0.1, float(timeout))
+    # urllib 的 timeout 在部分板端 OpenSSL TLS 握手内不会严格生效；千帆调用位于
+    # 独立进程的主线程，因此用 SIGALRM 补上硬上限，防止一次握手卡住二十多秒。
+    use_alarm = threading.current_thread() is threading.main_thread()
+    old_handler = None
+    old_timer = None
     try:
-        with urllib.request.urlopen(request, timeout=float(timeout)) as response:
+        if use_alarm:
+            old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+            old_timer = signal.setitimer(signal.ITIMER_REAL, timeout)
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             raw = response.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
         raw = exc.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"HTTP {exc.code} {exc.reason}: {raw}") from exc
+    except QianfanRequestTimeout as exc:
+        raise RuntimeError(str(exc)) from exc
+    finally:
+        if use_alarm:
+            signal.setitimer(signal.ITIMER_REAL, *(old_timer or (0.0, 0.0)))
+            signal.signal(signal.SIGALRM, old_handler)
 
     data = json.loads(raw)
     content = str(data["choices"][0]["message"]["content"]).strip().upper()
